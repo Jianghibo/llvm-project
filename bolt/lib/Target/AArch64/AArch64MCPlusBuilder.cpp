@@ -158,6 +158,7 @@ public:
 
   MCPhysReg getStackPointer() const override { return AArch64::SP; }
   MCPhysReg getFramePointer() const override { return AArch64::FP; }
+  MCPhysReg getFlagsReg() const override { return AArch64::NZCV; }
 
   bool isBreakpoint(const MCInst &Inst) const override {
     return Inst.getOpcode() == AArch64::BRK;
@@ -1252,6 +1253,67 @@ public:
     Regs |= getAliases(AArch64::X28);
     Regs |= getAliases(AArch64::LR);
     Regs |= getAliases(AArch64::FP);
+  }
+
+  void getGPRegs(BitVector &Regs, bool IncludeAlias) const override {
+    const MCRegisterClass &GPRegClass =
+        AArch64MCRegisterClasses[AArch64::GPR64RegClassID];
+    for (unsigned I = 0; I < GPRegClass.getNumRegs(); ++I) {
+      MCPhysReg Reg = GPRegClass.getRegister(I);
+      if (IncludeAlias) {
+        Regs |= getAliases(Reg);
+      } else {
+        Regs.set(Reg);
+      }
+    }
+  }
+
+  BitVector getRegsUsedAsParams() const override {
+    BitVector Regs = BitVector(RegInfo->getNumRegs(), false);
+    const MCRegisterClass &GPRegClass =
+        AArch64MCRegisterClasses[AArch64::GPR64argRegClassID];
+    for(unsigned I = 0; I < GPRegClass.getNumRegs(); ++I) {
+      MCPhysReg Reg = GPRegClass.getRegister(I);
+      Regs |= getAliases(Reg);
+    }
+    return Regs;
+  }
+
+  void getSpecialGPRegs(BitVector &Regs, bool IncludeAlias) const override {
+    if (IncludeAlias) {
+      Regs |= getAliases(getFramePointer());
+      Regs |= getAliases(getStackPointer());
+      Regs |= getAliases(AArch64::XZR);
+      Regs |= getAliases(AArch64::LR);
+      return;
+    }
+    Regs.set(getFramePointer());
+    Regs.set(getStackPointer());
+    Regs.set(AArch64::XZR);
+    Regs.set(AArch64::LR);
+  }
+
+  void getDefaultLiveOut(BitVector &Regs) const override {
+    Regs |= getAliases(AArch64::X0);
+    Regs |= getAliases(AArch64::X1);
+    Regs |= getAliases(AArch64::D0);
+    Regs |= getAliases(AArch64::D1);
+  }
+
+  bool isCleanRegXOR(const MCInst &Inst) const override {
+    switch (Inst.getOpcode()) {
+    case AArch64::EORWrr:
+    case AArch64::EORXrr:
+      return (Inst.getOperand(0).getReg() == Inst.getOperand(1).getReg() &&
+              Inst.getOperand(0).getReg() == Inst.getOperand(2).getReg());
+    case AArch64::EORWrs:
+    case AArch64::EORXrs:
+      return (Inst.getOperand(0).getReg() == Inst.getOperand(1).getReg() &&
+              Inst.getOperand(0).getReg() == Inst.getOperand(2).getReg() &&
+              Inst.getOperand(0).getImm() == 0);
+    default:
+      return false;
+    }
   }
 
   const MCExpr *getTargetExprFor(MCInst &Inst, const MCExpr *Expr,

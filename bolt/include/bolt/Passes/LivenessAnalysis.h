@@ -51,12 +51,29 @@ public:
     BV.flip();
     BitVector GPRegs(NumRegs, false);
     this->BC.MIB->getGPRegs(GPRegs, /*IncludeAlias=*/false);
-    // Ignore the register used for frame pointer even if it is not alive (it
-    // may be used by CFI which is not represented in our dataflow).
-    BitVector FP = BC.MIB->getAliases(BC.MIB->getFramePointer());
-    FP.flip();
+    // Ignore the register used for special purpose, such as frame pointer,
+    // stack pointer, linker register and zero register.
+    BitVector SpecialRegs(NumRegs, false);
+    this->BC.MIB->getSpecialGPRegs(SpecialRegs, /*IncludeAlias=*/false);
+    SpecialRegs.flip();
     BV &= GPRegs;
-    BV &= FP;
+    BV &= SpecialRegs;
+    int Reg = BV.find_first();
+    return Reg != -1 ? Reg : 0;
+  }
+
+  // Return a usable general-purpose reg before point P. Return 0 if no reg is
+  // available.
+  MCPhysReg scavengeRegBefore(ProgramPoint P) {
+    BitVector BV = *this->getStateBefore(P);
+    BV.flip();
+    BitVector GPRegs(NumRegs, false);
+    this->BC.MIB->getGPRegs(GPRegs, /*IncludeAlias=*/false);
+    BitVector SpecialRegs(NumRegs, false);
+    this->BC.MIB->getSpecialGPRegs(SpecialRegs, /*IncludeAlias=*/false);
+    SpecialRegs.flip();
+    BV &= GPRegs;
+    BV &= SpecialRegs;
     int Reg = BV.find_first();
     return Reg != -1 ? Reg : 0;
   }

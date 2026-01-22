@@ -1605,6 +1605,11 @@ public:
     llvm_unreachable("not implemented");
   }
 
+  /// Change \p Regs with a bitmask with special regs
+  virtual void getSpecialGPRegs(BitVector &Regs, bool IncludeAlias = true) const {
+    llvm_unreachable("not implemented");
+  }
+
   /// Change \p Regs with a bitmask with all general purpose regs that can be
   /// encoded without extra prefix bytes. For x86 only.
   virtual void getClassicGPRegs(BitVector &Regs) const {

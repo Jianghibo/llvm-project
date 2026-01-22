@@ -827,6 +827,16 @@ public:
     Regs.set(X86::R15);
   }
 
+  void getSpecialGPRegs(BitVector &Regs, bool IncludeAlias) const override {
+    if (IncludeAlias) {
+      Regs |= getAliases(getFramePointer());
+      Regs |= getAliases(getStackPointer());
+      return;
+    }
+    Regs.set(getFramePointer());
+    Regs.set(getStackPointer());
+  }
+
   void getClassicGPRegs(BitVector &Regs) const override {
     Regs |= getAliases(X86::RAX);
     Regs |= getAliases(X86::RBX);
