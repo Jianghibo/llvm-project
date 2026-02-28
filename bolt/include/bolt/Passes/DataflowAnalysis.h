@@ -11,6 +11,7 @@
 
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryFunction.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/Support/Errc.h"
 #include <optional>
 #include <queue>
@@ -321,6 +322,8 @@ public:
 
     if (Func.begin() == Func.end())
       return;
+
+    bool HasUnreachable = false;
     // Initialize state for all points of the function
     for (BinaryBasicBlock &BB : Func) {
       StateTy &St = getOrCreateStateAt(BB);
@@ -329,27 +332,55 @@ public:
         StateTy &St = getOrCreateStateAt(Inst);
         St = derived().getStartingStateAtPoint(Inst);
       }
+
+      // Reverse_post_order and post_order will leave may unreachable basicblock.
+      // If there are unreachable BBs, traverse all BBs based on the layout.
+      if (BB.pred_empty() && &BB != &Func.front())
+        HasUnreachable = true;
     }
 
     std::queue<BinaryBasicBlock *> Worklist;
     // TODO: Pushing this in a DFS ordering will greatly speed up the dataflow
     // performance.
     if (!Backward) {
-      for (BinaryBasicBlock &BB : Func) {
-        Worklist.push(&BB);
-        MCInst *Prev = nullptr;
-        for (MCInst &Inst : BB) {
-          PrevPoint[&Inst] = Prev ? ProgramPoint(Prev) : ProgramPoint(&BB);
+      if (HasUnreachable) {
+        for (BinaryBasicBlock &BB : Func) {
+          Worklist.push(&BB);
+          MCInst *Prev = nullptr;
+          for (MCInst &Inst : BB) {
+            PrevPoint[&Inst] = Prev ? ProgramPoint(Prev) : ProgramPoint(&BB);
           Prev = &Inst;
+          }
+        }
+      } else {
+        llvm::ReversePostOrderTraversal<BinaryBasicBlock *> RPO(&Func);
+        for (BinaryBasicBlock *BB : RPO) {
+          Worklist.push(BB);
+          MCInst *Prev = nullptr;
+          for (MCInst &Inst : *BB) {
+            PrevPoint[&Inst] = Prev ? ProgramPoint(Prev) : ProgramPoint(BB);
+            Prev = &Inst;
+          }
         }
       }
     } else {
-      for (BinaryBasicBlock &BB : llvm::reverse(Func)) {
-        Worklist.push(&BB);
-        MCInst *Prev = nullptr;
-        for (MCInst &Inst : llvm::reverse(BB)) {
-          PrevPoint[&Inst] = Prev ? ProgramPoint(Prev) : ProgramPoint(&BB);
-          Prev = &Inst;
+      if (HasUnreachable) {
+        for (BinaryBasicBlock &BB : llvm::reverse(Func)) {
+          Worklist.push(&BB);
+          MCInst *Prev = nullptr;
+          for (MCInst &Inst : llvm::reverse(BB)) {
+            PrevPoint[&Inst] = Prev ? ProgramPoint(Prev) : ProgramPoint(&BB);
+            Prev = &Inst;
+          }
+        }
+      } else {
+        for (BinaryBasicBlock *BB : post_order(&Func)) {
+          Worklist.push(BB);
+          MCInst *Prev = nullptr;
+          for (MCInst &Inst : llvm::reverse(*BB)) {
+            PrevPoint[&Inst] = Prev ? ProgramPoint(Prev) : ProgramPoint(BB);
+            Prev = &Inst;
+          }
         }
       }
     }
