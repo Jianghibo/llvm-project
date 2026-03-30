@@ -1911,9 +1911,6 @@ if (CostI != TargetTransformInfo::TCC_Free)
 **3. 保守验证：GEP 在循环内的用户必须满足严格约束（行 1307-1318）**
 
 ```cpp
-// For a GEP, we cannot simply use getInstructionCost because currently
-// it optimistically assumes that a GEP will fold into addressing mode
-// regardless of its users.
 const BasicBlock *BB = GEP->getParent();
 for (const User *U : GEP->users()) {
   const Instruction *UI = cast<Instruction>(U);
@@ -1978,4 +1975,424 @@ return true;
 
 - `isFoldableInLoop` 为 `true`：循环内有用户，但用户可以把 GEP 吸收进自身的寻址模式，因此 sink 时需要 clone 指令到出口 block，同时设置 `FoldableInLoop = true`（提示调用者需 clone 而非 move）。
 - `isFoldableInLoop` 为 `false`：循环内有真实用户且不可折叠，则不能 sink。
+
+
+## 函数分析：`canSinkOrHoistInst`（行 1165–1284）
+
+### 函数签名与目的（行 1165-1169）
+
+```cpp
+bool llvm::canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
+                               Loop *CurLoop, MemorySSAUpdater &MSSAU,
+                               bool TargetExecutesOncePerLoop,
+                               SinkAndHoistLICMFlags &Flags,
+                               OptimizationRemarkEmitter *ORE)
+```
+
+**功能**：判断指令是否可以安全地提升（hoist）或下沉（sink）出循环，这是 LICM Pass 的核心合法性判断函数。
+
+---
+
+### 整体结构
+
+```
+canSinkOrHoistInst(I, AA, DT, CurLoop, MSSAU, TargetExecutesOncePerLoop, Flags, ORE)
+├── 检查指令类型是否支持 hoist/sink
+│   └── isHoistableAndSinkableInst()
+├── LoadInst 处理
+│   ├── 检查是否为 unordered
+│   ├── 检查常量内存
+│   ├── 检查 invariant_load metadata
+│   ├── 检查 atomic load
+│   ├── 检查 invariant.start 支配
+│   └── 检查是否被 loop 内 store clobber
+├── CallInst 处理
+│   ├── 检查是否可抛异常
+│   ├── 检查是否为 convergent
+│   ├── 检查是否为 coroutine presplit
+│   ├── 检查 assume intrinsic
+│   ├── 检查内存访问行为
+│   │   ├── doesNotAccessMemory → true
+│   │   ├── onlyReadsMemory → 检查 pointerInvalidatedByLoop
+│   │   └── onlyWritesMemory → 检查 noConflictingReadWrites
+│   └── 其他情况 → false
+├── FenceInst 处理
+│   └── 检查是否为 loop 中唯一内存访问
+├── StoreInst 处理
+│   ├── 检查是否为 unordered
+│   ├── 检查是否为 loop 中唯一内存访问
+│   └── 检查是否有冲突的读写
+└── 其他指令
+    └── 断言不涉及内存访问
+```
+
+---
+
+### 逐段注释
+
+**1. 指令类型检查（行 1170-1172）**
+
+```cpp
+if (!isHoistableAndSinkableInst(I))
+  return false;
+```
+
+目的作用：快速过滤不支持的指令类型。
+注释说明：只有特定类型的指令（Load、Store、Call、Fence、Cast、UnaryOperator、BinaryOperator、Select、GEP、Cmp、向量操作、ExtractValue、InsertValue、Freeze）可以被 hoist/sink。
+
+**2. LoadInst 处理（行 1174-1210）**
+
+```cpp
+if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
+    if (!LI->isUnordered())
+      return false;
+    if (!isModSet(AA->getModRefInfoMask(LI->getOperand(0))))
+      return true;
+    if (LI->hasMetadata(LLVMContext::MD_invariant_load))
+      return true;
+    if (LI->isAtomic() && !TargetExecutesOncePerLoop)
+      return false;
+    if (isLoadInvariantInLoop(LI, DT, CurLoop))
+      return true;
+    auto MU = cast<MemoryUse>(MSSA->getMemoryAccess(LI));
+    bool InvariantGroup = LI->hasMetadata(LLVMContext::MD_invariant_group);
+    bool Invalidated = pointerInvalidatedByLoop(
+        MSSA, MU, CurLoop, I, Flags, InvariantGroup);
+    if (ORE && Invalidated && CurLoop->isLoopInvariant(LI->getPointerOperand()))
+      ORE->emit([&]() {
+        return OptimizationRemarkMissed(
+                     DEBUG_TYPE, "LoadWithLoopInvariantAddressInvalidated", LI)
+                << "failed to move load with loop-invariant address "
+                   "because loop may invalidate its value";
+      });
+    return !Invalidated;
+  }
+```
+
+目的作用：判断 Load 指令是否可以安全移动。
+注释说明：
+- `isUnordered()`：volatile 和有序 atomic load 不能移动，因为它们有可见的副作用
+- `isModSet()`：从常量内存（只读）加载总是安全的，即使别名集中有修改
+- `MD_invariant_load`：用户标记为 invariant 的 load 可以直接移动
+- `isAtomic() && !TargetExecutesOncePerLoop`：atomic load 在循环内多次执行时不能移动，因为可能被其他线程修改
+- `isLoadInvariantInLoop()`：检查是否有 `invariant.start` intrinsic 支配 load，表示该内存位置在循环内不变
+- `pointerInvalidatedByLoop()`：使用 MemorySSA walker 检查 load 是否被 loop 内的 store clobber
+- `ORE->emit()`：发出优化 remark，帮助用户理解为什么 load 不能移动
+
+**3. CallInst 处理（行 1211-1260）**
+
+```cpp
+} else if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+    // Don't sink calls which can throw.
+    if (CI->mayThrow())
+      return false;
+    if (CI->isConvergent())
+      return false;
+    if (CI->getFunction()->isPresplitCoroutine())
+      return false;
+    using namespace PatternMatch;
+    if (match(I, m_Intrinsic<Intrinsic::assume>()))
+      return true;
+    MemoryEffects Behavior = AA->getMemoryEffects(CI);
+    if (Behavior.doesNotAccessMemory())
+      return true;
+    if (Behavior.onlyReadsMemory()) {
+      auto *MU = dyn_cast<MemoryUse>(MSSA->getMemoryAccess(CI));
+      if (!MU)
+        return false;
+      return !pointerInvalidatedByLoop(
+          MSSA, MU, CurLoop, I, Flags, /*InvariantGroup=*/false);
+    }
+    if (Behavior.onlyWritesMemory()) {
+      return noConflictingReadWrites(CI, MSSA, AA, CurLoop, Flags);
+    }
+    return false;
+  }
+```
+
+目的作用：判断 Call 指令是否可以安全移动。
+注释说明：
+- `mayThrow()`：可抛异常的 call 不能移动，因为可能改变异常处理路径
+- `isConvergent()`：convergent 操作（如某些 GPU 操作）隐式依赖控制流，不能移动
+- `isPresplitCoroutine()`：coroutine presplit 函数不能移动（FIXME 指出这是保守策略）
+- `assume` intrinsic：不访问内存且不抛异常，可以安全移动
+- `doesNotAccessMemory()`：不访问内存的 call（如纯计算）可以安全移动
+- `onlyReadsMemory()`：只读内存的 call，检查是否被 loop 内的 store clobber
+- `onlyWritesMemory()`：只写内存的 call，检查是否有冲突的读写
+
+**4. FenceInst 处理（行 1261-1264）**
+
+```cpp
+} else if (auto *FI = dyn_cast<FenceInst>(&I)) {
+    return isOnlyMemoryAccess(FI, CurLoop, MSSAU);
+  }
+```
+
+目的作用：判断 Fence 指令是否可以安全移动。
+注释说明：fence 提供内存序，只有当它是 loop 中唯一的内存操作时才能移动，否则会破坏序语义。
+
+**5. StoreInst 处理（行 1265-1267）**
+
+```cpp
+} else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+    if (!SI->isUnordered())
+      return false;
+
+    if (isOnlyMemoryAccess(SI, CurLoop, MSSAU))
+      return true;
+    return noConflictingReadWrites(SI, MSSA, AA, CurLoop, Flags);
+  }
+```
+
+目的作用：判断 Store 指令是否可以安全移动。
+注释说明：
+- `isUnordered()`：volatile 和有序 atomic store 不能移动
+- `isOnlyMemoryAccess()`：如果 store 是 loop 中唯一的内存访问，可以安全移动
+- `noConflictingReadWrites()`：否则检查是否有冲突的读写
+
+**6. 其他指令断言（行 1279-1283）**
+
+```cpp
+assert(!I.mayReadOrWriteMemory() && "unhandled aliasing");
+
+return true;
+```
+
+目的作用：处理其他不涉及内存访问的指令。
+注释说明：对于不涉及内存访问的指令（如算术、比较等），已经确认可以机械地移动，由调用者检查故障安全性。
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段 | 含义 |
+|---|---|---|
+| `LoadInst` | `isUnordered()`, `isAtomic()`, `hasMetadata()` | Load 指令属性检查 |
+| `CallInst` | `mayThrow()`, `isConvergent()`, `getFunction()` | Call 指令属性检查 |
+| `MemoryEffects` | `doesNotAccessMemory()`, `onlyReadsMemory()`, `onlyWritesMemory()` | 内存访问行为描述 |
+| `MemoryUse` | - | MemorySSA 中的内存使用节点 |
+| `SinkAndHoistLICMFlags` | `tooManyClobberingCalls()` | 编译时开销控制 |
+
+---
+
+### 优化意图
+
+1. **分层检查**：从简单的指令类型检查到复杂的别名分析，逐步深入
+2. **Load 特殊处理**：常量内存、invariant_load、invariant.start 等多种快速路径
+3. **Call 安全性**：严格检查异常、convergent、coroutine 等边界情况
+4. **MemorySSA 精确追踪**：通过 `pointerInvalidatedByLoop()` 和 `noConflictingReadWrites()` 精确判断内存冲突
+5. **编译时保护**：通过 `Flags.tooManyClobberingCalls()` 限制 MemorySSA walker 调用次数
+
+对于重要部分，要解释其为什么这么优化：
+- Load 的多种快速路径（常量内存、invariant_load、invariant.start）避免昂贵的 MemorySSA 查询
+- Call 的 convergent 检查防止跨线程通信操作被错误移动
+- Fence 的唯一内存访问检查确保内存序不被破坏
+- Store 的 `isOnlyMemoryAccess()` 优化处理简单情况，避免复杂的别名分析
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 检查指令类型 | `isHoistableAndSinkableInst()` | `LICM.cpp:1123` |
+| 检查 Load 属性 | `isUnordered()`, `isAtomic()`, `hasMetadata()` | `llvm/IR/Instructions.h` |
+| 检查 Call 属性 | `mayThrow()`, `isConvergent()`, `getFunction()` | `llvm/IR/Instructions.h` |
+| 获取内存访问行为 | `AA->getMemoryEffects()` | `llvm/Analysis/AliasAnalysis.h` |
+| 获取 MemoryAccess | `MSSA->getMemoryAccess()` | `llvm/Analysis/MemorySSA.h` |
+| 检查是否被 clobber | `pointerInvalidatedByLoop()` | `LICM.cpp:196` |
+| 检查冲突读写 | `noConflictingReadWrites()` | `LICM.cpp:193` |
+| 检查唯一内存访问 | `isOnlyMemoryAccess()` | `LICM.cpp:1135` |
+| 检查 Load 不变性 | `isLoadInvariantInLoop()` | `LICM.cpp:1066` |
+| 检查 ModRef | `AA->getModRefInfoMask()` | `llvm/Analysis/AliasAnalysis.h` |
+
+**使用示例**：参考 `sinkRegion()` 和 `hoistRegion()` 中的调用方式（行 609、929）。
+
+---
+
+### 其他补充
+
+**与 MemorySSA 的关系**：
+- `pointerInvalidatedByLoop()` 使用 MemorySSA walker 精确追踪 load 是否被 loop 内的 store clobber
+- `noC onflictingReadWrites()` 使用 MemorySSA 判断 store/call 是否与 loop 内的其他内存操作冲突
+- `getClobberingMemoryAccess()` 受 `Flags.tooManyClobberingCalls()` 限制，防止编译时爆炸
+
+**调用时机**：
+- 在 `sinkRegion()` 中，尝试下沉指令前调用（行 609）
+- 在 `hoistRegion()` 中，尝试提升指令前调用（行 929）
+
+**正确性保证**：
+- Load：通过 MemorySSA 精确追踪确保移动后读取的值不变
+- Call：检查异常、convergent、coroutine 等边界情况
+- Store：确保不会引入新的写入路径或与现有读写冲突
+- Fence：只有在唯一内存访问时才能移动，保证内存序
+
+**性能优化**：
+- 常量内存、invariant_load、invariant.start 等快速路径避免昂贵的 MemorySSA 查询
+- `Flags.tooManyClobberingCalls()` 限制 MemorySSA walker 调用次数，防止 pathological 情况下的编译时爆炸
+
+---
+
+## 函数分析：`isLoadInvariantInLoop`（行 1066-1118）
+
+### 函数签名与目的（行 1066-1118）
+
+```cpp
+static bool isLoadInvariantInLoop(LoadInst *LI, DominatorTree *DT,
+                                   Loop *CurLoop)
+```
+
+**功能**: 判断一个 load 指令在循环中是否是不变的。判断依据是：循环外是否存在一个 `invariant.start` intrinsic，该 intrinsic 支配整个循环，且覆盖的内存位置和大小包含 load 的访问范围。
+
+---
+
+### 整体结构
+
+```
+isLoadInvariantInLoop(LoadInst *LI, DominatorTree *DT, Loop *CurLoop)
+├── 获取 load 的地址和类型大小
+├── 检查是否为可变大小类型 → 否则返回 false
+├── 检查地址是否为常量 → 是则返回 false
+├── 遍历地址的所有使用者
+│   ├── 限制遍历数量（MaxNumUsesTraversed = 8）
+│   ├── 检查查找到 invariant.start intrinsic
+│   │   ├── 验证 intrinsic 无使用者
+│   │   ├── 验证 intrinsic 大小参数非负
+│   │   ├── 验证 intrinsic 覆盖 load 的大小
+│   │   └── 验证 intrinsic 支配循环 header
+│   └── 满足所有条件则返回 true
+└── 未找到匹配的 invariant.start，返回 false
+```
+
+---
+
+### 逐段注释
+
+**1. 提取 load 的地址和大小信息（行 1068-1070）**
+
+```cpp
+Value *Addr = LI->getPointerOperand();
+const DataLayout &DL = LI->getDataLayout();
+const TypeSize LocSizeInBits = DL.getTypeSizeInBits(LI->getType());
+```
+
+目的作用：获取 load 指令加载的内存地址和加载的数据类型大小（以 bit 为单位），后续用于与 `invariant.start` 的覆盖范围进行比较。
+
+---
+
+**2. 拒绝可变大小类型（行 1072-1082）**
+
+```cpp
+if (LocSizeInBits.isScalable())
+  return false;
+```
+
+目的作用：可变大小类型（如 SVE 的 scalable vector）不支持 `invariant.start`，因为：
+- Clang 目前不会为这类类型生成 `invariant.start`
+- `invariant.start` 对可变大小对象使用 -1 作为大小参数，无法精确验证覆盖范围
+- 例如 `<vscale x 32 x i8>` 和 `<vscale x 16 x i8>` 都会是 -1，但前者是后者的两倍大小
+
+---
+
+**3. 拒绝常量地址（行 1084-1087）**
+
+```cpp
+if (isa<Constant>(Addr))
+  return false;
+```
+
+目的作用：如果地址是全局变量或常量，则不需要通过 `invariant.start` 来判断不变性，且循环 pass 不应该遍历全局/常量的 uselist。
+
+---
+
+**4. 遍历地址的使用者，查找匹配的 invariant.start（行 1089-1115）**
+
+```cpp
+unsigned UsesVisited = 0;
+for (auto *U : Addr->users()) {
+  if (++UsesVisited > MaxNumUsesTraversed)
+    return false;
+  IntrinsicInst *II = dyn_cast<IntrinsicInst>(U);
+  if (!II || II->getIntrinsicID() != Intrinsic::invariant_start ||
+      !II->use_empty())
+    continue;
+  ConstantInt *InvariantSize = cast<ConstantInt>(II->getArgOperand(0));
+  if (InvariantSize->isNegative())
+    continue;
+  uint64_t InvariantSizeInBits = InvariantSize->getSExtValue() * 8;
+  if (LocSizeInBits.getFixedValue() <= InvariantSizeInBits &&
+      DT->properlyDominates(II->getParent(), CurLoop->getHeader()))
+    return true;
+}
+```
+
+目的作用：
+- 遍历地址的所有使用者，限制遍历数量（`MaxNumUsesTraversed` 默认为 8），避免编译时开销过大
+- 查找 `invariant.start` intrinsic，该 intrinsic 标记了一段内存区域在当前路径上不会被修改
+- 验证条件：
+  1. `invariant.start` 无使用者（否则可能存在转义，无法保证不变性）
+  2. `invariant.start` 的大小参数非负（-1 表示可变大小对象，已排除）
+  3. `invariant.start` 覆盖 load 的大小（`LocSizeInBits <= InvariantSizeInBits`）
+  4. `invariant.start` 支配循环 header（确保 invariant.start 在循环外，且对整个循环有效）
+
+---
+
+**5. 未找到匹配的 invariant.start（行 1117）**
+
+```cpp
+return false;
+```
+
+目的作用：遍历完所有使用者后，未找到满足条件的 `invariant.start`，则认为 load 不是循环不变的。
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段 | 含义 |
+|---|---|---|
+| `LoadInst` | `getPointerOperand()` | 获取 load 指令加载的内存地址 |
+| `TypeSize` | `isScalable()` / `getFixedValue()` | 表示类型大小，可能是固定大小或可变大小 |
+| `IntrinsicInst` | `getIntrinsicID()` / `getArgOperand(0)` | `invariant.start` intrinsic，参数 0 为覆盖的字节数 |
+| `DominatorTree` | `properlyDominates(BB1, BB2)` | 判断 BB1 是否严格支配 BB2 |
+
+---
+
+### 优化意图
+
+1. **利用 `invariant.start` intrinsic 识别循环不变的 load**：`invariantser.start` 由前端（如 Clang）插入，用于标记在当前执行路径上不会被修改的内存区域。LICM 利用这个信息安全的将 load 提升到循环外。
+2. **限制遍历数量控制编译时开销**：通过 `MaxNumUsesTraversed`（默认 8）限制遍历地址使用者的数量，避免在地址使用者过多时产生过大的编译时开销。
+3. **保守的可变大小类型处理**：当前不支持可变大小类型的 `invariant.start`，直接返回 false，避免错误判断。
+4. **支配关系保证安全性**：要求 `invariant.start` 支配循环 header，确保 intrinsic 在循环外，且对整个循环有效。
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 获取 load 地址 | `LoadInst::getPointerOperand()` | `llvm/IR/Instructions.h` |
+| 获取类型大小 | `DataLayout::getTypeSizeInBits()` | `llvm/IR/DataLayout.h` |
+| 判断可变大小 | `TypeSize::isScalable()` | `llvm/Support/TypeSize.h` |
+| 遍历使用者 | `Value::users()` | `llvm/IR/User.h` |
+| 判断 intrinsic 类型 | `IntrinsicInst::getIntrinsicID()` | `llvm/IR/IntrinsicInst.h` |
+| 支配关系判断 | `DominatorTree::properlyDominates()` | `llvm/Analysis/Dominators.h` |
+| 命令行选项 | `MaxNumUsesTraversed`` | `llvm/lib/Transforms/Scalar/LICM.cpp:132-135` |
+
+---
+
+### 其他补充
+
+**调用上下文**：
+- 该函数在 LICM 中用于判断 load 指令是否可以安全地提升到循环外
+- 通常与 `invariant.start` intrinsic 配合使用，该 intrinsic 由前端在已知内存不会修改的路径上插入
+
+**与 MemorySSA 的关系**：
+- LICM 主要依赖 MemorySSA 进行内存别名分析，但 `isLoadInvariantInLoop` 提供了一种基于 `invariant.start` 的补充判断方式
+- 当 MemorySSA 无法精确判断时，`invariant.start` 可以提供额外的安全性保证
+
+**限制**：
+- 不支持可变大小类型（scalable vector）
+- 限制遍历地址使用者的数量，可能在地址使用者过多时错过有效的 `invariant.start`
+- 依赖前端正确插入 `invariant.start` intrinsic
 
