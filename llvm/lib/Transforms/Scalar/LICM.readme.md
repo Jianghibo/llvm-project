@@ -205,6 +205,7 @@ return SafetyInfo->isGuaranteedToExecute(Inst, DT, CurLoop);
 | `MemorySSAUpdater` | 在修改 IR 时同步更新 MemorySSA | `removeMemoryAccess()`, `createMemoryAccessInBB()`, `insertDef()`, `insertUse()`, `moveToPlace()` | `llvm/Analysis/MemorySSAUpdater.h` |
 | `ControlFlowHoister` | 处理条件分支和 PHI 的提升，维护 BB → 目标 BB 映射 | `registerPossiblyHoistableBranch()`, `canHoistPHI()`, `getOrCreateHoistedBlock()` | `LICM.cpp:654` |
 | `LoopPromoter` | 继承 `LoadAndStorePromoter`，实现内存提升的具体 IR 改写 | `insertStoresInLoopExitBlocks()`, `instructionDeleted()`, `shouldDelete()` | `LICM.cpp:1756` |
+| `PredIteratorCache` | 缓存 exit block 的前驱列表，避免 promotion 过程中重复扫描 CFG 前驱关系 | `size()`, `get()`, `clear()` | `llvm/include/llvm/IR/PredIteratorCache.h` |
 | `AliasSetTracker` | 快速分组 must-alias 集合 | `add()`, `isMustAlias()`, `isMod()` | `llvm/Analysis/AliasSetTracker.h` |
 | `SSAUpdater` | 多 def 场景下的 SSA 重建 | `AddAvailableValue()`, `GetValueInMiddleOfBlock()` | `llvm/Transforms/Utils/SSAUpdater.h` |
 | `LoopBlocksRPO` | Loop 内 BB 的反后序遍历 | `perform(LI)` | `llvm/Analysis/LoopIterator.h` |
@@ -2396,3 +2397,4058 @@ return false;
 - 限制遍历地址使用者的数量，可能在地址使用者过多时错过有效的 `invariant.start`
 - 依赖前端正确插入 `invariant.start` intrinsic
 
+
+---
+
+## 函数分析：`pointerInvalidatedByLoop`（行 2375-2424）
+
+### 函数签名与目的（行 2375-2424）
+
+```cpp
+static bool pointerInvalidatedByLoop(MemorySSA *MSSA, MemoryUse *MU,
+                                 Loop *CurLoop, Instruction &I,
+                                 SinkAndHoistLICMFlags &Flags,
+                                 bool InvariantGroup)
+```
+
+**功能**: 判断某个内存访问指令（load/store）所访问的指针在循环内是否会被无效化（即被修改），从而决定该指令是否可以安全地提升或（下沉）出循环。
+
+---
+
+### 整体结构
+
+```
+pointerInvalidatedByLoop()
+├── 检查是提升还是下沉场景
+│   ├── 提升场景（hoisting）
+│   │   ├── 使用 MemorySSA walker 查找 clobbering access
+│   │   ├── 判断 clobbering access 是否在循环内
+│   │   └── 特殊处理 invariant group 场景
+│   └── 下沉场景（sinking）
+│       ├── 遍历循环内所有基本块
+│       │   └── 调用 pointerInvalidatedByBlock 检查
+│       └── 检查源块是否也无效化指针
+└── 返回是否被无效化
+```
+
+---
+
+### 逐段注释
+
+**1. 提升场景的判断逻辑（行 2378-2395）**
+
+```cpp
+if (!Flags.getIsSink()) {
+    // 如果是提升场景，我们只需要检查在循环开始到 load 之间
+    // 是否有 store 修改了被加载的指针（因为所有值必须相同）
+    
+    // 这可以通过两个条件检查：
+    // 1) 如果 memory access 在循环外
+    // 2) 最早的 access 在循环 header，
+    //    如果加载的内存是 phi 节点
+    
+    BatchAAResults BAA(MSSA->getAA());
+    MemoryAccess *Source = getClobberingMemoryAccess(*MSSA, BAA, Flags, MU);
+    return !MSSA->isLiveOnEntryDef(Source) &&
+           CurLoop->contains(Source->getBlock()) &&
+           !(InvariantGroup && Source->getBlock() == CurLoop->getHeader() && 
+             isa<MemoryPhi>(Source));
+}
+```
+
+目的作用：在提升场景下，使用 MemorySSA 的 walker 来确定安全性。如果存在一个在循环内且会 clobber 该访问的内存操作，则不能提升。
+
+注释说明：
+- `getClobberingMemoryAccess` 查找会修改或影响该内存位置的最新访问
+- `isLiveOnEntryDef` 检查该访问是否是循环入口处的定义
+- `InvariantGroup` 特殊处理：如果是 invariant group，且 clobbering access 是循环 header 的 MemoryPhi，则认为安全
+
+**2. 下沉场景的判断逻辑（行 2397-2423）**
+
+```cpp
+// 对于下沉场景，我们需要检查该 use 下方的所有 Def。
+// getClobbering 调用会在循环的 backedge 上查找，但会检查与
+// 前一次迭代中指令的 aliasing。
+// 例如：
+// for (i ... )
+//   load a[i] ( Use (LoE)
+//   store a[i] ( 1 = Def (2), with 2 = Phi for 循环
+//   i++;
+// load 在循环内看不到 clobbering，因为 backedge alias check
+// 会做 phi 翻译，并检查与 store a[i-1] 的 aliasing。
+// 然而将 load 下沉到循环外，store 下方是不正确的。
+
+// 目前，只有当循环内没有 Def，且现有的 Def 在 use 之前
+// 且在同一块中时才下沉。
+// FIXME: 提高精度：如果 Use 后支配 Def 则安全下沉；
+// 需要 PostDominatorTreeAnalysis。
+// FIXME: 更精确：没有 alias 该 Use 的 Def。
+if (Flags.tooManyMemoryAccesses())
+  return true;
+for (auto *BB : CurLoop->getBlocks())
+  if (pointerInvalidatedByBlock(*BB, *MSSA, *MU))
+    return true;
+// 当下沉时，源块可能不是循环的一部分，所以也要检查它。
+if (!CurLoop->contains(&I))
+  return pointerInvalidatedByBlock(*I.getParent(), *MSSA, *MU);
+
+return false;
+```
+
+目的作用：在下沉场景下，遍历循环内所有基本块，检查是否有任何块会无效化该指针。如果源块不在循环内，也要检查源块。
+
+注释说明：
+- 下沉场景更保守，因为需要考虑后向依赖
+- 当前实现只检查同一块内的 Def，FIXME 注释表明可以用后支配树分析提高精度
+- `tooManyMemoryAccesses` 是编译时优化，避免在复杂循环中做昂贵的遍历
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段 | 含义 |
+|---|---|---|
+| `MemorySSA` | - | Memory SSA 分析结果，用于追踪内存访问间的依赖关系 |
+| `MemoryUse` | - | 表示一个内存使用（load/store）节点 |
+| `MemoryAccess` | - | MemoryUse 或 MemoryDef 的基类 |
+| `SinkAndHoistLICMFlags` | `IsSink`, `NoOfMemAccTooLarge` | 控制提升/下沉行为和编译时优化标志 |
+| `BatchAAResults` | - | 批量别名分析结果，用于高效的 alias 查询 |
+
+---
+
+### 优化意图
+
+1. **区分提升和下沉场景**：提升只需检查前向依赖（循环开始到指令之间），下沉需检查后向依赖（指令到循环结束）
+2. **使用 MemorySSA 提高精度**：通过 MemorySSA 的 walker 机制，精确追踪内存访问间的 clobbering 关系
+3. **编译时优化**：通过 `tooManyMemoryAccesses` 标志避免在复杂循环中做昂贵的遍历
+4. **特殊处理 invariant group**：对于标记为 invariant group 的内存访问，放宽某些检查条件
+5. **保守的下沉（sink）策略**：当前下沉实现较保守，FIXME 注释表明可以通过后支配树分析提高精度
+
+对于重要部分，要解释其为什么这么优化：
+- MemorySSA 的使用避免了传统的保守别名分析，提供了更精确的内存依赖信息
+- 区分提升和下沉场景是因为它们的语义不同：提升是将指令移到循环前（只需保证循环内无修改），下沉是将指令移到循环后（需保证循环内无后续修改）
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 获取 clobbering 内存访问 | `getClobberingMemoryAccess` | LICM.cpp:1151-1163 |
+| 检查是否是入口定义 | `isLiveOnEntryDef` | MemorySSA.h |
+| 检查块内是否无效化 | `pointerInvalidatedByBlock` | LICM.cpp:2426-2433 |
+| 批量别名分析 | `BatchAAResults` | llvm/Analysis/BasicAliasAnalysis.h |
+
+**使用示例**：
+```cpp
+// 在 canSinkOrHoistInst 中使用（行 1198-1210）
+auto MU = cast<MemoryUse>(MSSA->getMemoryAccess(LI));
+bool Invalidated = pointerInvalidatedByLoop(
+    MSSA, MU, CurLoop, I, Flags, InvariantGroup);
+return !Invalidated;
+```
+
+---
+
+### 其他补充
+
+**调用上下文**：
+- 主要在 `canSinkOrHoistInst` 函数中被调用（行 1198-1210），用于判断 load 指令是否可以安全提升或下沉
+- 对于只读内存的 call 指令也会调用此函数（行 1250-1251）
+
+**正确性保证**：
+- 对于提升场景，通过检查 clobbering access 是否在循环内来保证提升后的 load 仍然读取正确值
+- 对于下沉场景，通过遍历所有块来保证没有后续的 store 会修改该内存位置
+
+**性能权衡**：
+- 使用 `tooManyMemoryAccesses` 避免在内存访问过多的循环中做昂贵的遍历
+- MemorySSA walker 有 cap 限制（`SetLicmMssaOptCap`），超过后使用不精确的 `getDefiningAccess`
+
+**待改进点**（根据代码中的 FIXME 注释）：
+1. 下沉场景可以使用 PostDominatorTreeAnalysis 提高精度（行 2411）
+2. 可以更精确地只检查 alias 该 Use 的 Def（行 2413）
+3. 可以禁用提升 past 潜在干扰的 loads（行 2342）
+
+
+---
+
+## `noConflictingReadWrites` 函数分析
+
+> 源文件：`llvm/lib/Transforms/Scalar/LICM.cpp`，第 2307–2373 行
+
+### 函数签名与目的（行号 2307-2373）
+
+```cpp
+static bool noConflictingReadWrites(Instruction *I, MemorySSA *MSSA,
+                                    AAResults *AA, Loop *CurLoop,
+                                    SinkAndHoistLICMFlags &Flags)
+```
+
+**功能**：针对 `StoreInst` 或只写内存的 `CallInst`，判断在 `CurLoop` 范围内是否存在与指令 `I` 的内存操作**冲突的读或写**，若不存在冲突则返回 `true`，允许 LICM 对 `I` 执行 hoist 或 sink。
+
+**调用者**（`canSinkOrHoistInst` 中）：
+
+```text
+canSinkOrHoistInst()
+  ├── CallInst 且 onlyWritesMemory() → noConflictingReadWrites(CI, ...)
+  └── StoreInst 且非 isOnlyMemoryAccess → noConflictingReadWrites(SI, ...)
+```
+
+---
+
+### 整体结构
+
+```
+noConflictingReadWrites(I, MSSA, AA, CurLoop, Flags)
+├── 1. 访问数量守卫：tooManyMemoryAccesses → return false
+├── 2. 找 I 自身的 clobbering access
+│   └── clobber 在循环内 → return false（I 本身被覆盖，不能移出）
+└── 3. 遍历循环内所有 BB 的每条 MemoryAccess
+    ├── MemoryUse（普通 load）
+    │   ├── 其 clobber 在循环内 → return false（循环内写干扰该 load）
+    │   └── 仅 hoist 模式：IMD 不支配 MU → return false（可能被该 load 干扰）
+    └── MemoryDef（非普通 store 的 Def）
+        ├── 是有序 load（ordered load 存为 Def）→ return false
+        └── 是 CallInst → 检查 Call 与 I 的 ModRef
+            ├── I 是 StoreInst：BAA.getModRefInfo(CI, MemLoc(SI))
+            └── I 是 CallInst：BAA.getModRefInfo(CI, SCI)，跳过 CI == SCI
+            └── isModOrRefSet → return false
+└── return true（无冲突）
+```
+
+---
+
+### 逐段注释
+
+**1. 访问数量守卫（第 2310–2314 行）**
+
+```cpp
+assert(isa<CallInst>(*I) || isa<StoreInst>(*I));
+if (Flags.tooManyMemoryAccesses())
+  return false;
+```
+
+`SinkAndHoistLICMFlags::NoOfMemAccTooLarge` 在构造时根据循环内 MemoryAccess 数量与阈值设置。超过上限时，跳过整个分析，保守返回 `false`，避免在大循环中引发编译时爆炸。
+
+**2. 检查 I 自身是否在循环内被 clobber（第 2316–2321 行）**
+
+```cpp
+auto *IMD = MSSA->getMemoryAccess(I);
+BatchAAResults BAA(*AA);
+auto *Source = getClobberingMemoryAccess(*MSSA, BAA, Flags, IMD);
+if (!MSSA->isLiveOnEntryDef(Source) && CurLoop->contains(Source->getBlock()))
+  return false;
+```
+
+- `IMD`：`I` 对应的 `MemoryAccess`（对 store/写 call 通常是 `MemoryDef`）。
+- `getClobberingMemoryAccess` 找到真正 clobber `IMD` 的最近访问：若该 clobber **不是** `LiveOnEntry` 且位于循环内，说明循环内存在写覆盖/干扰，不能 hoist/sink。
+
+**3. 遍历循环内所有 MemoryAccess（第 2328–2371 行）**
+
+```cpp
+for (auto *BB : CurLoop->getBlocks()) {
+  auto *Accesses = MSSA->getBlockAccesses(BB);
+  if (!Accesses)
+    continue;
+  for (const auto &MA : *Accesses)
+    ...
+}
+```
+
+按基本块遍历 `MemoryUse` 与 `MemoryDef`，逐类检查可能的冲突点。
+
+**3a. `MemoryUse`：循环内读的 clobber 与 hoist 限制（第 2333–2343 行）**
+
+```cpp
+if (const auto *MU = dyn_cast<MemoryUse>(&MA)) {
+  auto *MD = getClobberingMemoryAccess(*MSSA, BAA, Flags,
+                                       const_cast<MemoryUse *>(MU));
+  if (!MSSA->isLiveOnEntryDef(MD) && CurLoop->contains(MD->getBlock()))
+    return false;
+  if (!Flags.getIsSink() && !MSSA->dominates(IMD, MU))
+    return false;
+}
+```
+
+- 若该 `MemoryUse` 的 clobbering Def 在循环内，则循环内存在写-读链，会与移动 `I` 产生干扰风险，返回 `false`。
+- 仅 hoist（`!Flags.getIsSink()`）时额外要求 `IMD` 支配 `MU`：否则 hoist 可能改变该 load 在循环内观察到的写入效果。该检查目前较保守（源码 `FIXME` 指出更精确做法应仅针对别名 `I` 的 Uses）。
+
+**3b. `MemoryDef`：ordered load 与 call 的 ModRef 冲突（第 2344–2369 行）**
+
+```cpp
+} else if (const auto *MD = dyn_cast<MemoryDef>(&MA)) {
+  if (auto *LI = dyn_cast<LoadInst>(MD->getMemoryInst())) {
+    assert(!LI->isUnordered() && "Expected unordered load");
+    return false;
+  }
+  if (auto *CI = dyn_cast<CallInst>(MD->getMemoryInst())) {
+    if (auto *SI = dyn_cast<StoreInst>(I)) {
+      ModRefInfo MRI = BAA.getModRefInfo(CI, MemoryLocation::get(SI));
+      if (isModOrRefSet(MRI))
+        return false;
+    } else {
+      auto *SCI = cast<CallInst>(I);
+      if (SCI == CI)
+        continue;
+      ModRefInfo MRI = BAA.getModRefInfo(CI, SCI);
+      if (isModOrRefSet(MRI))
+        return false;
+    }
+  }
+}
+```
+
+- ordered atomic load 在 MemorySSA 中可能被建模为 Def（带顺序语义），出现即放弃移动（保守且正确）。
+- 对循环内 `CallInst`（作为 Def）用 `BatchAAResults` 做 ModRef 检查：若 call 可能读/写 `I` 相关位置（store-location 或 call-call），则存在潜在冲突，返回 `false`。
+
+---
+
+### 关键数据结构
+
+| 类型 | 关键接口 | 含义 |
+|---|---|---|
+| `MemorySSA` | `getMemoryAccess`, `getBlockAccesses`, `isLiveOnEntryDef`, `dominates` | 内存 SSA 图与 clobber/支配查询 |
+| `MemoryUse` | - | 读内存访问节点 |
+| `MemoryDef` | `getMemoryInst()` | 写内存/有序 load/call 等访问节点 |
+| `BatchAAResults` | `getModRefInfo` | 批量缓存别名与 ModRef 查询，降低重复 AA 成本 |
+| `SinkAndHoistLICMFlags` | `tooManyMemoryAccesses`, `getIsSink` | 分析预算与 hoist/sink 模式控制 |
+
+---
+
+### 优化意图
+
+1. **用 MemorySSA 提升精度**：通过 clobbering access 判断真实内存依赖，而非完全依赖传统 AliasSet 的保守结论。
+2. **区分 hoist 与 sink 的约束**：hoist 额外限制 `dominates(IMD, MU)`，避免提升穿越潜在干扰的 loads（当前实现偏保守）。
+3. **编译时开销保护**：`tooManyMemoryAccesses()` 提供预算上限，避免在高密度内存访问循环中做昂贵遍历。
+4. **原子/顺序语义守卫**：遇到 ordered atomic load 直接放弃移动，防止破坏内存顺序语义。
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 获取指令 MemoryAccess | `MSSA->getMemoryAccess(I)` | `llvm/Analysis/MemorySSA.h` |
+| 获取块内访问序列 | `MSSA->getBlockAccesses(BB)` | `llvm/Analysis/MemorySSA.h` |
+| clobber 查询 | `getClobberingMemoryAccess(...)` | `LICM.cpp`（内部 helper） |
+| LiveOnEntry 判定 | `MSSA->isLiveOnEntryDef(...)` | `llvm/Analysis/MemorySSA.h` |
+| 支配关系 | `MSSA->dominates(IMD, MU)` | `llvm/Analysis/MemorySSA.h` |
+| ModRef 查询 | `BatchAAResults::getModRefInfo(...)` | `llvm/Analysis/AliasAnalysis.h` |
+| 模式与预算 | `SinkAndHoistLICMFlags` | `llvm/Transforms/Utils/LoopUtils.h` |
+
+---
+
+### 其他补充
+
+- **保守点**：hoist 场景的 `dominates(IMD, MU)` 检查未做 alias 过滤，可能过度拒绝；源码明确标注 `FIXME`，未来可按“仅对 alias I 的 Uses”收紧。
+- **适用范围**：函数入口 `assert` 限定仅用于 store 或 call（写内存）这两类需要读写冲突检查的指令。
+
+---
+
+## 函数分析：`isSafeToExecuteUnconditionally()`（行 1729-1753）
+
+### 函数签名与目的（行 1729-1753）
+
+```cpp
+static bool isSafeToExecuteUnconditionally(
+    Instruction &Inst, const DominatorTree *DT, const TargetLibraryInfo *TLI,
+    const Loop *CurLoop, const LoopSafetyInfo *SafetyInfo,
+    OptimizationRemarkEmitter *ORE, const Instruction *CtxI,
+    AssumptionCache *AC, bool AllowSpeculation)
+```
+
+**功能**: 判断是否安全地将指令无条件执行（即在循环外/预头块中执行），主要用于 LICM 的 hoisting 和 sinking 决策。
+
+---
+
+### 整体结构
+
+```text
+isSafeToExecuteUnconditionally(Inst, DT, TLI, CurLoop, SafetyInfo, ORE, CtxI, AC, AllowSpeculation)
+├── Step 1: Speculative Execution Check
+│   └── 如果允许推测执行且安全 → 返回 true
+│       调用：isSafeToSpeculativelyExecute
+├── Step 2: Guaranteed-to-Execute Check
+│   ├── 检查指令是否在循环内 guaranteed to execute
+│   │   调用：SafetyInfo->isGuaranteedToExecute
+│   └── 如果不是 guaranteed to execute
+│       ├── 如果是 LoadInst 且地址 loop invariant
+│       │   └── 发出 OptimizationRemarkMissed
+│       └── 返回 false
+└── Step 3: 返回结果
+    └── GuaranteedToExecute 的值
+```
+
+---
+
+### 逐段注释
+
+#### 1. 推测执行检查 (行 1734-1736)
+
+```cpp
+if (AllowSpeculation &&
+    isSafeToSpeculativelyExecute(&Inst, CtxI, AC, DT, TLI))
+  return true;
+```
+
+**目的作用**: 
+- 首先检查是否允许推测执行 (`AllowSpeculation` flag)
+- 如果允许，调用 `isSafeToSpeculativelyExecute` 验证指令是否可以安全地推测执行
+- 如果可以推测执行，直接返回 true，无需后续检查
+
+**关键点**:
+- 这是一个快速路径优化，避免进入更复杂的检查
+- 推测执行通常针对可能 trap 的指令（如 load、div）
+- 需要 AC(假设缓存)、DT(支配树)、TLI(目标库信息) 来验证安全性
+
+---
+
+#### 2. 确认执行安全检查 (行 1738-1750)
+
+**代码片段**:
+```cpp
+bool GuaranteedToExecute =
+    SafetyInfo->isGuaranteedToExecute(Inst, DT, CurLoop);
+
+if (!GuaranteedToExecute) {
+  auto *LI = dyn_cast<LoadInst>(&Inst);
+  if (LI && CurLoop->isLoopInvariant(LI->getPointerOperand()))
+    ORE->emit([&]() {
+      return OptimizationRemarkMissed(
+                 DEBUG_TYPE, "LoadWithLoopInvariantAddressCondExecuted", LI)
+             << "failed to hoist load with loop-invariant address "
+                "because load is conditionally executed";
+    });
+}
+```
+
+**目的作用**:
+- **核心检查**: 通过 `SafetyInfo->isGuaranteedToExecute` 判断指令是否在循环的每个可执行路径上都会被执行
+- `SafetyInfo` 是 LICM 在 `runOnLoop` 中预先计算的循环安全信息
+- `isGuaranteedToExecute` 基于支配树分析确定指令是否被条件分支保护
+
+**非 guaranteed 时的特殊处理**:
+- 如果指令不是 guaranteed to execute，特别检查是否为 `LoadInst`
+- 如果 load 的地址是 loop invariant（但执行本身有條件），发出 remark 记录优化未生效的原因
+- Remark ID: `"LoadWithLoopInvariantAddressCondExecuted"`
+
+**调试意义**:
+- 这条信息帮助开发者理解为什么某些循环不变 load 没有被 hoist
+- 常见于条件执行的路径上的内存访问
+
+---
+
+#### 3. 返回最终结果 (行 1752)
+
+**代码片段**:
+```cpp
+return GuaranteedToExecute;
+```
+
+**目的作用**:
+- 直接返回步骤 2 中计算的结果
+- 只有当指令 guaranteed to execute 时才返回 true
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段 | 含义 |
+|------|------|------|
+| `LoopSafetyInfo` | - | 存储循环安全信息，包括哪些指令 guaranteed to execute |
+| `DominatorTree` | - | 用于支配关系分析和执行路径判断 |
+| `Instruction` | - | 待检查的指令对象 |
+| `AssumptionCache` | - | 包含假设信息，辅助推断指针有效性等 |
+
+---
+
+### 优化意图
+
+**设计动机**:
+
+1. **防止 Trap 异常**: 确保在循环外执行指令不会引入新的 trap（例如访问无效指针）
+   - 推测执行允许对无副作用的指令做乐观推理
+   - 保证执行则要求严格的路径可达性分析
+
+2. **保持语义等价性**: LICM 的核心原则是不改变程序语义
+   - 移动到预头块意味着该指令会在循环前始终执行一次
+   - 对于原循环内可能不执行的指令，必须谨慎对待
+
+3. **保留编译器提示能力**: 通过 ORE 输出 missed optimization 信息
+   - 即使无法 hoist，也能告知开发者失败原因
+   - 便于源码级调整（如添加 restrict、重构控制流）
+
+**权衡考虑**:
+
+- **保守 vs 激进**: `AllowSpeculation` 参数控制策略激进程度
+  - `true`: 允许更多优化，但依赖假设缓存的准确性
+  - `false`: 仅移动 guaranteed to execute 的指令
+
+- **精度 vs 开销**: `SafetyInfo->isGuaranteedToExecute` 的计算成本较高
+  - 在 `runOnLoop` 中一次性计算供多次使用
+  - 避免每次 hoist 时重复分析
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|------|------|------|
+| `AllowSpeculation` 为 false | 此时跳过推测执行检查，强制要求 guaranteed to execute | 错过一些 hoisting 机会 |
+| `SafetyInfo` 已失效 | LICM 修改 IR 后需重新计算安全信息 | 可能导致错误的 hoisting 决策 |
+| Load 条件执行 | 即使地址 invariant，若执行有条件也不能 hoist | 正确性保护机制，不可绕过 |
+| Context 指令 CtxI | 通常是 Preheader 的 terminator，作为 hoisting 的目标上下文 | 需提供有效的上下界 |
+
+**关键前提条件**:
+
+```cpp
+// 调用链位置参考 (hoistRegion 行 930):
+if (CurLoop->hasLoopInvariantOperands(&I) &&
+    canSinkOrHoistInst(I, AA, DT, CurLoop, MSSAU, true, Flags, ORE) &&
+    isSafeToExecuteUnconditionally(...)) {
+  // 三个检查缺一不可:
+  // 1. 操作数 loop invariant
+  // 2. alias 安全 + 机械能力满足
+  // 3. 执行无条件安全 ← 本函数负责
+}
+```
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 推测执行检查 | `isSafeToSpeculativelyExecute` | `llvm/include/llvm/Transforms/Utils/Local.h` |
+| 保证执行检查 | `SafetyInfo->isGuaranteedToExecute` | `llvm/lib/Transforms/Scalar/LICM.cpp:2128+` (LICMSafetyInfo) |
+| 循环不变性判断 | `CurLoop->isLoopInvariant` | `llvm/include/llvm/Analysis/LoopInfo.h` |
+| Optimization 记录 | `ORE->emit` | `llvm/include/llvm/Analysis/OptimizationRemarkEmitter.h` |
+| 指令类型转换 | `dyn_cast<LoadInst>` | `llvm/include/llvm/IR/Instructions.h` |
+
+**使用示例**:
+```cpp
+// 在 LICM::runOnLoop 中，先计算 SafetyInfo:
+ICFLoopSafetyInfo SafetyInfo;
+SafetyInfo.computeLoopSafetyInfo(L);
+
+// 在 hoistRegion 中对每个候选指令检查:
+if (isSafeToExecuteUnconditionally(I, DT, TLI, CurLoop, 
+                                    &SafetyInfo, ORE, 
+                                    Preheader->getTerminator(), AC,
+                                    LicmAllowSpeculation)) {
+  // 安全 hoist
+}
+```
+
+---
+
+### 关联函数
+
+| 函数 | 关系 |
+|------|------|
+| `canSinkOrHoistInst` (行 1165+) | 检查指令是否有能力 hoist/sink，但不验证执行安全性 |
+| `isSafeToSpeculativelyExecute` | 实际实现推测执行的安全检查逻辑 |
+| `hoist` (行 1682+) | 通过本函数确认安全后才调用 |
+| `sink` (行 1576+) | 同样需要先通过本函数验证 |
+
+**典型调用链**:
+```text
+hoistRegion
+  → 遍历每个指令
+    → canSinkOrHoistInst (别名分析 + 机械能力)
+    → isSafeToExecuteUnconditionally (执行安全性) ← 当前函数
+      → isSafeToSpeculativelyExecute (推测路径)
+      → SafetyInfo->isGuaranteedToExecute (保证执行路径)
+    → hoist (实际移动)
+```
+
+---
+
+### 其他补充
+
+**版本差异**:
+- NewPM(LLVM 17+) 通过 `Opts.AllowSpeculation` 传递此标志
+- Legacy PM 在 `LegacyLICMPass` 构造函数中默认初始化为 `true`
+
+**性能考量**:
+- `isGuaranteedToExecute` 的计算在 `runOnLoop` 开始时完成
+- 整个 pass 中对每个指令只调用一次，复杂度 O(N)
+
+**调试建议**:
+```bash
+opt -load-pass-plugin=libclicm.so -passes="licm" \
+    -debug-only=licm -S input.ll 2>&1 | grep -A2 -B2 "conditional"
+```
+
+---
+
+
+## 函数分析：`hoist`（行 1682-1724）
+
+### 函数签名与目的（行 1682-1685）
+
+```cpp
+static void hoist(Instruction &I, const DominatorTree *DT, const Loop *CurLoop,
+                   BasicBlock *Dest, ICFLoopSafetyInfo *SafetyInfo,
+                   MemorySSAUpdater &MSSAU, ScalarEvolution *SE,
+                   OptimizationRemarkEmitter *ORE);
+```
+
+**功能**: 将指令 I 从循环体提升到目标块 Dest（通常是循环前驱块），执行必要的清理和更新工作。
+
+---
+
+### 整体结构
+
+```
+hoist(Instruction &I, ...)
+├── 发出优化备注
+├── 处理元数据和调用属性
+│   ├── 如果指令有元数据且非必然执行，删除 UB 属性和元数据
+└── 移动指令到目标位置
+    ├── 如果是 PHI 节点，移到目标块 PHI 列表末尾
+    └── 否则，移到目标块终止符之前
+└── 更新调试信息位置
+└── 更新统计信息
+```
+
+---
+
+### 逐段注释
+
+**1. 发出优化备注（行 1686-1691）**
+
+```cpp
+LLVM_DEBUG(dbgs() << "LICM hoisting to " << Dest->getNameOrAsOperand() << ": "
+                  << I << "\n");
+ORE->emit([&]() {
+  return OptimizationRemark(DEBUG_TYPE, "Hoisted", &I) << "hoisting "
+                                                         << ore::NV("Inst", &I);
+});
+```
+
+目的作用：
+- 记录提升操作的调试信息
+- 发出优化备注，供用户查看哪些指令被提升
+
+**2. 处理元数据和调用属性（行 169.3-1707）**
+
+```cpp
+if ((I.hasMetadataOtherThanDebugLoc() || isa<CallInst>(I)) &&
+      !SafetyInfo->isGuaranteedToExecute(I, DT, CurLoop)) {
+  I.dropUBImplyingAttrsAndMetadata();
+}
+```
+
+目的作用：
+- 当指令有元数据或为调用指令，且在循环中非必然执行时
+- 删除可能导致可能导致未定义行为的属性和元数据
+- 原因：提升到循环前驱块后，这些元数据可能不再有效
+
+**3. 移动指令到目标位置（行 1709-1715）**
+
+```cpp
+if (isa<PHINode>(I))
+  moveInstructionBefore(I, Dest->getFirstNonPHIIt(), *SafetyInfo, MSSAU, SE);
+else
+  moveInstructionBefore(I, Dest->getTerminator()->getIterator(), *SafetyInfo,
+                        MSSAU, SE);
+```
+
+目的作用：
+- 将指令 I 移动到目标块 Dest
+- PHI 节点移到目标块的 PHI 列表末尾（在非 PHI 指令之前）
+- 其他指令移到目标块终止符之前
+
+**4. 更新调试信息（行 1717）**
+
+```cpp
+I.updateLocationAfterHoist();
+```
+
+目的作用：
+- 更新指令的调试信息位置，反映其新的位置
+
+**5. 更新统计信息（行 1719-1723）**
+
+```cpp
+if (isa<LoadInst>(I))
+  ++NumMovedLoads;
+else if (isa<CallInst>(I))
+  ++NumMovedCalls;
+++NumHoisted;
+```
+
+目的作用：
+- 更新 LICM 统计信息，记录提升的指令数量
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段 | 含义 |
+|---|---|---|
+| Instruction | - | 被提升的指令 |
+| DominatorTree | - | 支配树，用于判断指令是否必然执行 |
+| Loop | - | 当前循环 |
+| BasicBlock | - | 目标块（通常是循环前驱块） |
+| ICFLoopSafetyInfo | - | 循环安全信息，用于判断指令是否必然执行 |
+| MemorySSAUpdater | - | MemorySSA 更新器，用于更新内存 SSA |
+| ScalarEvolution | - | 标量演化，用于遗忘循环信息 |
+| OptimizationRemarkEmitter | - | 优化备注发射器，用于发出优化备注 |
+
+---
+
+### 优化意图
+
+1. 减少循环体中的计算量，提高性能
+2. 将循环不变计算移出循环，避免重复计算
+3. 为后续优化创造机会（如常量传播、死代码消除）
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 指令必须安全提升 | 指令不能有副作用，提升后不会改变程序语义 | 错误提升可能导致程序行为改变 |
+| 元数据可能失效 | 提升后某些元数据可能不再有效 | 需要删除可能导致 UB 的元数据 |
+| PHI 节点位置特殊 | PHI 节点必须放在目标块 PHI 列表末尾 | 错误放置可能导致 IR 不合法 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 判断指令是否必然执行 | `isGuaranteedToExecute` | `llvm/Analysis/MustExecute.h` |
+| 移动指令 | `moveInstructionBefore` | `llvm/lib/Transforms/Scalar/LICM.cpp:1456` |
+| 更新调试信息 | `updateLocationAfterHoist` | `llvm/IR/Instructions.h` |
+| 删除 UB 属性和元数据 | `dropUBImplyingAttrsAndMetadata` | `llvm/IR/Instructions.h` |
+
+**使用示例**：
+- 在 `hoistRegion` 函数中调用 `hoist` 提升指令（行 933）
+- 在处理 FDiv 时调用 `hoist` 提升倒数除数（行 961）
+- 在处理 invariant.start 或 guard 时调用 `hoist`（行 980）
+
+---
+
+### 其他补充
+
+1. `hoist` 函数是 LICM Pass 的核心操作之一，负责将指令从循环体提升到循环前驱
+2. 函数内部调用了 `moveInstructionBefore` 来实际移动指令，并更新相关分析结果
+3. 函数会处理元数据和调用属性，确保提升后的指令不会导致未定义行为
+4. 函数会更新统计信息，用于性能分析和调试
+
+---
+
+## 函数分析：`hoistArithmetics`（行 203-206）
+
+### 函数签名与目的（行 203-206）
+
+```cpp
+static bool hoistArithmetics(Instruction &I, Loop &L,
+                              ICFLoopSafetyInfo &SafetyInfo,
+                              MemorySSAUpdater &MSSAU, AssumptionCache *AC,
+                              DominatorTree *DT);
+```
+
+**功能**: 尝试通过重关联表达式将部分不变计算提取出循环，提升到循环前驱块。支持 min/max、GEP、add/sub、浮点数和整数运算等多种模式。
+
+---
+
+### 整体结构
+
+```
+hoistArithmetics(I, L, SafetyInfo, MSSAU, AC, DT)
+├── 尝试 hoistMinMax（选择指令）
+│   └── 尝试 hoistGEP（GEP 重关联）
+│   └── 尝试 hoistAdd / hoistSub（加减重关联）
+│   └── 尝试 hoistFPAssociation（浮点数重关联）
+│   └── 尝试 hoistBOAssociation（整数/浮点数通用重关联）
+└── 返回是否发生变换
+```
+
+---
+
+### 逐段注释
+
+**1. hoistMinMax（选择指令）**
+
+```cpp
+if (hoistMinMax(I, L, SafetyInfo, MSSAU, AC, DT))
+  return true;
+```
+
+目的作用：
+- 尝试将 `select` 指令形式的 min/max 表达式提升到循环外
+- 例如：`(A < C1) && (A < C2)` → `A < min(C1, C2)`
+
+**2. hoistGEP（GEP 重关联）**
+
+```cpp
+if (hoistGEP(I, L, SafetyInfo, MSSAU, AC, DT))
+  return true;
+```
+
+目的作用：
+- 尝试将 GEP（GetElementPtr）指令重关联，把不变的索引层移到外层，允许外层 GEP 被提升
+- 例如：`gep(gep(ptr, idx1_variant), idx2_invariant)` → `gep(gep(ptr, idx2_invariant), idx1_variant)`
+
+**3. hoistAdd / hoistSub（加减重关联）**
+
+```cpp
+if (hoistAdd(Pred, LHS, RHS, cast<ICmpInst>(I), L, SafetyInfo, MSSAU, AC, DT))
+  return true;
+if (hoistSub(Pred, LHS, RHS, cast<ICmpInst>(I), L, SafetyInfo, MSSAU, AC, DT))
+  return true;
+```
+
+目的作用：
+- 尝试将加减运算重关联，将不变量的加减移到比较的另一侧
+- 例如：`(LV + C1) < C2` → `LV < C2 - C1`
+
+**4. hoistFPAssociation（浮点数重关联）**
+
+```cpp
+if (hoistFPAssociation(I, L, SafetyInfo, MSSAU, AC, DT))
+  return true;
+```
+
+目的作用：
+- 尝试浮点数重关联，受 `AllowFPReassoc` 标志控制
+- 有 `FPAssociationUpperLimit` 限制单轮变换次数（默认 5）
+
+**5. hoistBOAssociation（整数/浮点数通用重关联）**
+
+```cpp
+if (hoistBOAssociation(I, L, SafetyInfo, MSSAU, AC, DT))
+  return true;
+```
+
+目的作用：
+- 尝试整数和浮点数通用重关联，受 `IntAssociationUpperLimit` 限制单轮变换次数（默认 5）
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段 | 含义 |
+|---|---|---|
+| Instruction | - | 被试重关联的指令 |
+| Loop | - | 当前循环 |
+| ICFLoopSafetyInfo | - | 循环安全信息 |
+| MemorySSAUpdater | - | MemorySSA 更新器 |
+| AssumptionCache | - | 假设缓存 |
+| DominatorTree | - | 支配树 |
+
+---
+
+### 优化意图
+
+1. **重关联提升不变量**：通过重新组织表达式的结合方式，将部分不变的计算提取到循环外
+2. **减少循环内计算量**：不变量提升后，循环内只需执行一次计算
+3. **为后续优化创造机会**：提升后的不变量可能被常量传播、死代码消除等优化利用
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 结合律结合律不满足 | 重关联可能改变计算结果，需要确保 flags 正确 | 计算错误 |
+| 浮点溢出 | 浮点运算可能溢出，需要检查 nsw/nuw flags | 溢出风险 |
+| Poison 传播 | 重关联可能引入 poison，需要正确处理 | 语义风险 |
+| 浮序依赖 | 重关联改变操作数顺序，可能改变程序行为 | 正确性风险 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 判断指令类型 | `isa<SelectInst>()`, `isa<ICmpInst>()` 等 | `llvm/IR/Instructions.h` |
+| 检查操作数不变性 | `L->isLoopInvariant()` | `llvm/Analysis/LoopInfo.h` |
+| 创建新指令 | `BinaryOperator::Create*()` | `llvm/IR/Instructions.h` |
+| 更新指令 | `I.replaceAllUsesWith()` | `llvm/IR/Instruction.h` |
+| 删除旧指令 | `eraseInstruction()` | `LICM.cpp` 内部 |
+| 判断是否安全执行 | `isSafeToExecuteUnconditionally()` | `LICM.cpp` 内部 |
+| 更新指令位置 | `moveInstructionBefore()` | `LICM.cpp` 内部 |
+
+**使用示例**：
+- 在 `hoistRegion` 函数中调用 `hoistArithmetics(I, ...)`（行 1004）
+- 在 `hoistRegion` 函数中对每个指令尝试重关联提升（行 1002-1007）
+
+---
+
+### 其他补充
+
+1. **变换次数限制**：`FPAssociationUpperLimit` 和 `IntAssociationUpperLimit` 限制单轮变换次数，防止编译时爆炸
+2. **递归调用**：每个 helper 函数可能递归调用自身，形成级联提升（如 `hoistMinMax` → `hoistGEP` → `hoistAdd` → `hoistFPAssociation`）
+3. **变换成功返回**：只要任一 helper 成功即返回 true，允许后续继续尝试其他模式
+
+---
+
+## 补充分析：`PredIteratorCache` 在 LICM Promotion 中的作用与效率价值
+
+`PredIteratorCache` 是一个非常轻量的 **BasicBlock 前驱列表缓存**，定义在 `llvm/include/llvm/IR/PredIteratorCache.h:24`。它内部用 `DenseMap<BasicBlock *, ArrayRef<BasicBlock *>>` 记录某个 block 的前驱列表，并在第一次查询时把 `predecessors(BB)` 的结果物化到 `BumpPtrAllocator` 中保存；后续对同一个 `BB` 的查询直接复用缓存数组，而不是重新沿 CFG 的 use-list 遍历。
+
+**它解决的问题**：LICM 的 memory promotion 会对同一批 loop exit blocks 反复插入 LCSSA PHI 和 store。如果每次都直接调用 `predecessors(BB)`，那么同一个 exit block 的前驱列表会被重复扫描多次；`PredIteratorCache` 把这部分重复工作折叠为“第一次收集，后续复用”。
+
+### 在 LICM 中的调用链
+
+```cpp
+LoopInvariantCodeMotion::runOnLoop()              // LICM.cpp:447-535
+  -> PredIteratorCache PIC;                       // LICM.cpp:508
+  -> promoteLoopAccessesToScalars(..., PIC, ...) // LICM.cpp:518-521
+     -> LoopPromoter Promoter(..., PIC, ...)     // LICM.cpp:2182-2186
+        -> maybeInsertLCSSAPHI()                 // LICM.cpp:1775-1787
+```
+
+### 它具体用在什么场景
+
+`LoopPromoter::insertStoresInLoopExitBlocks()` 会在每个 exit block 中插入写回 store。如果要写回的值或指针定义在 loop 内部，那么直接在 exit block 使用它会破坏 LCSSA，此时 `maybeInsertLCSSAPHI()` 会先在 exit block 头部插入一个 PHI：
+
+```cpp
+PHINode *PN = PHINode::Create(I->getType(), PredCache.size(BB),
+                              I->getName() + ".lcssa");
+for (BasicBlock *Pred : PredCache.get(BB))
+  PN->addIncoming(I, Pred);
+```
+
+这里会同时用到：
+- `PredCache.size(BB)`：提前给 PHI 预留 incoming 个数
+- `PredCache.get(BB)`：遍历 exit block 的所有前驱并填充 incoming
+
+也就是说，`PredIteratorCache` 在 LICM 中不是用于 hoist/sink 合法性判断，而是用于 **promotion 阶段构造 LCSSA PHI**。
+
+### 为什么它比直接用 `predecessors(BB)` 更高效
+
+- 它**不是**让“单次前驱查询”更快；第一次查询同样需要扫描前驱。
+- 它的收益来自“**同一个 BasicBlock 被多次查询前驱**”的场景。
+- 如果直接写成：
+
+```cpp
+unsigned NumPreds = std::distance(pred_begin(ExitBB), pred_end(ExitBB));
+PHINode *PN = PHINode::Create(Ty, NumPreds, Name);
+for (BasicBlock *Pred : predecessors(ExitBB))
+  PN->addIncoming(V, Pred);
+```
+
+那么每造一个 PHI，通常至少要对 `ExitBB` 的前驱做两次遍历：一次数个数，一次数列表。对于 promotion 来说，同一轮 `do { ... } while (LocalPromoted)` 里会反复处理多个 must-alias 候选集合（`LICM.cpp:514-524`），这些候选往往共享同一批 exit blocks，因此不加缓存会反复重扫相同的前驱关系。
+
+### 一个具体例子
+
+假设 loop 有一个共享的 `exit` block，循环内部有三条不同路径都能跳到它：
+
+```llvm
+for.body:
+  br i1 %c1, label %exit, label %cont1
+cont1:
+  br i1 %c2, label %exit, label %cont2
+cont2:
+  br i1 %c3, label %exit, label %latch
+exit:
+  ...
+```
+
+这时 `exit` 的前驱是 `for.body`、`cont1`、`cont2`。如果 LICM promotion 发现 5 组可提升的 must-alias 内存访问，并且其中多组都需要在 `exit` 中插入 LCSSA PHI：
+
+- **直接用 `predecessors(exit)`**：每次插一个 PHI，都要重新数一遍前驱、再遍历一遍前驱
+- **用 `PredIteratorCache`**：第一次 `PIC.get(exit)` 时把 `[for.body, cont1, cont2]` 缓存下来，后续 `PIC.size(exit)` / `PIC.get(exit)` 直接复用这份 `ArrayRef`
+
+因此，`PredIteratorCache` 优化掉的是“对同一个 exit block 的重复 CFG 前驱扫描”，而不是 PHI 构造本身。
+
+### 怎么使用以及边界条件
+
+```cpp
+PredIteratorCache PIC;
+
+PHINode *PN = PHINode::Create(Ty, PIC.size(ExitBB), Name);
+for (BasicBlock *Pred : PIC.get(ExitBB))
+  PN->addIncoming(V, Pred);
+```
+
+- 适合在一个局部变换中多次查询同一批 blocks 的前驱列表
+- 如果 CFG 边发生变化（例如 split block、改 branch successor、增删前驱），缓存内容可能过期，需要调用 `PIC.clear()` 失效重建；`PredIteratorCache.h:48-52`
+- LICM 的 promotion 这段逻辑主要插入 `load/store/phi`，不改 exit block 的前驱关系，所以可以安全地在整轮 promotion 中复用同一个 `PIC`
+
+---
+
+## moveInstructionBefore 函数分析
+
+### 函数签名与目的（行号 1456-1459）
+
+```cpp
+static void moveInstructionBefore(Instruction &I, BasicBlock::iterator Dest,
+                                  ICFLoopSafetyInfo &SafetyInfo,
+                                  MemorySSAUpdater &MSSAU,
+                                  ScalarEvolution *SE)
+```
+
+**功能**: 将指令 `I` 移动到目标位置 `Dest`，同时更新 SafetyInfo、MemorySSA 和 SCEV 分析信息，保证 LICM 变换后分析结果的正确性。
+
+---
+
+### 整体结构
+
+```
+moveInstructionBefore(I, Dest, SafetyInfo, MSSAU, SE)
+├── 从 SafetyInfo 移除指令 I
+├── 将指令 I 插入到目标 BB 的 SafetyInfo
+├── 执行 IR 层面的指令移动
+├── 更新 MemorySSA 访问位置
+└── 清除 SCEV 的块/循环 disposition 缓存
+```
+
+---
+
+### 逐段注释
+
+**1. SafetyInfo 状态转移 (行 1460-1461)**
+
+```cpp
+SafetyInfo.removeInstruction(&I);
+SafetyInfo.insertInstructionTo(&I, Dest->getParent());
+I.moveBefore(*Dest->getParent(), Dest);
+```
+
+- **目的**: 先从原位置移除指令的安全信息，再将指令标记为属于目标基本块
+- **为何先移后插**: `ICFLoopSafetyInfo` 维护每个 BB 的指令集合，移动前后需要更新所属关系
+- **关键点**: 必须在 IR 移动前更新 SafetyInfo，否则 `I` 的父 BB 信息可能不一致
+
+**2. IR 层面指令移动 (行 1462)**
+
+```cpp
+I.moveBefore(*Dest->getParent(), Dest);
+```
+
+- **目的**: 将指令 `I` 从原位置移动到 `Dest` 指定的位置
+- **API 说明**: `moveBefore(BasicBlock &BB, BasicBlock::iterator I)` 将指令插入到 BB 的 I 位置之前
+
+**3. MemorySSA 更新 (行 1463-1466)**
+
+```cpp
+if (MemoryUseOrDef *OldMemAcc = cast_or_null<MemoryUseOrDef>(
+        MSSAU.getMemorySSA()->getMemoryAccess(&I)))
+  MSSAU.moveToPlace(OldMemAcc, Dest->getParent(),
+                    MemorySSA::BeforeTerminator);
+```
+
+- **目的**: 如果指令涉及内存访问，更新其在 MemorySSA 中的位置
+- **条件检查**: `cast_or_null` 返回 null 表示非内存指令，跳过 MSSA 更新
+- **目标位置**: `BeforeTerminator` 表示插入到目标块终结指令之前
+
+**4. SCEV 缓存清理 (行 1467-1468)**
+
+```cpp
+if (SE)
+  SE->forgetBlockAndLoopDispositions(&I);
+```
+
+- **目的**: 使 SCEV 中与该指令相关的块/循环 disposition 信息失效
+- **原因**: 指令位置变化可能影响循环分析结果（如 `isLoopInvariant` 判断）
+- **可选性**: SE 参数可能为空，需判空
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段/接口 | 含义 |
+|---|---|---|
+| `ICFLoopSafetyInfo` | `removeInstruction()` | 从当前 BB 的指令集合中移除 |
+| `ICFLoopSafetyInfo` | `insertInstructionTo()` | 将指令登记到目标 BB |
+| `MemorySSAUpdater` | `moveToPlace()` | 移动 MemoryUse/Def 到新位置 |
+| `ScalarEvolution` | `forgetBlockAndLoopDispositions()` | 清除缓存的分析结果 |
+
+---
+
+### 优化意图
+
+1. **维护分析一致性**: LICM 将指令从循环内提升到循环外，必须同步更新 SafetyInfo、MemorySSA、SCEV 三类分析
+2. **减少重建开销**: 通过增量更新而非全量重建，降低编译时成本
+3. **支持后续变换**: 更新后的分析结果供后续 hoist/sink 决策使用
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| SafetyInfo 必须先更新 | 在 `I.moveBefore` 前调用 `removeInstruction`/`insertInstructionTo` | IR 移动后父 BB 信息可能不一致 |
+| MSSA 更新仅限内存指令 | 非内存指令无 MemoryAccess，`getMemoryAccess` 返回 null | 无需处理 |
+| SCEV 可为空 | 调用方可能不传入 SE | 需判空 |
+| 目标位置必须在有效 BB | `Dest->getParent()` 必须有效 | 否则 UB |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 指令移动 | `Instruction::moveBefore()` | `llvm/IR/Instruction.h` |
+| MemorySSA 更新 | `MemorySSAUpdater::moveToPlace()` | `llvm/Analysis/MemorySSAUpdater.h` |
+| SCEV 缓存清理 | `ScalarEvolution::forgetBlockAndLoopDispositions()` | `llvm/Analysis/ScalarEvolution.h` |
+| SafetyInfo 维护 | `ICFLoopSafetyInfo::removeInstruction()` | 本文件行号 214 声明 |
+
+---
+
+### 调用场景
+
+该函数在 LICM 中被调用三次：
+
+1. **行 1039**: Hoist（提升）阶段，将循环不变指令提升到循环前置块
+2. **行 1711**: Sink（下沉）阶段，将指令下沉到出口块的首个非 PHI 位置
+3. **行 1714**: Sink 阶段，将指令下沉到出口块的终结指令之前
+
+---
+
+## hoistMinMax 函数分析
+
+### 函数签名与目的（行号 2438-2439）
+
+```cpp
+static bool hoistMinMax(Instruction &I, Loop &L, ICFLoopSafetyInfo &SafetyInfo,
+                        MemorySSAUpdater &MSSAU)
+```
+
+**功能**: 尝试将形如 `(A < INV_1 AND A < INV_2)` 的条件简化为 `(A < min(INV_1, INV_2))`，其中 `INV_1` 和 `INV_2` 是循环不变量，`A` 是循环变量。通过在循环外计算 min/max，减少循环内的比较次数。
+
+---
+
+### 整体结构
+
+```
+hoistMinMax(I, L, SafetyInfo, MSSAU)
+├── 步骤1: 匹配逻辑与/或指令，确定是否需要反转谓词
+├── 步骤2: 提取两个 icmp 并验证模式（一个循环变量 vs 一个不变量）
+├── 步骤3: 检查两个 icmp 是否可合并（相同 LHS，匹配的谓词）
+├── 步骤4: 在循环前置块创建 min/max intrinsic
+├── 步骤5: 替换原指令并清理
+└── 返回 true/false
+```
+
+---
+
+### 逐段注释
+
+**1. 匹配逻辑与/或指令 (行 2440-2448)**
+
+```cpp
+bool Inverse = false;
+using namespace PatternMatch;
+Value *Cond1, *Cond2;
+if (match(&I, m_LogicalOr(m_Value(Cond1), m_Value(Cond2)))) {
+  Inverse = true;
+} else if (match(&I, m_LogicalAnd(m_Value(Cond1), m_Value(Cond2)))) {
+  // Do nothing
+} else
+  return false;
+```
+
+- 目的：识别输入指令是否为逻辑与（AND）或逻辑或（OR）
+- 对于 `OR`，后续需要对谓词取反
+- `m_LogicalAnd` / `m_LogicalOr` 同时匹配 `and i1` 和 `select i1` 形式
+
+**2. 提取并验证 icmp 模式 (行 2450-2472)**
+
+```cpp
+auto MatchICmpAgainstInvariant = [&](Value *C, CmpPredicate &P, Value *&LHS,
+                                     Value *&RHS) {
+  if (!match(C, m_OneUse(m_ICmp(P, m_Value(LHS), m_Value(RHS)))))
+    return false;
+  if (!LHS->getType()->isIntegerTy())
+    return false;
+  if (!ICmpInst::isRelational(P))
+    return false;
+  if (L.isLoopInvariant(LHS)) {
+    std::swap(LHS, RHS);
+    P = ICmpInst::getSwappedPredicate(P);
+  }
+  if (L.isLoopInvariant(LHS) || !L.isLoopInvariant(RHS))
+    return false;
+  if (Inverse)
+    P = ICmpInst::getInversePredicate(P);
+  return true;
+};
+CmpPredicate P1, P2;
+Value *LHS1, *LHS2, *RHS1, *RHS2;
+if (!MatchICmpAgainstInvariant(Cond1, P1, LHS1, RHS1) ||
+    !MatchICmpAgainstInvariant(Cond2, P2, LHS2, RHS2))
+  return false;
+```
+
+- 目的：验证每个条件都是 `icmp`，且形式为"循环变量 op 循环不变量"
+- 关键约束：
+  - 必须是整数类型的 icmp
+  - 必须是关系谓词（`<`, `<=`, `>`, `>=`），不支持 `==`/`!=`
+  - 必须满足"一个操作数循环不变，另一个循环变化"
+  - `m_OneUse` 限制确保 icmp 只有这一个使用者，变换后可安全删除
+
+**3. 检查可合并性 (行 2473-2475)**
+
+```cpp
+auto MatchingPred = CmpPredicate::getMatching(P1, P2);
+if (!MatchingPred || LHS1 != LHS2)
+  return false;
+```
+
+- 目的：确保两个 icmp 可合并
+- 条件：
+  - `LHS1 == LHS2`：两个比较必须是同一个循环变量
+  - `getMatching(P1, P2)` 返回有效谓词：例如 `<` 和 `<` 匹配，`<` 和 `>` 不匹配
+
+**4. 创建 min/max intrinsic (行 2478-2504)**
+
+```cpp
+bool UseMin = ICmpInst::isLT(*MatchingPred) || ICmpInst::isLE(*MatchingPred);
+Intrinsic::ID id = ICmpInst::isSigned(*MatchingPred)
+                       ? (UseMin ? Intrinsic::smin : Intrinsic::smax)
+                       : (UseMin ? Intrinsic::umin : Intrinsic::umax);
+auto *Preheader = L.getLoopPreheader();
+IRBuilder<> Builder(Preheader->getTerminator());
+if (isa<SelectInst>(I))
+  RHS2 = Builder.CreateFreeze(RHS2, RHS2->getName() + ".fr");
+Value *NewRHS = Builder.CreateBinaryIntrinsic(
+    id, RHS1, RHS2, nullptr,
+    StringRef("invariant.") +
+        (ICmpInst::isSigned(*MatchingPred) ? "s" : "u") +
+        (UseMin ? "min" : "max"));
+Builder.SetInsertPoint(&I);
+ICmpInst::Predicate P = *MatchingPred;
+if (Inverse)
+  P = ICmpInst::getInversePredicate(P);
+Value *NewCond = Builder.CreateICmp(P, LHS1, NewRHS);
+```
+
+- 目的：在循环前置块计算 min/max，循环内只做一次比较
+- 谓词映射：
+  - `<` / `<=` → 使用 `min`
+  - `>` / `>=` → 使用 `max`
+  - 有符号 → `smin`/`smax`，无符号 → `umin`/`umax`
+- **Freeze 处理**（行 2493-2494）：如果是 `select` 形式的逻辑操作，`RHS2` 可能是 poison（短路求值时未使用的分支），需要 freeze
+
+**5. 替换与清理 (行 2505-2514)**
+
+```cpp
+NewCond->takeName(&I);
+I.replaceAllUsesWith(NewCond);
+eraseInstruction(I, SafetyInfo, MSSAU);
+Instruction &CondI1 = *cast<Instruction>(Cond1);
+Instruction &CondI2 = *cast<Instruction>(Cond2);
+salvageDebugInfo(CondI1);
+salvageDebugInfo(CondI2);
+eraseInstruction(CondI1, SafetyInfo, MSSAU);
+eraseInstruction(CondI2, SafetyInfo, MSSAU);
+return true;
+```
+
+- 目的：替换原指令并清理死代码
+- 保留 debug 信息后删除原逻辑指令和两个 icmp
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段/接口 | 含义 |
+|---|---|---|
+| `PatternMatch::m_LogicalAnd` | 匹配器 | 匹配 `and i1` 或 `select i1, i1 true, i1 false` 形式 |
+| `PatternMatch::m_LogicalOr` | 匹配器 | 匹配 `or i1` 或 `select i1, i1 false, i1 true` 形式 |
+| `CmpPredicate` | `getMatching()` | 判断两个谓词是否可合并为同一方向 |
+| `ICmpInst` | `isRelational()` | 判断是否为 `<`, `<=`, `>`, `>=` |
+| `Intrinsic` | `smin/smax/umin/umax` | LLVM 内联函数 ID |
+
+---
+
+### 优化意图
+
+1. **减少循环内比较次数**：将两次 icmp + 一次逻辑运算 → 一次 icmp
+2. **提升不变计算**：min/max 计算提到循环外，每轮循环复用结果
+3. **支持短路求值形式**：通过 `m_LogicalAnd/m_LogicalOr` 兼容 `select` 实现的短路求值
+
+**为什么这样优化**：
+- 循环内条件判断越少，分支预测压力越低
+- min/max 通常可映射到单条指令（如 x86 的 `pminsd`）
+- 对于 N 次循环，从 2N 次 icmp → N 次 icmp + 1 次 min/max
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| icmp 必须是 one-use | 确保 icmp 没有其他使用者 | 删除后导致 use-after-free |
+| LHS 必须相同 | 两个比较必须是同一个变量 | 否则无法合并 |
+| 谓词方向必须一致 | `<` 和 `>` 不能合并 | 无意义变换 |
+| select 形式的 poison | 短路求值中未使用的分支可能是 poison | 需要 freeze |
+| 整数类型限制 | 不支持浮点 | 浮点 min/max 语义不同 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 模式匹配 | `PatternMatch::match()` | `llvm/IR/PatternMatch.h` |
+| 逻辑操作匹配 | `m_LogicalAnd`, `m_LogicalOr` | `llvm/IR/PatternMatch.h` |
+| icmp 匹配 | `m_ICmp()` | `llvm/IR/PatternMatch.h` |
+| 谓词操作 | `ICmpInst::getSwappedPredicate()` | `llvm/IR/InstrTypes.h` |
+| 创建 intrinsic | `IRBuilder::CreateBinaryIntrinsic()` | `llvm/IR/IRBuilder.h` |
+| freeze 创建 | `IRBuilder::CreateFreeze()` | `llvm/IR/IRBuilder.h` |
+
+---
+
+### 示例场景
+
+#### C 语言示例
+
+```c
+// 场景：循环内的边界检查优化
+// 原始代码：检查 i 是否在某个动态上界内
+int clamp(int *arr, int n, int lower, int upper) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+        // 两个上界比较，可合并为 i < min(lower, upper)
+        if (i < lower && i < upper) {
+            sum += arr[i];
+        }
+    }
+    return sum;
+}
+```
+
+#### 变换前的 IR
+
+```llvm
+define i32 @clamp(ptr %arr, i32 %n, i32 %lower, i32 %upper) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.end ]
+  %sum = phi i32 [ 0, %entry ], [ %sum.next, %loop.end ]
+  ; 两次 icmp
+  %cmp1 = icmp slt i32 %i, %lower    ; i < lower
+  %cmp2 = icmp slt i32 %i, %upper    ; i < upper
+  ; 逻辑与
+  %and = and i1 %cmp1, %cmp2         ; 两个条件都满足
+  br i1 %and, label %body, label %loop.end
+body:
+  %gep = getelementptr i32, ptr %arr, i32 %i
+  %val = load i32, ptr %gep
+  %sum.next = add i32 %sum, %val
+  br label %loop.end
+loop.end:
+  %i.next = add i32 %i, 1
+  %cond = icmp slt i32 %i.next, %n
+  br i1 %cond, label %loop, label %exit
+exit:
+  ret i32 %sum
+}
+```
+
+#### 变换后的 IR
+
+```llvm
+define i32 @clamp(ptr %arr, i32 %n, i32 %lower, i32 %upper) {
+entry:
+  ; min/max 计算提到循环外
+  %invariant.smin = call i32 @llvm.smin.i32(i32 %lower, i32 %upper)
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.end ]
+  %sum = phi i32 [ 0, %entry ], [ %sum.next, %loop.end ]
+  ; 只需一次 icmp
+  %cmp = icmp slt i32 %i, %invariant.smin  ; i < min(lower, upper)
+  br i1 %cmp, label %body, label %loop.end
+body:
+  %gep = getelementptr i32, ptr %arr, i32 %i
+  %val = load i32, ptr %gep
+  %sum.next = add i32 %sum, %val
+  br label %loop.end
+loop.end:
+  %i.next = add i32 %i, 1
+  %cond = icmp slt i32 %i.next, %n
+  br i1 %cond, label %loop, label %exit
+exit:
+  ret i32 %sum
+}
+
+; LLVM intrinsic 声明
+declare i32 @llvm.smin.i32(i32, i32)
+```
+
+#### 变换效果
+
+| 指标 | 变换前 | 变换后 |
+|---|---|---|
+| 循环内 icmp | 2 次 | 1 次 |
+| 循环内逻辑运算 | 1 次 and | 0 次 |
+| 循环外计算 | 无 | 1 次 smin |
+| N 次循环总 icmp | 2N | N + 1 |
+
+---
+
+## 函数分析：`hoistGEP`（行 2519-2573）
+
+### 函数签名与目的（行 2519-2524）
+
+```cpp
+static bool hoistGEP(Instruction &I, Loop &L, ICFLoopSafetyInfo &SafetyInfo,
+                      MemorySSAUpdater &MSSAU, AssumptionCache *AC,
+                      DominatorTree *DT)
+```
+
+**功能**：通过重新关联嵌套 GEP 的索引层，将不变量的索引层移到外层，从而允许外层 GEP 被提升到循环外。核心变换是 `gep(gep(ptr, idx1_variant), idx2_invariant)` → `gep(gep(ptr, idx2_invariant), idx1_variant)`，使得外层 GEP（使用不变索引）可以 hoist 到 preheader。
+
+---
+
+### 整体结构
+
+```
+hoistGEP(I, L, SafetyInfo, MSSAU, AC, DT)
+├── 1. 类型检查：I 是否为 GEP
+├── 2. 常量索引检查：排除全常量 GEP
+├── 3. 嵌套 GEP 检查：指针操作数必须是循环内的单用 GEP
+├── 4. 不变性验证：基指针不变 + 外层 GEP 的所有索引不变
+├── 5. 早退检查：内层 GEP 索引不能全不变（否则标准 LICM 已处理）
+├── 6. inbounds 条件计算：两个 GEP 均 inbounds + 所有偏移非负
+├── 7. 创建重关联 GEP 链
+│   ├── 在 preheader 创建 NewSrc = gep(SrcPtr, GEP.indices)   // 不变部分
+│   ├── 在原位置创建 NewGEP = gep(NewSrc, Src.indices)         // 变部分
+│   ├── GEP.replaceAllUsesWith(NewGEP)
+│   └── 删除原 GEP 和 Src GEP
+└── 返回 true
+```
+
+---
+
+### 逐段注释
+
+**1. 类型检查与常量索引排除（行 2522-2530）**
+
+```cpp
+auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+if (!GEP)
+  return false;
+
+// Do not try to hoist a constant GEP out of the loop via reassociation.
+// Constant GEPs can often be folded into addressing modes, and reassociating
+// them may inhibit CSE of a common base.
+if (GEP->hasAllConstantIndices())
+  return false;
+```
+
+- `dyn_cast<GetElementPtrInst>`：只处理 GEP 指令，其他指令直接返回 false
+- `hasAllConstantIndices()`：全常量索引的 GEP 通常能被后端折叠进寻址模式（如 `[base + offset]`），重关联反而可能抑制公共基址的 CSE
+
+**2. 嵌套 GEP 与单用检查（行 2532-2534）**
+
+```cpp
+auto *Src = dyn_cast<GetElementPtrInst>(GEP->getPointerOperand());
+if (!Src || !Src->hasOneUse() || !L.contains(Src))
+  return false;
+```
+
+三个条件缺一不可：
+- 指针操作数必须是另一个 GEP（嵌套 GEP 模式）
+- `Src->hasOneUse()`：内层 GEP 只能被当前 GEP 使用，确保重关联后不会遗漏其他用户
+- `L.contains(Src)`：内层 GEP 必须在循环内（否则不需要重关联）
+
+**3. 不变性验证（行 2536-2539）**
+
+```cpp
+Value *SrcPtr = Src->getPointerOperand();
+auto LoopInvariant = [&](Value *V) { return L.isLoopInvariant(V); };
+if (!L.isLoopInvariant(SrcPtr) || !all_of(GEP->indices(), LoopInvariant))
+  return false;
+```
+
+变换的前提条件：
+- 最外层基指针 `SrcPtr` 必须循环不变
+- 外层 GEP 的所有索引必须循环不变（这些是要提升到 preheader 的部分）
+
+**4. 早退：内层 GEP 索引全不变（行 2541-2546）**
+
+```cpp
+// This can only happen if !AllowSpeculation, otherwise this would already be
+// handled.
+// FIXME: Should we respect AllowSpeculation in these reassociation folds?
+// The flag exists to prevent metadata dropping, which is not relevant here.
+if (all_of(Src->indices(), LoopInvariant))
+  return false;
+```
+
+如果内层 GEP 的所有索引也不变，那么 `Src` 本身就是标准 LICM 的 hoist 候选，不需要重关联。到达这里说明 `Src` 至少有一个变索引。FIXME 指出当前未考虑 `AllowSpeculation` 标志，但注释认为这里不涉及 metadata dropping，可能无需处理。
+
+**5. inbounds 条件计算（行 2548-2557）**
+
+```cpp
+const DataLayout &DL = GEP->getDataLayout();
+auto NonNegative = [&](Value *V) {
+  return isKnownNonNegative(V, SimplifyQuery(DL, DT, AC, GEP));
+};
+bool IsInBounds = Src->isInBounds() && GEP->isInBounds() &&
+                  all_of(Src->indices(), NonNegative) &&
+                  all_of(GEP->indices(), NonNegative);
+```
+
+交换 GEP 嵌套顺序后保持 `inbounds` 的条件：
+- 两个原始 GEP 都必须是 `inbounds`
+- 两个 GEP 的所有偏移量都必须非负
+
+原因：`inbounds` 要求指针不越界，交换索引层后只有当所有偏移都是非负时才能保证不改变越界语义。使用 `isKnownNonNegative` + `SimplifyQuery`（依赖 DT、AC）做精确推断。
+
+**6. 创建重关联后的 GEP 链（行 2559-2572）**
+
+```cpp
+BasicBlock *Preheader = L.getLoopPreheader();
+IRBuilder<> Builder(Preheader->getTerminator());
+Value *NewSrc = Builder.CreateGEP(GEP->getSourceElementType(), SrcPtr,
+                                  SmallVector<Value *>(GEP->indices()),
+                                  "invariant.gep", IsInBounds);
+Builder.SetInsertPoint(GEP);
+Value *NewGEP = Builder.CreateGEP(Src->getSourceElementType(), NewSrc,
+                                  SmallVector<Value *>(Src->indices()), "gep",
+                                  IsInBounds);
+GEP->replaceAllUsesWith(NewGEP);
+eraseInstruction(*GEP, SafetyInfo, MSSAU);
+salvageDebugInfo(*Src);
+eraseInstruction(*Src, SafetyInfo, MSSAU);
+return true;
+```
+
+变换步骤：
+1. 在 preheader terminator 前创建 `NewSrc = gep(SrcPtr, GEP.indices)` —— 这是不变的部分，可以被后续标准 LICM hoist
+2. 将 Builder 插入点移回原 GEP 位置
+3. 创建 `NewGEP = gep(NewSrc, Src.indices)` —— 这是变的部分，留在循环内
+4. `GEP->replaceAllUsesWith(NewGEP)`：保持语义等价
+5. 删除原 GEP 和内层 Src GEP（原 GEP 先 RAUW 再 erase；Src 先 salvage debug 再 erase）
+
+---
+
+### 变换示例
+
+**变换前**（`Src` 有变索引 `i`，`GEP` 有不变索引 `offset`）：
+
+```llvm
+loop:
+  %i = phi i64 [0, %pre], [%i.next, %loop]
+  %src.gep = getelementptr inbounds i32, ptr %base, i64 %i    ; Src（变索引）
+  %outer.gep = getelementptr inbounds i32, ptr %src.gep, i64 4  ; GEP（不变索引）
+  %val = load i32, ptr %outer.gep
+  ...
+```
+
+**变换后**（不变索引 `4` 被提到外层 GEP，该 GEP 可被后续 LICM hoist）：
+
+```llvm
+preheader:
+  %invariant.gep = getelementptr inbounds i32, ptr %base, i64 4  ; NewSrc（不变，可 hoist）
+loop:
+  %i = phi i64 [0, %pre], [%i.next, %loop]
+  %gep = getelementptr inbounds i32, ptr %invariant.gep, i64 %i  ; NewGEP（变，留循环内）
+  %val = load i32, ptr %gep
+  ...
+```
+
+---
+
+### 关键数据结构
+
+| 结构 | 关键字段/接口 | 含义 |
+|---|---|---|
+| `GetElementPtrInst` | `getPointerOperand()`, `indices()`, `isInBounds()`, `hasAllConstantIndices()` | GEP 指令，提供指针、索引、inbounds 属性 |
+| `IRBuilder<>` | `CreateGEP()`, `SetInsertPoint()` | IR 构建器，在指定位置创建指令 |
+| `SimplifyQuery` | 构造函数 `(DL, DT, AC, CtxI)` | 简化查询上下文，为 `isKnownNonNegative` 提供分析信息 |
+
+---
+
+### 优化意图
+
+1. **暴露更多 hoist 机会**：嵌套 GEP 中，如果外层索引不变但内层索引变，标准 LICM 无法提升外层 GEP（因为它的指针操作数是循环内的）。通过交换索引层，不变部分被移到外层 GEP，使其成为标准 LICM 的候选。
+
+2. **常量 GEP 排除**：全常量 GEP 通常被后端折叠进寻址模式（如 x86 的 `[base + disp32]`），重关联不仅无益，还可能抑制公共基址的 CSE。
+
+3. **单用约束**：`Src->hasOneUse()` 确保内层 GEP 只被当前外层 GEP 使用。如果 Src 有多个用户，重关联会改变其他用户的计算结果，不安全。
+
+4. **inbounds 保守处理**：只有当两个 GEP 都 inbounds 且所有偏移非负时才保留 inbounds。否则新 GEP 不带 inbounds，保守但正确。
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 嵌套 GEP 模式 | 仅处理 `gep(gep(...))` 两层嵌套 | 更深层嵌套不被处理 |
+| 内层 GEP 单用 | `Src->hasOneUse()` | 多用户时重关联会改变其他用户的语义 |
+| inbounds 保留条件 | 两个 GEP 均 inbounds + 所有偏移非负 | 条件不满足时新 GEP 丢失 inbounds，可能影响后续优化 |
+| 内层 GEP 至少一个变索引 | `all_of(Src->indices(), LoopInvariant)` 为 false 时才继续 | 全不变时标准 LICM 已处理，重关联是冗余工作 |
+| 调试信息保留 | `salvageDebugInfo(*Src)` 在删除 Src 前调用 | 不调用会导致调试信息丢失 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 类型转换 | `dyn_cast<GetElementPtrInst>(&I)` | `llvm/IR/Instructions.h` |
+| 获取 GEP 基指针 | `GEP->getPointerOperand()` | `llvm/IR/Instructions.h` |
+| 遍历 GEP 索引 | `GEP->indices()` | `llvm/IR/Instructions.h` |
+| 检查常量索引 | `GEP->hasAllConstantIndices()` | `llvm/IR/Instructions.h` |
+| 检查 inbounds | `GEP->isInBounds()` | `llvm/IR/Instructions.h` |
+| 判断循环不变 | `L.isLoopInvariant(V)` | `llvm/Analysis/LoopInfo.h` |
+| 判断非负 | `isKnownNonNegative(V, SimplifyQuery)` | `llvm/Analysis/ValueTracking.h` |
+| 创建 GEP | `Builder.CreateGEP()` | `llvm/IR/IRBuilder.h` |
+| 替换使用 | `GEP->replaceAllUsesWith(NewGEP)` | `llvm/IR/Value.h` |
+| 删除指令 | `eraseInstruction()` | `LICM.cpp:211` |
+| 保存调试信息 | `salvageDebugInfo()` | `llvm/Transforms/Utils/Local.h` |
+
+---
+
+### 调用上下文
+
+```text
+hoistRegion()                              // LICM.cpp:889
+  -> 遍历循环内每条指令
+     -> hoistArithmetics(I, ...)            // LICM.cpp:1004
+        -> hoistGEP(I, ...)                 // LICM.cpp:2519（本函数）
+```
+
+`hoistGEP` 是 `hoistArithmetics` 中尝试的多种重关联策略之一，在 `hoistMinMax` 之后、`hoistAdd`/`hoistSub` 之前被调用。返回 `true` 时，`hoistArithmetics` 立即返回，不再尝试后续策略。
+
+---
+
+### 统计项
+
+变换成功时递增 `NumGEPsHoisted`（`LICM.cpp:107-108`）：
+
+```cpp
+STATISTIC(NumGEPsHoisted,
+          "Number of geps reassociated and hoisted out of the loop");
+```
+
+---
+
+### 与其他 hoistArithmetics helper 的对比
+
+| Helper | 处理的 IR 模式 | 变换效果 |
+|---|---|---|
+| `hoistMinMax` | `select/and/or(icmp(A, INV1), icmp(A, INV2))` | 合并为 `icmp(A, min/max(INV1, INV2))` |
+| `hoistGEP` | `gep(gep(ptr, variant), invariant)` | 交换索引层：`gep(gep(ptr, invariant), variant)` |
+| `hoistAdd` | `icmp(LV + INV1, INV2)` | 移项：`icmp(LV, INV2 - INV1)` |
+| `hoistSub` | `icmp(LV - INV1, INV2)` 或 `icmp(INV1 - LV, INV2)` | 移项并可能翻转谓词 |
+| `hoistFPAssociation` | FP 二元运算链 | 重结合以提取不变子表达式 |
+| `hoistBOAssociation` | 整数/FP 二元运算链 | 通用的重结合变换 |
+
+---
+
+## 函数分析：`hoistAdd`（行 2575-2630）
+
+### 函数签名与目的（行 2575-2580）
+
+```cpp
+static bool hoistAdd(ICmpInst::Predicate Pred, Value *VariantLHS,
+                     Value *InvariantRHS, ICmpInst &ICmp, Loop &L,
+                     ICFLoopSafetyInfo &SafetyInfo, MemorySSAUpdater &MSSAU,
+                     AssumptionCache *AC, DominatorTree *DT)
+```
+
+**功能**：将形如 `(LV + C1) < C2` 的比较重关联为 `LV < (C2 - C1)`，其中 `LV` 是循环变量（loop-variant），`C1` 和 `C2` 是循环不变量（loop-invariant）。通过在 preheader 中预先计算 `C2 - C1`，循环内只需做一次比较。
+
+---
+
+### 整体结构
+
+```
+hoistAdd(Pred, VariantLHS, InvariantRHS, ICmp, L, ...)
+├── 1. 前置断言：VariantLHS 变，InvariantRHS 不变
+├── 2. 确定符号性（signed vs unsigned）
+├── 3. PatternMatch：从 VariantLHS 中提取 (VariantOp + InvariantOp)
+│   ├── Signed → m_NSWAddLike
+│   └── Unsigned → m_NUWAddLike
+├── 4. 确保 VariantOp 是变、InvariantOp 是不变
+├── 5. 溢出检查：C2 - C1 永不溢出
+├── 6. 在 preheader 创建 NewCmpOp = C2 - C1
+├── 7. 修改 icmp：LV < NewCmpOp
+├── 8. 删除原加法指令
+└── 返回 true
+```
+
+---
+
+### 逐段注释
+
+**1. 前置断言与符号性判断（行 2581-2584）**
+
+```cpp
+assert(!L.isLoopInvariant(VariantLHS) && "Precondition.");
+assert(L.isLoopInvariant(InvariantRHS) && "Precondition.");
+bool IsSigned = ICmpInst::isSigned(Pred);
+```
+
+调用者已确保：比较的 LHS 是循环变量，RHS 是循环不变量。`isSigned` 判断比较谓词是否为有符号（`slt`/`sle`/`sgt`/`sge`）。
+
+**2. 匹配加法模式（行 2586-2594）**
+
+```cpp
+using namespace PatternMatch;
+Value *VariantOp, *InvariantOp;
+if (IsSigned && !match(VariantLHS, m_NSWAddLike(m_Value(VariantOp),
+                                                m_Value(InvariantOp))))
+  return false;
+if (!IsSigned && !match(VariantLHS, m_NUWAddLike(m_Value(VariantOp),
+                                                 m_Value(InvariantOp))))
+  return false;
+```
+
+- 有符号比较 → 匹配 `nsw add`（`m_NSWAddLike` 同时匹配 `add nsw` 和 `or` 形式的加法）
+- 无符号比较 → 匹配 `nuw add`（`m_NUWAddLike`）
+
+**为什么需要 nsw/nuw？** 移项 `LV + C1 < C2` → `LV < C2 - C1` 等价于线性代数中的移项，但整数运算中溢出会打破等价性。`nsw`/`nuw` flag 保证加法不溢出，是变换合法性的基础。
+
+**3. 确保操作数角色正确（行 2596-2601）**
+
+```cpp
+if (L.isLoopInvariant(VariantOp))
+  std::swap(VariantOp, InvariantOp);
+if (L.isLoopInvariant(VariantOp) || !L.isLoopInvariant(InvariantOp))
+  return false;
+```
+
+`PatternMatch` 不保证操作数顺序，这里确保 `VariantOp` 是循环变量、`InvariantOp` 是循环不变量。如果两个都是不变或两个都是变，则无法变换。
+
+**4. 溢出检查（行 2603-2615）**
+
+```cpp
+auto &DL = L.getHeader()->getDataLayout();
+SimplifyQuery SQ(DL, DT, AC, &ICmp);
+if (IsSigned && computeOverflowForSignedSub(InvariantRHS, InvariantOp, SQ) !=
+                    llvm::OverflowResult::NeverOverflows)
+  return false;
+if (!IsSigned &&
+    computeOverflowForUnsignedSub(InvariantRHS, InvariantOp, SQ) !=
+        llvm::OverflowResult::NeverOverflows)
+  return false;
+```
+
+核心正确性约束：`C2 - C1` 必须永不溢出。使用 `computeOverflowForSignedSub`/`computeOverflowForUnsignedSub` + `SimplifyQuery`（利用 DT、AC 做值域推断）精确判断。
+
+**5. 创建新比较操作数并修改 icmp（行 2616-2624）**
+
+```cpp
+auto *Preheader = L.getLoopPreheader();
+IRBuilder<> Builder(Preheader->getTerminator());
+Value *NewCmpOp =
+    Builder.CreateSub(InvariantRHS, InvariantOp, "invariant.op",
+                      /*HasNUW*/ !IsSigned, /*HasNSW*/ IsSigned);
+ICmp.setPredicate(Pred);
+ICmp.setOperand(0, VariantOp);
+ICmp.setOperand(1, NewCmpOp);
+```
+
+- 在 preheader 中创建 `C2 - C1`（带 nsw/nuw flag）
+- 直接修改原 `icmp` 指令：LHS 改为 `LV`，RHS 改为 `NewCmpOp`，谓词不变
+
+**6. 清理（行 2626-2629）**
+
+```cpp
+Instruction &DeadI = cast<Instruction>(*VariantLHS);
+salvageDebugInfo(DeadI);
+eraseInstruction(DeadI, SafetyInfo, MSSAU);
+return true;
+```
+
+原加法指令不再需要，先保存调试信息再删除。
+
+---
+
+### 变换示例
+
+**C 语言场景**：
+
+```c
+// 循环变量 i 与不变量 offset、limit 的比较
+for (int i = 0; i < n; i++) {
+    if (i + offset < limit) {  // offset, limit 不变
+        arr[i] = val;
+    }
+}
+```
+
+**变换前 IR**：
+
+```llvm
+loop:
+  %i = phi i32 [0, %pre], [%i.next, %loop]
+  %add = add nsw i32 %i, %offset      ; 循环内计算
+  %cmp = icmp slt i32 %add, %limit     ; (i + offset) < limit
+  br i1 %cmp, label %body, label %loop.end
+```
+
+**变换后 IR**：
+
+```llvm
+preheader:
+  %invariant.op = sub nsw i32 %limit, %offset  ; limit - offset（循环外）
+loop:
+  %i = phi i32 [0, %pre], [%i.next, %loop]
+  %cmp = icmp slt i32 %i, %invariant.op         ; i < (limit - offset)
+  br i1 %cmp, label %body, label %loop.end
+```
+
+---
+
+### 关键数据结构
+
+| 结构 | 关键字段/接口 | 含义 |
+|---|---|---|
+| `PatternMatch` | `m_NSWAddLike`, `m_NUWAddLike` | 匹配带溢出标志的加法 |
+| `SimplifyQuery` | 构造函数 `(DL, DT, AC, CtxI)` | 为溢出检查提供分析上下文 |
+| `OverflowResult` | `NeverOverflows` | 溢出检查结果 |
+| `ICmpInst` | `setPredicate()`, `setOperand()` | 直接修改比较指令 |
+
+---
+
+### 优化意图
+
+1. **消除循环内加法**：将 `LV + C1` 中的不变量 `C1` 移到比较的另一侧，循环内只需做比较，加法被 `C2 - C1` 替代并提升到 preheader
+2. **利用 nsw/nuw 保证等价性**：变换依赖加法/减法的无溢出保证，否则移项在溢出情况下不等价
+3. **减少循环内指令数**：对于 N 次循环，从 N 次加法 + N 次比较 → N 次比较 + 1 次减法
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 必须有 nsw/nuw flag | 无溢出标志的 add 不能安全移项 | 溢出时移项不等价 |
+| C2 - C1 永不溢出 | 通过 `computeOverflowFor*Sub` 检查 | 否则新减法可能产生 poison |
+| 操作数角色必须一変一不变 | 两个都变或两个都不变无法变换 | 提前返回 false |
+| VariantLHS 必须有一个使用 | 由调用者 `hoistAddSub` 保证 `hasOneUse()` | 否则删除后影响其他用户 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 匹配加法 | `match(V, m_NSWAddLike(...))` | `llvm/IR/PatternMatch.h` |
+| 判断有符号 | `ICmpInst::isSigned(Pred)` | `llvm/IR/InstrTypes.h` |
+| 溢出检查 | `computeOverflowForSignedSub()` | `llvm/Analysis/ValueTracking.h` |
+| 创建减法 | `Builder.CreateSub()` | `llvm/IR/IRBuilder.h` |
+| 修改 icmp | `ICmp.setPredicate()`, `setOperand()` | `llvm/IR/Instructions.h` |
+| 删除指令 | `eraseInstruction()` | `LICM.cpp:211` |
+
+---
+
+### 调用上下文
+
+```text
+hoistRegion()
+  -> hoistArithmetics(I, ...)
+     -> hoistAddSub(I, ...)
+        -> hoistAdd(Pred, LHS, RHS, ...)  // 本函数
+```
+
+---
+
+## 函数分析：`hoistSub`（行 2632-2711）
+
+### 函数签名与目的（行 2632-2638）
+
+```cpp
+static bool hoistSub(ICmpInst::Predicate Pred, Value *VariantLHS,
+                     Value *InvariantRHS, ICmpInst &ICmp, Loop &L,
+                     ICFLoopSafetyInfo &SafetyInfo, MemorySSAUpdater &MSSAU,
+                     AssumptionCache *AC, DominatorTree *DT)
+```
+
+**功能**：处理两种减法模式的比较重关联：
+- **模式 A**：`LV - C1 < C2` → `LV < C1 + C2`
+- **模式 B**：`C1 - LV < C2` → `LV > C1 - C2`（变量在减号右侧，需翻转谓词）
+
+---
+
+### 整体结构
+
+```
+hoistSub(Pred, VariantLHS, InvariantRHS, ICmp, L, ...)
+├── 1. 前置断言：VariantLHS 变，InvariantRHS 不变
+├── 2. 确定符号性
+├── 3. PatternMatch：从 VariantLHS 中提取减法
+│   ├── Signed → m_NSWSub
+│   └── Unsigned → m_NUWSub
+├── 4. 判断变量在减号的哪一侧
+│   ├── VariantOp 不变 → 变量在右侧（模式 B）
+│   │   ├── 交换操作数角色
+│   │   └── 翻转谓词
+│   └── 否则 → 变量在左侧（模式 A）
+├── 5. 溢出检查
+│   ├── 模式 B：C1 - C2 永不溢出
+│   └── 模式 A：C1 + C2 永不溢出
+├── 6. 在 preheader 创建 NewCmpOp
+│   ├── 模式 B → C1 - C2
+│   └── 模式 A → C1 + C2
+├── 7. 修改 icmp
+├── 8. 删除原减法指令
+└── 返回 true
+```
+
+---
+
+### 逐段注释
+
+**1. 匹配减法模式（行 2644-2652）**
+
+```cpp
+using namespace PatternMatch;
+Value *VariantOp, *InvariantOp;
+if (IsSigned &&
+    !match(VariantLHS, m_NSWSub(m_Value(VariantOp), m_Value(InvariantOp))))
+  return false;
+if (!IsSigned &&
+    !match(VariantLHS, m_NUWSub(m_Value(VariantOp), m_Value(InvariantOp))))
+  return false;
+```
+
+匹配 `sub nsw` 或 `sub nuw`。`m_NSWSub` 匹配 `sub nsw A, B`，捕获两个操作数。
+
+**2. 判断变量位置（行 2654-2664）**
+
+```cpp
+bool VariantSubtracted = false;
+if (L.isLoopInvariant(VariantOp)) {
+  std::swap(VariantOp, InvariantOp);
+  VariantSubtracted = true;
+  Pred = ICmpInst::getSwappedPredicate(Pred);
+}
+if (L.isLoopInvariant(VariantOp) || !L.isLoopInvariant(InvariantOp))
+  return false;
+```
+
+`m_NSWSub(VariantOp, InvariantOp)` 匹配的是 `VariantOp - InvariantOp`，但 `PatternMatch` 按书写顺序捕获，不区分哪个是变量。如果 `VariantOp` 实际是不变量，说明变量在减号右侧（`C1 - LV`），此时：
+- 交换操作数：`VariantOp` 变为循环变量
+- `VariantSubtracted = true`：标记变量被减
+- 翻转谓词：`<` → `>`（因为 `C1 - LV < C2` 等价于 `LV > C1 - C2`）
+
+**3. 溢出检查（行 2666-2693）**
+
+四种情况，分别检查：
+
+| 模式 | 变换 | 需检查 |
+|---|---|---|
+| A (Signed) | `LV - C1 < C2` → `LV < C1 + C2` | `C1 + C2` 不溢出 |
+| A (Unsigned) | 同上 | `C1 + C2` 不溢出 |
+| B (Signed) | `C1 - LV < C2` → `LV > C1 - C2` | `C1 - C2` 不溢出 |
+| B (Unsigned) | 同上 | `C1 - C2` 不溢出 |
+
+**4. 创建新操作数并修改 icmp（行 2694-2705）**
+
+```cpp
+IRBuilder<> Builder(Preheader->getTerminator());
+Value *NewCmpOp =
+    VariantSubtracted
+        ? Builder.CreateSub(InvariantOp, InvariantRHS, "invariant.op",
+                            /*HasNUW*/ !IsSigned, /*HasNSW*/ IsSigned)
+        : Builder.CreateAdd(InvariantOp, InvariantRHS, "invariant.op",
+                            /*HasNUW*/ !IsSigned, /*HasNSW*/ IsSigned);
+ICmp.setPredicate(Pred);
+ICmp.setOperand(0, VariantOp);
+ICmp.setOperand(1, NewCmpOp);
+```
+
+- 模式 A（变量在左侧）→ 创建 `C1 + C2`
+- 模式 B（变量在右侧）→ 创建 `C1 - C2`
+
+---
+
+### 变换示例
+
+**模式 A：`LV - C1 < C2` → `LV < C1 + C2`**
+
+```c
+// C 语言
+for (int i = 0; i < n; i++) {
+    if (i - header_size < body_limit) {  // header_size, body_limit 不变
+        process(i);
+    }
+}
+```
+
+```llvm
+; 变换前
+%sub = sub nsw i32 %i, %header_size
+%cmp = icmp slt i32 %sub, %body_limit    ; (i - header_size) < body_limit
+
+; 变换后（preheader 中）
+%invariant.op = add nsw i32 %header_size, %body_limit  ; header_size + body_limit
+; 循环内
+%cmp = icmp slt i32 %i, %invariant.op                  ; i < (header_size + body_limit)
+```
+
+**模式 B：`C1 - LV < C2` → `LV > C1 - C2`**
+
+```c
+// C 语言：剩余空间检查
+for (int i = 0; i < n; i++) {
+    if (total_budget - cost[i] < min_reserve) {  // 剩余 < 最小保留
+        break;
+    }
+}
+```
+
+```llvm
+; 变换前
+%sub = sub nsw i32 %total_budget, %cost      ; total_budget - cost[i]
+%cmp = icmp slt i32 %sub, %min_reserve        ; (total - cost) < min_reserve
+
+; 变换后（preheader 中）
+%invariant.op = sub nsw i32 %total_budget, %min_reserve  ; total - min_reserve
+; 循环内
+%cmp = icmp sgt i32 %cost, %invariant.op                   ; cost > (total - min_reserve)
+```
+
+注意：谓词从 `slt` 翻转为 `sgt`。
+
+---
+
+### 关键数据结构
+
+| 结构 | 关键字段/接口 | 含义 |
+|---|---|---|
+| `PatternMatch` | `m_NSWSub`, `m_NUWSub` | 匹配带溢出标志的减法 |
+| `ICmpInst` | `getSwappedPredicate(Pred)` | 翻转比较方向（`<` → `>`） |
+| `OverflowResult` | `NeverOverflows` | 溢出检查结果 |
+
+---
+
+### 优化意图
+
+1. **消除循环内减法**：与 `hoistAdd` 类似，将不变量部分移到比较的另一侧
+2. **处理变量在减号右侧的情况**：`C1 - LV` 模式需要翻转谓词，这是 `hoistSub` 相比 `hoistAdd` 的额外复杂度
+3. **统一的不变量提升**：变换后比较的一个操作数是完全不变的，为后续标准 LICM hoist 创造条件
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 必须有 nsw/nuw flag | 减法同样需要无溢出保证 | 溢出时移项不等价 |
+| 模式 B 需翻转谓词 | `C1 - LV < C2` 不等价于 `LV < C1 - C2` | 忘记翻转谓词会导致语义错误 |
+| 模式 B 的减法溢出检查 | 检查的是 `C1 - C2` 而非 `C1 + C2` | 方向错误会导致漏检溢出 |
+| 变量必须恰好有一个使用 | 由调用者保证 | 否则删除减法后影响其他用户 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 匹配减法 | `match(V, m_NSWSub(...))` | `llvm/IR/PatternMatch.h` |
+| 翻转谓词 | `ICmpInst::getSwappedPredicate(Pred)` | `llvm/IR/InstrTypes.h` |
+| 溢出检查 | `computeOverflowForSignedAdd/Sub()` | `llvm/Analysis/ValueTracking.h` |
+| 创建加法 | `Builder.CreateAdd()` | `llvm/IR/IRBuilder.h` |
+| 创建减法 | `Builder.CreateSub()` | `llvm/IR/IRBuilder.h` |
+
+---
+
+### 调用上下文
+
+```text
+hoistRegion()
+  -> hoistArithmetics(I, ...)
+     -> hoistAddSub(I, ...)
+        -> hoistSub(Pred, LHS, RHS, ...)  // 本函数
+```
+
+---
+
+## 函数分析：`hoistAddSub`（行 2713-2742）
+
+### 函数签名与目的（行 2713-2716）
+
+```cpp
+static bool hoistAddSub(Instruction &I, Loop &L, ICFLoopSafetyInfo &SafetyInfo,
+                        MemorySSAUpdater &MSSAU, AssumptionCache *AC,
+                        DominatorTree *DT)
+```
+
+**功能**：`hoistAdd` 和 `hoistSub` 的统一入口。识别 `icmp` 指令中是否包含可重关联的加法或减法模式，并分派给对应的 helper 函数执行变换。
+
+---
+
+### 整体结构
+
+```
+hoistAddSub(I, L, SafetyInfo, MSSAU, AC, DT)
+├── 1. 匹配 icmp 指令
+├── 2. 确保 LHS 是变量、RHS 是不变量
+│   └── 若 LHS 不变 → 交换 LHS/RHS 并翻转谓词
+├── 3. 前置检查
+│   ├── LHS 必须是变量
+│   ├── RHS 必须是不变量
+│   └── LHS 必须只有一个使用（变换后可安全删除）
+├── 4. 尝试 hoistAdd
+├── 5. 若失败，尝试 hoistSub
+└── 返回结果
+```
+
+---
+
+### 逐段注释
+
+**1. 匹配 icmp（行 2717-2721）**
+
+```cpp
+using namespace PatternMatch;
+CmpPredicate Pred;
+Value *LHS, *RHS;
+if (!match(&I, m_ICmp(Pred, m_Value(LHS), m_Value(RHS))))
+  return false;
+```
+
+只处理整数比较指令。
+
+**2. 规范化操作数位置（行 2723-2727）**
+
+```cpp
+// Put variant operand to LHS position.
+if (L.isLoopInvariant(LHS)) {
+  std::swap(LHS, RHS);
+  Pred = ICmpInst::getSwappedPredicate(Pred);
+}
+```
+
+如果 LHS 是不变量而 RHS 是变量，交换两者并翻转谓词，确保后续 `hoistAdd`/`hoistSub` 的 `VariantLHS` 参数确实是循环变量。
+
+**3. 前置检查（行 2728-2731）**
+
+```cpp
+// We want to delete the initial operation after reassociation, so only do it
+// if it has no other uses.
+if (L.isLoopInvariant(LHS) || !L.isLoopInvariant(RHS) || !LHS->hasOneUse())
+  return false;
+```
+
+三个条件缺一不可：
+- `LHS` 必须是变量（否则不需要重关联）
+- `RHS` 必须是不变量（否则无法将不变量移到比较的另一侧）
+- `LHS` 必须只有一个使用（变换后原加法/减法指令需要被删除）
+
+**4. 分派给 hoistAdd / hoistSub（行 2733-2741）**
+
+```cpp
+// TODO: We could go with smarter context, taking common dominator of all I's
+// users instead of I itself.
+if (hoistAdd(Pred, LHS, RHS, cast<ICmpInst>(I), L, SafetyInfo, MSSAU, AC, DT))
+  return true;
+
+if (hoistSub(Pred, LHS, RHS, cast<ICmpInst>(I), L, SafetyInfo, MSSAU, AC, DT))
+  return true;
+
+return false;
+```
+
+先尝试 `hoistAdd`（匹配 `LV + C1` 模式），失败后再尝试 `hoistSub`（匹配 `LV - C1` 或 `C1 - LV` 模式）。任一成功即返回 `true`。
+
+TODO 注释指出：当前以 `I` 本身为上下文做溢出检查，未来可以考虑取 `I` 的所有用户的共同支配点，可能获得更精确的值域信息。
+
+---
+
+### 关键数据结构
+
+| 结构 | 关键字段/接口 | 含义 |
+|---|---|---|
+| `PatternMatch` | `m_ICmp(Pred, LHS, RHS)` | 匹配 icmp 指令并捕获谓词和操作数 |
+| `Value` | `hasOneUse()` | 检查单一使用 |
+
+---
+
+### 优化意图
+
+1. **统一入口**：`hoistArithmetics` 只需调用一个函数即可尝试加法和减法两种重关联
+2. **操作数规范化**：在入口处统一将变量放在 LHS，简化后续 helper 的逻辑
+3. **短路尝试**：`hoistAdd` 成功则不再尝试 `hoistSub`，避免重复工作
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 只处理 icmp | 不处理 fcmp（浮点比较有不同语义） | 浮点由 `hoistFPAssociation` 处理 |
+| LHS 必须单用 | 变换后原加法/减法被删除 | 多用户时删除会破坏其他使用 |
+| 谓词翻转的正确性 | 交换操作数时必须同时翻转谓词 | 否则比较语义错误 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 匹配 icmp | `match(&I, m_ICmp(Pred, LHS, RHS))` | `llvm/IR/PatternMatch.h` |
+| 翻转谓词 | `ICmpInst::getSwappedPredicate(Pred)` | `llvm/IR/InstrTypes.h` |
+| 单一使用检查 | `LHS->hasOneUse()` | `llvm/IR/Value.h` |
+| 分派加法 | `hoistAdd(...)` | `LICM.cpp:2575` |
+| 分派减法 | `hoistSub(...)` | `LICM.cpp:2632` |
+
+---
+
+### 调用上下文
+
+```text
+hoistRegion()                              // LICM.cpp:889
+  -> 遍历循环内每条指令
+     -> hoistArithmetics(I, ...)            // LICM.cpp:1004
+        -> hoistAddSub(I, ...)              // LICM.cpp:2714（本函数）
+           -> hoistAdd(...)                 // LICM.cpp:2575
+           -> hoistSub(...)                 // LICM.cpp:2632
+```
+
+---
+
+### 统计项
+
+变换成功时递增 `NumAddSubHoisted`（`LICM.cpp:109-110`）：
+
+```cpp
+STATISTIC(NumAddSubHoisted, "Number of add/subtract expressions reassociated "
+                            "and hoisted out of the loop");
+```
+
+---
+
+### 三个函数的关系总结
+
+```
+hoistAddSub (统一入口，行 2713)
+├── 规范化：确保 icmp 的 LHS 是变量、RHS 是不变量
+├── 检查：LHS 单用、LHS 变、RHS 不变
+│
+├── hoistAdd (行 2575)
+│   ├── 匹配：LV + C1 < C2
+│   ├── 变换：LV < C2 - C1
+│   └── 溢出检查：C2 - C1 永不溢出
+│
+└── hoistSub (行 2632)
+    ├── 模式 A：LV - C1 < C2 → LV < C1 + C2
+    │   └── 溢出检查：C1 + C2 永不溢出
+    │
+    └── 模式 B：C1 - LV < C2 → LV > C1 - C2
+        ├── 翻转谓词
+        └── 溢出检查：C1 - C2 永不溢出
+```
+
+**共同点**：
+- 都依赖 nsw/nuw flag 保证移项等价
+- 都将不变量计算提升到 preheader
+- 都修改原 icmp 指令而非创建新 icmp
+- 都删除原加法/减法指令
+
+**区别**：
+- `hoistAdd` 只处理加法，只有一种变换方向
+- `hoistSub` 处理减法，有两种模式（变量在左侧/右侧），模式 B 需要翻转谓词
+- `hoistAddSub` 是调度器，负责规范化操作数位置和分派
+
+---
+
+## 函数分析：`hoistMulAddAssociation`（行 2759-2850）
+
+### 函数签名与目的（行 2759-2762）
+
+```cpp
+static bool hoistMulAddAssociation(Instruction &I, Loop &L,
+                                   ICFLoopSafetyInfo &SafetyInfo,
+                                   MemorySSAUpdater &MSSAU, AssumptionCache *AC,
+                                   DominatorTree *DT)
+```
+
+**功能**：将形如 `((A1 * B1) + (A2 * B2) + ...) * C` 的表达式（其中 `A1, A2, ...` 和 `C` 是循环不变量）重关联为 `((A1 * C * B1) + (A2 * C * B2) + ...)`，并将 `A1 * C`、`A2 * C` 等不变子表达式提升到 preheader。适用于整数乘法/加法链和浮点 FMul/FAdd 链。
+
+---
+
+### 整体结构
+
+```
+hoistMulAddAssociation(I, L, ...)
+├── 1. 检查 I 是否为可重关联的 Mul/FMul
+├── 2. 确定 VariantOp 和 InvariantOp（Factor）
+├── 3. 遍历表达式树，收集可变换点
+│   ├── Worklist: 从 VariantOp 开始 BFS
+│   ├── 遇到 Add/FAdd → 递归进入两个操作数
+│   ├── 遇到 Mul/FMul → 检查是否有一个不变操作数
+│   │   └── 记录 Changes（待修改的 Use）
+│   └── 任一节点多用户 / 无不变操作数 / 超限 → 返回 false
+├── 4. 若 Changes 为空 → 返回 false
+├── 5. 整数类型：清除所有经过的 Add 的 poison flags
+├── 6. 执行变换
+│   ├── 对每个 Change：
+│   │   ├── 在 preheader 创建 Mul = InvariantOperand * Factor
+│   │   ├── 重写原 Mul 指令：用 Mul 替换不变操作数
+│   │   ├── RAUW 旧 Mul → 新 Mul
+│   │   └── 删除旧 Mul
+│   └── 替换 I 为 VariantOp，删除 I
+└── 返回 true
+```
+
+---
+
+### 逐段注释
+
+**1. 入口检查与操作数分类（行 2763-2771）**
+
+```cpp
+if (!isReassociableOp(&I, Instruction::Mul, Instruction::FMul))
+  return false;
+Value *VariantOp = I.getOperand(0);
+Value *InvariantOp = I.getOperand(1);
+if (L.isLoopInvariant(VariantOp))
+  std::swap(VariantOp, InvariantOp);
+if (L.isLoopInvariant(VariantOp) || !L.isLoopInvariant(InvariantOp))
+  return false;
+Value *Factor = InvariantOp;
+```
+
+- `isReassociableOp`：整数要求 `Mul`；浮点要求 `FMul` + `reassoc` + `nsz`（no-signed-zeros）
+- 确保一个操作数变、一个不变；不变的那个称为 `Factor`，将乘到每个不变子表达式上
+
+**2. 遍历表达式树，收集 Changes（行 2773-2809）**
+
+```cpp
+SmallVector<Use *> Changes;
+SmallVector<BinaryOperator *> Adds;
+SmallVector<BinaryOperator *> Worklist;
+if (BinaryOperator *VariantBinOp = dyn_cast<BinaryOperator>(VariantOp))
+  Worklist.push_back(VariantBinOp);
+while (!Worklist.empty()) {
+  BinaryOperator *BO = Worklist.pop_back_val();
+  if (!BO->hasOneUse())
+    return false;
+  if (isReassociableOp(BO, Instruction::Add, Instruction::FAdd) &&
+      isa<BinaryOperator>(BO->getOperand(0)) &&
+      isa<BinaryOperator>(BO->getOperand(1))) {
+    Worklist.push_back(cast<BinaryOperator>(BO->getOperand(0)));
+    Worklist.push_back(cast<BinaryOperator>(BO->getOperand(1)));
+    Adds.push_back(BO);
+    continue;
+  }
+  if (!isReassociableOp(BO, Instruction::Mul, Instruction::FMul) ||
+      L.isLoopInvariant(BO))
+    return false;
+  Use &U0 = BO->getOperandUse(0);
+  Use &U1 = BO->getOperandUse(1);
+  if (L.isLoopInvariant(U0))
+    Changes.push_back(&U0);
+  else if (L.isLoopInvariant(U1))
+    Changes.push_back(&U1);
+  else
+    return false;
+  unsigned Limit = I.getType()->isIntOrIntVectorTy()
+                       ? IntAssociationUpperLimit
+                       : FPAssociationUpperLimit;
+  if (Changes.size() > Limit)
+    return false;
+}
+```
+
+BFS 遍历表达式树：
+- **Add/FAdd 节点**：递归进入两个操作数（要求两个操作数也都是 BinaryOperator），记录到 `Adds` 列表
+- **Mul/FMul 节点**：必须恰好有一个不变操作数，记录到 `Changes`；如果两个都变或整个 Mul 不变 → 失败
+- **单用约束**：每个节点必须 `hasOneUse()`，否则变换后影响其他用户
+- **上限控制**：`IntAssociationUpperLimit` / `FPAssociationUpperLimit`（默认 5），防止编译时爆炸
+
+**3. 清除 poison flags（行 2811-2815）**
+
+```cpp
+if (I.getType()->isIntOrIntVectorTy()) {
+  for (auto *Add : Adds)
+    Add->dropPoisonGeneratingFlags();
+}
+```
+
+整数加法链经过重关联后，原有的 `nsw`/`nuw` 标志可能不再成立，需要清除。
+
+**4. 执行变换（行 2817-2849）**
+
+```cpp
+auto *Preheader = L.getLoopPreheader();
+IRBuilder<> Builder(Preheader->getTerminator());
+for (auto *U : Changes) {
+  assert(L.isLoopInvariant(U->get()));
+  auto *Ins = cast<BinaryOperator>(U->getUser());
+  Value *Mul;
+  if (I.getType()->isIntOrIntVectorTy()) {
+    Mul = Builder.CreateMul(U->get(), Factor, "factor.op.mul");
+    Ins->dropPoisonGeneratingFlags();
+  } else
+    Mul = Builder.CreateFMulFMF(U->get(), Factor, Ins, "factor.op.fmul");
+
+  unsigned OpIdx = U->getOperandNo();
+  auto *LHS = OpIdx == 0 ? Mul : Ins->getOperand(0);
+  auto *RHS = OpIdx == 1 ? Mul : Ins->getOperand(1);
+  auto *NewBO = BinaryOperator::Create(Ins->getOpcode(), LHS, RHS,
+                                       Ins->getName() + ".reass", Ins->getIterator());
+  NewBO->setDebugLoc(DebugLoc::getDropped());
+  NewBO->copyIRFlags(Ins);
+  if (VariantOp == Ins)
+    VariantOp = NewBO;
+  Ins->replaceAllUsesWith(NewBO);
+  eraseInstruction(*Ins, SafetyInfo, MSSAU);
+}
+I.replaceAllUsesWith(VariantOp);
+eraseInstruction(I, SafetyInfo, MSSAU);
+return true;
+```
+
+对每个 `Change`（即每个 Mul 中的不变操作数）：
+1. 在 preheader 创建 `Mul = InvariantOperand * Factor`
+2. 在原位置创建新的 Mul 指令，用 `Mul` 替换原来的不变操作数
+3. RAUW 旧 Mul → 新 Mul，删除旧 Mul
+4. 最后替换最外层的 `I`
+
+---
+
+### 变换示例
+
+**C 语言场景**：
+
+```c
+// 循环内：(a[i] * scale + b[i] * scale) 其中 scale 是不变量
+for (int i = 0; i < n; i++) {
+    result[i] = a[i] * scale + b[i] * scale;
+}
+```
+
+**变换前 IR**：
+
+```llvm
+preheader:
+  ; scale 是循环不变
+loop:
+  %a_val = load i32, ptr %a_ptr
+  %b_val = load i32, ptr %b_ptr
+  %mul1 = mul i32 %a_val, %scale       ; a[i] * scale
+  %mul2 = mul i32 %b_val, %scale       ; b[i] * scale
+  %add = add i32 %mul1, %mul2          ; (a[i]*scale) + (b[i]*scale)
+  %result = mul i32 %add, %scale2      ; 假设外层再乘一个不变量
+  ...
+```
+
+更典型的模式是 `((A1 * B1) + (A2 * B2)) * C`：
+
+```llvm
+; 假设 I = ((%a_inv * %lv) + (%b_inv * %lv2)) * %c_inv
+; 其中 %a_inv, %b_inv, %c_inv 不变，%lv, %lv2 变
+```
+
+**变换后 IR**：
+
+```llvm
+preheader:
+  %factor.op.mul1 = mul i32 %a_inv, %c_inv   ; 不变部分提升到 preheader
+  %factor.op.mul2 = mul i32 %b_inv, %c_inv   ; 不变部分提升到 preheader
+loop:
+  %mul1.reass = mul i32 %factor.op.mul1, %lv   ; (a_inv * c_inv) * lv
+  %mul2.reass = mul i32 %factor.op.mul2, %lv2  ; (b_inv * c_inv) * lv2
+  %add.reass = add i32 %mul1.reass, %mul2.reass
+  ...
+```
+
+每个不变乘法 `A * C` 被提升到 preheader，循环内只执行 `A*C*LV` 中的变部分。
+
+---
+
+### 关键数据结构
+
+| 结构 | 关键字段/接口 | 含义 |
+|---|---|---|
+| `SmallVector<Use *>` | `Changes` | 记录待修改的 Use（每个 Mul 中的不变操作数） |
+| `SmallVector<BinaryOperator *>` | `Adds` | 记录遍历过的 Add/FAdd 节点（用于清除 poison flags） |
+| `SmallVector<BinaryOperator *>` | `Worklist` | BFS 工作列表 |
+| `isReassociableOp` | 辅助函数 | 判断指令是否为可重关联的 Mul/FMul 或 Add/FAdd |
+
+---
+
+### 优化意图
+
+1. **分配律应用**：利用 `(A * B) + (A * C) = A * (B + C)` 的逆过程，将公共不变因子分配到每个项中，使更多不变计算可以提升到循环外
+2. **减少循环内乘法**：对于 N 次循环和 K 个不变因子，从 N * K 次不变乘法 → K 次不变乘法（在 preheader）
+3. **同时支持整数和浮点**：整数用 `Mul/Add`，浮点用 `FMul/FAdd`（需 `reassoc` + `nsz` flags）
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 每个节点必须单用 | `BO->hasOneUse()` | 多用户时变换会破坏其他使用 |
+| 每个 Mul 必须恰好一个不变操作数 | 两个都变或都不变无法提取 | 返回 false |
+| 变换次数上限 | `IntAssociationUpperLimit` / `FPAssociationUpperLimit`（默认 5） | 防止编译时爆炸 |
+| 整数 Add 的 poison flags | 重关联后 nsw/nuw 可能不成立 | 必须 `dropPoisonGeneratingFlags()` |
+| 浮点需 reassoc + nsz | 浮点重关联改变计算顺序 | 无 flags 时不能变换 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 可重关联判断 | `isReassociableOp()` | `LICM.cpp:2744` |
+| 创建整数乘法 | `Builder.CreateMul()` | `llvm/IR/IRBuilder.h` |
+| 创建浮点乘法 | `Builder.CreateFMulFMF()` | `llvm/IR/IRBuilder.h` |
+| 清除 poison flags | `Ins->dropPoisonGeneratingFlags()` | `llvm/IR/Instruction.h` |
+| 复制 IR flags | `NewBO->copyIRFlags(Ins)` | `llvm/IR/Instruction.h` |
+| 替换使用 | `Ins->replaceAllUsesWith(NewBO)` | `llvm/IR/Value.h` |
+
+---
+
+### 调用上下文
+
+```text
+hoistRegion()
+  -> hoistArithmetics(I, ...)
+     -> hoistMulAddAssociation(I, ...)  // 本函数（行 2957）
+```
+
+---
+
+### 统计项
+
+变换成功时递增 `NumIntAssociationsHoisted`（整数）或 `NumFPAssociationsHoisted`（浮点）：
+
+```cpp
+if (IsInt)
+  ++NumIntAssociationsHoisted;
+else
+  ++NumFPAssociationsHoisted;
+```
+
+---
+
+## 函数分析：`hoistBOAssociation`（行 2862-2927）
+
+### 函数签名与目的（行 2862-2865）
+
+```cpp
+static bool hoistBOAssociation(Instruction &I, Loop &L,
+                               ICFLoopSafetyInfo &SafetyInfo,
+                               MemorySSAUpdater &MSSAU, AssumptionCache *AC,
+                               DominatorTree *DT)
+```
+
+**功能**：处理两层嵌套的关联二元运算，将不变量合并后提升到 preheader。支持四种模式：
+1. `(LV op C1) op C2` → `LV op (C1 op C2)`
+2. `(C1 op LV) op C2` → `LV op (C1 op C2)`
+3. `C2 op (C1 op LV)` → `LV op (C1 op C2)`
+4. `C2 op (LV op C1)` → `LV op (C1 op C2)`
+
+其中 `op` 是关联运算（`add`/`mul`/`fadd`/`fmul`/`and`/`or`/`xor`），`LV` 是循环变量，`C1`/`C2` 是循环不变量。
+
+---
+
+### 整体结构
+
+```
+hoistBOAssociation(I, L, ...)
+├── 1. 检查 I 是否为关联 BinaryOperator
+├── 2. 确定 LV 在内层还是外层
+├── 3. 提取内层 BinaryOperator BO0
+├── 4. 从 BO0 中识别 LV、C1，从外层识别 C2
+├── 5. 验证：LV 变、C1 不变、C2 不变
+├── 6. 在 preheader 创建 Inv = C1 op C2
+├── 7. 在原位置创建 NewBO = LV op Inv
+├── 8. 传播 flags（FMF 或 OverflowTracking）
+├── 9. RAUW I → NewBO，删除 I
+├── 10. 若 BO0 无用户，删除 BO0
+└── 返回 true
+```
+
+---
+
+### 逐段注释
+
+**1. 入口检查（行 2866-2874）**
+
+```cpp
+auto *BO = dyn_cast<BinaryOperator>(&I);
+if (!BO || !BO->isAssociative())
+  return false;
+
+Instruction::BinaryOps Opcode = BO->getOpcode();
+bool LVInRHS = L.isLoopInvariant(BO->getOperand(0));
+auto *BO0 = dyn_cast<BinaryOperator>(BO->getOperand(LVInRHS));
+if (!BO0 || BO0->getOpcode() != Opcode || !BO0->isAssociative() ||
+    BO0->hasNUsesOrMore(BO0->getType()->isIntegerTy() ? 2 : 3))
+  return false;
+```
+
+- 外层 `I` 必须是关联运算
+- `LVInRHS`：如果 LHS 不变，说明 LV 在 RHS，内层运算在 LHS
+- 内层 `BO0` 必须是相同 opcode 的关联运算
+- `hasNUsesOrMore` 检查：整数类型最多 1 个用户，浮点最多 2 个（因为 FMF flags 需要额外考虑）
+
+**2. 提取 LV、C1、C2（行 2877-2886）**
+
+```cpp
+Value *LV = BO0->getOperand(0);
+Value *C1 = BO0->getOperand(1);
+Value *C2 = BO->getOperand(!LVInRHS);
+
+assert(BO->isCommutative() && BO0->isCommutative() &&
+       "Associativity implies commutativity");
+if (L.isLoopInvariant(LV) && !L.isLoopInvariant(C1))
+  std::swap(LV, C1);
+if (L.isLoopInvariant(LV) || !L.isLoopInvariant(C1) || !L.isLoopInvariant(C2))
+  return false;
+```
+
+- 关联运算隐含交换律，所以 `BO0` 的操作数顺序不重要
+- 如果 `LV` 实际是不变而 `C1` 是变，交换两者
+- 最终确保：`LV` 变、`C1` 不变、`C2` 不变
+
+**3. 创建不变运算和新二元运算（行 2888-2896）**
+
+```cpp
+auto *Preheader = L.getLoopPreheader();
+IRBuilder<> Builder(Preheader->getTerminator());
+auto *Inv = Builder.CreateBinOp(Opcode, C1, C2, "invariant.op");
+
+auto *NewBO = BinaryOperator::Create(
+    Opcode, LV, Inv, BO->getName() + ".reass", BO->getIterator());
+NewBO->setDebugLoc(DebugLoc::getDropped());
+```
+
+- 在 preheader 创建 `Inv = C1 op C2`（不变部分）
+- 在原位置创建 `NewBO = LV op Inv`
+
+**4. 传播 flags（行 2898-2914）**
+
+```cpp
+if (Opcode == Instruction::FAdd || Opcode == Instruction::FMul) {
+  // Intersect FMF flags for FADD and FMUL.
+  FastMathFlags Intersect = BO->getFastMathFlags() & BO0->getFastMathFlags();
+  if (auto *I = dyn_cast<Instruction>(Inv))
+    I->setFastMathFlags(Intersect);
+  NewBO->setFastMathFlags(Intersect);
+} else {
+  OverflowTracking Flags;
+  Flags.AllKnownNonNegative = false;
+  Flags.AllKnownNonZero = false;
+  Flags.mergeFlags(*BO);
+  Flags.mergeFlags(*BO0);
+  if (auto *I = dyn_cast<Instruction>(Inv))
+    Flags.applyFlags(*I);
+  Flags.applyFlags(*NewBO);
+}
+```
+
+- **浮点**：取两个原始指令的 FMF（FastMathFlags）交集，保守处理
+- **整数**：用 `OverflowTracking` 合并两个指令的溢出标志（`nsw`/`nuw` 等），只保留两者都有的标志
+
+**5. 清理（行 2916-2926）**
+
+```cpp
+BO->replaceAllUsesWith(NewBO);
+eraseInstruction(*BO, SafetyInfo, MSSAU);
+
+if (BO0->use_empty()) {
+  salvageDebugInfo(*BO0);
+  eraseInstruction(*BO0, SafetyInfo, MSSAU);
+}
+return true;
+```
+
+- 替换 `I` → `NewBO`，删除 `I`
+- 如果内层 `BO0` 没有其他用户（即只有 `I` 用了它），也删除
+
+---
+
+### 变换示例
+
+**模式 1：`(LV + C1) + C2` → `LV + (C1 + C2)`**
+
+```c
+// C 语言
+for (int i = 0; i < n; i++) {
+    int x = (i + offset1) + offset2;  // offset1, offset2 不变
+    arr[i] = x;
+}
+```
+
+```llvm
+; 变换前
+loop:
+  %i = phi i32 [0, %pre], [%i.next, %loop]
+  %add1 = add nsw i32 %i, %offset1     ; LV + C1
+  %add2 = add nsw i32 %add1, %offset2  ; (LV + C1) + C2
+
+; 变换后
+preheader:
+  %invariant.op = add nsw i32 %offset1, %offset2  ; C1 + C2
+loop:
+  %i = phi i32 [0, %pre], [%i.next, %loop]
+  %add2.reass = add nsw i32 %i, %invariant.op     ; LV + (C1 + C2)
+```
+
+**模式 2：`(C1 * LV) * C2` → `LV * (C1 * C2)`**
+
+```c
+// C 语言：缩放因子合并
+for (int i = 0; i < n; i++) {
+    result[i] = (scale1 * data[i]) * scale2;  // scale1, scale2 不变
+}
+```
+
+```llvm
+; 变换前
+loop:
+  %data = load i32, ptr %data_ptr
+  %mul1 = mul i32 %scale1, %data       ; C1 * LV
+  %mul2 = mul i32 %mul1, %scale2       ; (C1 * LV) * C2
+
+; 变换后
+preheader:
+  %invariant.op = mul i32 %scale1, %scale2  ; C1 * C2
+loop:
+  %data = load i32, ptr %data_ptr
+  %mul2.reass = mul i32 %data, %invariant.op  ; LV * (C1 * C2)
+```
+
+**模式 3：`C2 & (C1 & LV)` → `LV & (C1 & C2)`**（按位与）
+
+```c
+// C 语言：掩码合并
+for (int i = 0; i < n; i++) {
+    flags[i] = (MASK1 & flags[i]) & MASK2;  // MASK1, MASK2 不变
+}
+```
+
+```llvm
+; 变换前
+loop:
+  %flags = load i32, ptr %flags_ptr
+  %and1 = and i32 %MASK1, %flags       ; C1 & LV
+  %and2 = and i32 %and1, %MASK2        ; (C1 & LV) & C2
+
+; 变换后
+preheader:
+  %invariant.op = and i32 %MASK1, %MASK2  ; C1 & C2
+loop:
+  %flags = load i32, ptr %flags_ptr
+  %and2.reass = and i32 %flags, %invariant.op  ; LV & (C1 & C2)
+```
+
+---
+
+### 关键数据结构
+
+| 结构 | 关键字段/接口 | 含义 |
+|---|---|---|
+| `BinaryOperator` | `isAssociative()`, `isCommutative()` | 判断运算是否关联/交换 |
+| `FastMathFlags` | `operator&`（交集） | 浮点快速数学标志的交集运算 |
+| `OverflowTracking` | `mergeFlags()`, `applyFlags()` | 整数溢出标志的合并与应用 |
+
+---
+
+### 优化意图
+
+1. **不变量合并**：将两层嵌套运算中的两个不变量 `C1` 和 `C2` 合并为一个运算，提升到 preheader
+2. **减少循环内运算**：从循环内 2 次运算 → 循环内 1 次运算 + preheader 1 次运算
+3. **通用性**：支持所有关联运算（`add`/`mul`/`fadd`/`fmul`/`and`/`or`/`xor`），不限于特定 opcode
+4. **保守的 flags 处理**：浮点取 FMF 交集，整数用 `OverflowTracking` 合并标志，确保变换后 flags 正确
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 必须是关联运算 | `BO->isAssociative()` | 非关联运算（如 `sub`/`div`/`fdiv`）不能变换 |
+| 内层必须同 opcode | `BO0->getOpcode() == Opcode` | 不同运算不能合并 |
+| 内层用户数限制 | 整数 ≤ 1，浮点 ≤ 2 | 多用户时不能安全删除 |
+| FMF flags 交集 | 浮点取两个指令的 FMF 交集 | 交集可能丢失优化标志 |
+| OverflowTracking 初始化 | `AllKnownNonNegative/NonZero` 设为 false | 保守处理，可能丢失 nsw/nuw |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 关联性判断 | `BO->isAssociative()` | `llvm/IR/Instruction.h` |
+| 创建二元运算 | `Builder.CreateBinOp()` | `llvm/IR/IRBuilder.h` |
+| FMF 交集 | `FMF1 & FMF2` | `llvm/IR/Operator.h` |
+| 溢出标志合并 | `OverflowTracking::mergeFlags()` | `llvm/IR/Instruction.h` |
+| 创建新指令 | `BinaryOperator::Create()` | `llvm/IR/Instructions.h` |
+
+---
+
+### 调用上下文
+
+```text
+hoistRegion()
+  -> hoistArithmetics(I, ...)
+     -> hoistBOAssociation(I, ...)  // 本函数（行 2966）
+```
+
+---
+
+### 统计项
+
+变换成功时递增 `NumBOAssociationsHoisted`（`LICM.cpp:116-117`）：
+
+```cpp
+STATISTIC(NumBOAssociationsHoisted, "Number of invariant BinaryOp expressions "
+                                    "reassociated and hoisted out of the loop");
+```
+
+---
+
+### `hoistMulAddAssociation` 与 `hoistBOAssociation` 的对比
+
+| 特性 | `hoistMulAddAssociation` | `hoistBOAssociation` |
+|---|---|---|
+| **处理的模式** | `((A1*B1)+(A2*B2)+...) * C` | `(LV op C1) op C2` 等四种两层嵌套 |
+| **变换本质** | 分配律：将公共因子分配到每个项 | 结合律：重新分组不变量 |
+| **遍历深度** | 任意深度（BFS 遍历整棵树） | 固定两层 |
+| **支持运算** | Mul/Add 或 FMul/FAdd | 所有关联运算（add/mul/and/or/xor/fadd/fmul） |
+| **变换数量上限** | `IntAssociationUpperLimit` / `FPAssociationUpperLimit`（默认 5） | 无上限（单次只处理一个模式） |
+| **Poison flags** | 清除所有经过的 Add 的 poison flags | 通过 `OverflowTracking` 保守合并 |
+| **FMF flags** | `CreateFMulFMF` 继承源指令 flags | 取两个指令的 FMF 交集 |
+| **复杂度** | O(K)，K 为表达式树节点数 | O(1)，固定两层 |
+| **适用场景** | 多项式乘以不变量 | 简单的两层嵌套不变量合并 |
+
+---
+
+## 函数分析：`ControlFlowHoister::registerPossiblyHoistableBranch`（行 675-730）
+
+### 函数签名与目的
+
+```cpp
+void registerPossiblyHoistableBranch(BranchInst *BI)
+```
+
+**功能**：识别并注册循环内可被提升的条件分支。如果分支条件是不变量，且控制流结构允许复制（收敛到一个公共后继），则将其记录到 `HoistableBranches` 映射中，为后续提升条件执行的指令和 PHI 节点做准备。
+
+---
+
+### 整体结构
+
+```
+registerPossiblyHoistableBranch(BI)
+├── 1. 基本检查：开关、条件分支、操作数不变
+├── 2. 目标块检查：都在循环内、不重合
+├── 3. 寻找公共后继 (CommonSucc)
+│   ├── 三角形模式：TrueDest 是 FalseDest 的后继（或反之）
+│   └── 菱形模式：两个目标块有且仅有一个公共后继
+└── 4. 支配性检查：BI 支配 CommonSucc → 注册到 HoistableBranches
+```
+
+---
+
+### 逐段注释
+
+**1. 基本检查（行 677-679）**
+
+```cpp
+if (!ControlFlowHoisting || !BI->isConditional() ||
+    !CurLoop->hasLoopInvariantOperands(BI))
+  return;
+```
+
+- 必须开启 `-licm-control-flow-hoisting`。
+- 必须是条件分支。
+- 分支条件必须是循环不变量（这是提升的前提）。
+
+**2. 目标块检查（行 684-688）**
+
+```cpp
+BasicBlock *TrueDest = BI->getSuccessor(0);
+BasicBlock *FalseDest = BI->getSuccessor(1);
+if (!CurLoop->contains(TrueDest) || !CurLoop->contains(FalseDest) ||
+    TrueDest == FalseDest)
+  return;
+```
+
+- 两个目标块都必须在循环内。
+- 目标块不能相同（否则等价于无条件分支，无需复制）。
+
+**3. 寻找公共后继（行 695-718）**
+
+- **三角形模式**：如果 `TrueDest` 是 `FalseDest` 的后继（或反之），则公共后继就是那个被指向的块。
+- **菱形模式**：计算两个目标块后继集合的交集。
+  - 如果交集为空，无法提升。
+  - 如果有一个公共后继，直接使用。
+  - 如果有多个公共后继，选择函数中顺序靠前的那个（`llvm::find_if`），保证确定性。
+
+**4. 支配性检查与注册（行 728-729）**
+
+```cpp
+if (CommonSucc && DT->dominates(BI, CommonSucc))
+  HoistableBranches[BI] = CommonSucc;
+```
+
+- 分支指令必须支配公共后继。
+- **为什么？** 确保复制分支后，控制流语义正确。如果 BI 不支配 CommonSucc，说明存在其他路径到达 CommonSucc 而不经过 BI，复制分支会导致语义错误。同时，这也避免了将回边（back-edge）错误地包含在提升的控制流中。
+
+---
+
+### 关键数据结构
+
+| 结构 | 含义 |
+|---|---|
+| `HoistableBranches` | `DenseMap<BranchInst *, BasicBlock *>`，记录可提升分支及其收敛点 |
+
+---
+
+### 优化意图
+
+1. **识别可复制结构**：只有三角形或菱形结构才能安全复制，避免复杂 CFG 带来的正确性问题。
+2. **保证支配关系**：通过支配性检查确保提升后的控制流与原逻辑等价。
+
+---
+
+## 函数分析：`ControlFlowHoister::canHoistPHI`（行 732-767）
+
+### 函数签名与目的
+
+```cpp
+bool canHoistPHI(PHINode *PN)
+```
+
+**功能**：判断 PHI 节点是否可以随控制流一起被提升。如果 PHI 的所有前驱都被可提升分支覆盖，且 PHI 操作数不变，则可以提升。
+
+---
+
+### 整体结构
+
+```
+canHoistPHI(PN)
+├── 1. 检查 PHI 操作数是否循环不变
+├── 2. 收集 PHI 所在块的所有前驱
+├── 3. 检查前驱是否被 HoistableBranches 覆盖
+│   ├── 遍历已注册的可提升分支
+│   ├── 若分支目标是 PHI 所在块，根据模式移除对应前驱
+│   └── 若所有前驱被移除 → 返回 true
+└── 返回 false
+```
+
+---
+
+### 逐段注释
+
+**1. 不变性检查（行 734-735）**
+
+```cpp
+if (!ControlFlowHoisting || !CurLoop->hasLoopInvariantOperands(PN))
+  return false;
+```
+
+- PHI 的所有 incoming value 必须循环不变。
+
+**2. 前驱覆盖检查（行 738-766）**
+
+```cpp
+BasicBlock *BB = PN->getParent();
+SmallPtrSet<BasicBlock *, 8> PredecessorBlocks(llvm::from_range, predecessors(BB));
+...
+for (auto &Pair : HoistableBranches) {
+  if (Pair.second == BB) {
+    // 根据分支模式移除前驱
+    ...
+  }
+}
+return PredecessorBlocks.empty();
+```
+
+- 收集 PHI 所在块 `BB` 的所有前驱。
+- 遍历 `HoistableBranches`，如果某个分支的收敛点是 `BB`，说明该分支控制着进入 `BB` 的路径。
+- **去重逻辑**：
+  - **三角形模式**：分支的一个目标是 `BB`，另一个目标是 `BB` 的前驱。这两个前驱实际上来自同一个分支决策。需要从集合中移除这两个块。
+  - **菱形模式**：分支的两个目标都是 `BB` 的前驱。移除这两个块。
+- 如果最终集合为空，说明所有进入 `BB` 的路径都被可提升分支覆盖，PHI 可以安全提升。
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 前驱必须完全覆盖 | 只要有一个前驱未被覆盖，PHI 就不能提升 | 否则提升后 PHI 的某些 incoming value 无法确定 |
+| 分支模式匹配 | 必须正确识别三角形/菱形模式 | 错误识别会导致前驱移除错误，破坏 SSA |
+
+---
+
+## 函数分析：`ControlFlowHoister::getOrCreateHoistedBlock`（行 769-880）
+
+### 函数签名与目的
+
+```cpp
+BasicBlock *getOrCreateHoistedBlock(BasicBlock *BB)
+```
+
+**功能**：懒加载机制，获取基本块 `BB` 在循环外（Preheader 区域）对应的影子块。如果不存在，则创建并链接，同时更新 DominatorTree、LoopInfo 和 MemorySSA。
+
+---
+
+### 整体结构
+
+```
+getOrCreateHoistedBlock(BB)
+├── 1. 缓存检查：若已存在，直接返回
+├── 2. 关联分支：查找 BB 是哪个可提升分支的目标
+├── 3. 若无关，返回 Preheader
+├── 4. 递归创建影子块
+│   ├── CreateHoistedBlock: 创建 BB，更新 DT/LI
+│   └── 递归创建 TrueDest, FalseDest, CommonSucc 的影子块
+├── 5. 链接影子 CFG
+│   ├── moveBefore, BranchInst::Create
+├── 6. 更新 Preheader（若替换）
+│   ├── 更新 PHI 使用、DT、MSSA
+├── 7. 克隆分支指令
+│   ├── 创建新分支，复制 md_prof，设置 DebugLoc
+└── 返回影子块
+```
+
+---
+
+### 逐段注释
+
+**1. 缓存与开关（行 770-774）**
+
+```cpp
+if (!ControlFlowHoisting) return CurLoop->getLoopPreheader();
+if (auto It = HoistDestinationMap.find(BB); It != HoistDestinationMap.end())
+  return It->second;
+```
+
+- 功能关闭时回退到 Preheader。
+- 命中缓存直接返回。
+
+**2. 关联分支（行 777-782）**
+
+```cpp
+auto HasBBAsSuccessor = [&](...) { ... };
+auto It = llvm::find_if(HoistableBranches, HasBBAsSuccessor);
+```
+
+- 查找 `BB` 是哪个已注册分支的目标。如果没找到，说明 `BB` 不参与可提升控制流，直接返回 Preheader。
+
+**3. 递归创建（行 799-824）**
+
+```cpp
+BasicBlock *HoistTrueDest = CreateHoistedBlock(TrueDest);
+BasicBlock *HoistFalseDest = CreateHoistedBlock(FalseDest);
+BasicBlock *HoistCommonSucc = CreateHoistedBlock(CommonSucc);
+```
+
+- `CreateHoistedBlock` Lambda：
+  - 创建新块 `OrigName.licm`。
+  - `DT->addNewBlock(New, HoistTarget)`：更新支配树。
+  - `CurLoop->getParentLoop()->addBasicBlockToLoop`：加入外层循环。
+  - 递增 `NumCreatedBlocks`。
+- 递归调用确保依赖的影子块先被创建。
+
+**4. 链接影子 CFG（行 827-842）**
+
+- 将新块插入到正确位置 (`moveBefore`)。
+- 创建分支指令连接它们，形成完整的影子控制流。
+
+**5. Preheader 更新（行 846-859）**
+
+```cpp
+if (HoistTarget == InitialPreheader) {
+  InitialPreheader->replaceSuccessorsPhiUsesWith(HoistCommonSucc);
+  MSSAU.wireOldPredecessorsToNewImmediatePredecessor(...);
+  DT->changeImmediateDominator(HeaderNode, PreheaderNode);
+  ...
+}
+```
+
+- 如果影子 CommonSucc 替换了原来的 Preheader：
+  - 更新循环头 PHI 的使用，指向新 Preheader。
+  - 更新 MemorySSA 的前驱关系。
+  - 更新 DominatorTree，新 Preheader 支配循环头。
+  - 更新 `HoistDestinationMap` 中其他映射到新 Preheader 的条目。
+
+**6. 克隆分支（行 863-873）**
+
+```cpp
+auto *NewBI = BranchInst::Create(HoistTrueDest, HoistFalseDest, BI->getCondition(), ...);
+HoistTarget->getTerminator()->eraseFromParent();
+NewBI->copyMetadata(*BI, {LLVMContext::MD_prof});
+NewBI->setDebugLoc(...);
+```
+
+- 在影子 Preheader 创建新的分支指令。
+- 删除旧的 terminator。
+- 复制 `md_prof` 元数据（分支概率），因为条件不变，概率不变。
+- 设置 DebugLoc。
+- 递增 `NumClonedBranches`。
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 创建基本块 | `BasicBlock::Create()` | `LICM.cpp:811` |
+| 更新支配树 | `DT->addNewBlock()`, `changeImmediateDominator()` | `LICM.cpp:813, 854` |
+| 更新 LoopInfo | `addBasicBlockToLoop()` | `LICM.cpp:815` |
+| 更新 MemorySSA | `MSSAU.wireOldPredecessorsToNewImmediatePredecessor()` | `LICM.cpp:849` |
+| 克隆分支指令 | `BranchInst::Create()`, `copyMetadata()` | `LICM.cpp:864, 870` |
+| 统计项 | `NumCreatedBlocks`, `NumClonedBranches` | `LICM.cpp:96, 97` |
+
+---
+
+### 约束与局限性
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 仅支持简单模式 | 仅处理三角形/菱形收敛 | 复杂 CFG 无法提升 |
+| 代码膨胀 | 复制基本块和分支指令 | 增加代码体积，可能影响 I-Cache |
+| 分析同步 | 需手动更新 DT、LI、MSSA | 实现复杂，易引入 IR 不一致 Bug |
+
+---
+
+### 总结
+
+`ControlFlowHoister` 通过**惰性 CFG 复制**（Lazy CFG Duplication），在 Preheader 区域构建循环不变分支的"影子图"，使条件执行的不变量得以安全提升。其核心在于：
+1. **`registerPossiblyHoistableBranch`**：识别可复制的控制流模式。
+2. **`canHoistPHI`**：验证 PHI 节点是否可随控制流提升。
+3. **`getOrCreateHoistedBlock`**：懒加载创建影子块并同步所有分析结构（DT, LI, MSSA）。
+
+该机制显著增强了 LICM 的能力，但默认关闭（`-licm-control-flow-hoisting=false`），因为涉及复杂的 CFG 变换和分析同步，存在较高的实现复杂度和潜在风险。
+
+---
+
+## 类分析：`ControlFlowHoister`（行 654-881）
+
+### 1. 类概述与作用
+
+**定位**：`ControlFlowHoister` 是 LICM `hoistRegion` 阶段的辅助类，用于突破传统 LICM 只能将指令提升到循环 Preheader 的限制。
+
+**核心问题**：标准 LICM 要求被提升的指令在所有循环迭代路径上都必然执行（`isGuaranteedToExecute`）。如果指令位于循环不变条件分支的某一侧（如 `if (inv) { x = a + b; }`），标准 LICM 无法提升，因为提升到 Preheader 会改变语义（原条件为假时不执行，提升后无条件执行）。
+
+**解决方案**：通过在 Preheader 区域**复制循环内的不变控制流结构**，为条件执行的指令创建对应的"影子基本块"。指令被提升到影子块中，从而保持原有的条件语义，同时移出循环体。
+
+**开关控制**：由命令行参数 `-licm-control-flow-hoisting` 控制（默认 `false`）。
+
+---
+
+### 2. 核心数据结构
+
+| 成员 | 类型 | 作用 |
+|---|---|---|
+| `HoistDestinationMap` | `DenseMap<BasicBlock *, BasicBlock *>` | 缓存原循环块到对应影子块的映射。若块已创建影子块，直接返回；否则按需创建。 |
+| `HoistableBranches` | `DenseMap<BranchInst *, BasicBlock *>` | 记录可提升的条件分支及其收敛点（Common Successor）。键为循环内的分支指令，值为两个分支路径汇合的块。 |
+| `LI`, `DT`, `CurLoop`, `MSSAU` | 指针/引用 | 维护 LoopInfo、DominatorTree、当前循环、MemorySSA 更新器，用于 CFG 变换时的分析结构同步。 |
+
+---
+
+### 3. 关键方法分析
+
+#### 3.1 `registerPossiblyHoistableBranch(BI)`（行 675-730）
+**作用**：在遍历循环块时，识别并注册可提升的条件分支。
+
+**合法性检查**：
+1. 分支必须是条件分支且操作数循环不变。
+2. 两个目标块都必须在循环内，且不能相同。
+3. **收敛点查找**：两个目标块必须共享一个公共后继 `CommonSucc`。支持三种模式：
+   - 三角形：`TrueDest` 直接跳到 `FalseDest`（或反之）。
+   - 菱形：两个目标块都跳到同一个 `CommonSucc`。
+4. **支配关系**：分支指令必须支配 `CommonSucc`，确保控制流复制后不会引入错误路径。
+
+**设计意图**：仅处理简单收敛模式，避免复杂 CFG 复制带来的正确性风险和编译时开销。
+
+#### 3.2 `canHoistPHI(PN)`（行 732-767）
+**作用**：判断 PHI 节点是否可以随控制流一起提升。
+
+**检查逻辑**：
+1. PHI 的所有操作数必须循环不变。
+2. PHI 所在块的所有前驱必须都被 `HoistableBranches` 覆盖。
+3. 处理三角形/菱形结构的前驱去重（同一块可能通过不同边到达）。
+
+**意义**：允许提升由不变分支控制的 PHI 节点，进一步暴露提升机会。
+
+#### 3.3 `getOrCreateHoistedBlock(BB)`（行 769-880）
+**作用**：懒加载创建影子控制流结构，返回 `BB` 对应的提升目标块。
+
+**执行流程**：
+1. **缓存命中**：若 `BB` 已映射，直接返回。
+2. **非分支块**：若 `BB` 不参与可提升分支，直接返回 `Preheader`。
+3. **触发 CFG 复制**：
+   - 递归创建分支父块、TrueDest、FalseDest、CommonSucc 的影子块。
+   - 新建块命名规则：`OrigName.licm`。
+   - 链接影子块：`HoistTarget` → 克隆分支 → `TrueDest.licm`/`FalseDest.licm` → `CommonSucc.licm`。
+4. **更新分析结构**：
+   - `DT->addNewBlock()`：维护支配树。
+   - `CurLoop->getParentLoop()->addBasicBlockToLoop()`：将影子块加入外层循环。
+   - `MSSAU.wireOldPredecessorsToNewImmediatePredecessor()`：同步 MemorySSA。
+   - 若替换了 Preheader，更新循环头的前驱 PHI 和支配关系。
+5. **克隆分支**：复制原分支指令到影子 Preheader，保留 `md_prof` 元数据。
+
+---
+
+### 4. 工作流程与 IR 变换示例
+
+**调用时机**：在 `hoistRegion` 的 RPO 遍历中：
+- 提升指令时：`hoist(I, ..., CFH.getOrCreateHoistedBlock(BB), ...)`
+- 检查 PHI 时：`CFH.canHoistPHI(PN)`
+- 遍历末尾：`CFH.registerPossiblyHoistableBranch(BI)`
+
+**变换示例**：
+
+```llvm
+; === 变换前 ===
+loop.preheader:
+  br label %loop.header
+loop.header:
+  br i1 %inv_cond, label %loop.true, label %loop.false
+loop.true:
+  %val = add i32 %invariant_a, %invariant_b  ; 条件执行，标准 LICM 无法提升
+  br label %loop.merge
+loop.false:
+  br label %loop.merge
+loop.merge:
+  %res = phi i32 [%val, %loop.true], [0, %loop.false]
+  br label %loop.header
+
+; === 变换后 (licm-control-flow-hoisting=true) ===
+loop.preheader:
+  ; 复制不变分支到循环外
+  br i1 %inv_cond, label %loop.true.licm, label %loop.false.licm
+loop.true.licm:
+  %val.hoisted = add i32 %invariant_a, %invariant_b  ; 成功提升
+  br label %loop.merge.licm
+loop.false.licm:
+  br label %loop.merge.licm
+loop.merge.licm:
+  br label %loop.header
+loop.header:
+  br i1 %inv_cond, label %loop.true, label %loop.false  ; 原分支保留（若未被 DCE 清除）
+...
+```
+
+---
+
+### 5. 约束与局限性
+
+| 约束 | 说明 | 风险/影响 |
+|---|---|---|
+| **默认关闭** | `-licm-control-flow-hoisting=false` | 生产环境默认不启用，需显式开启 |
+| **模式限制** | 仅支持三角形/菱形收敛，要求分支支配汇合点 | 复杂控制流（如多分支汇合、交叉边）无法处理 |
+| **代码膨胀** | 复制基本块和分支指令 | 增加代码体积，可能影响 I-Cache |
+| **分析同步** | 需手动更新 DT、LI、MSSA、PHI | 实现复杂，易引入 IR 不一致 Bug |
+| **Rehoist 修正** | 提升后可能不支配所有 Use，需 `moveInstructionBefore` 修正 | 增加 Pass 复杂度 |
+
+---
+
+### 6. 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 分支收敛检查 | `DT->dominates(BI, CommonSucc)` | `LICM.cpp:728` |
+| 创建新基本块 | `BasicBlock::Create()` | `LICM.cpp:811` |
+| 更新支配树 | `DT->addNewBlock()`, `changeImmediateDominator()` | `LICM.cpp:813, 854` |
+| 更新 LoopInfo | `addBasicBlockToLoop()` | `LICM.cpp:815` |
+| 更新 MemorySSA | `MSSAU.wireOldPredecessorsToNewImmediatePredecessor()` | `LICM.cpp:849` |
+| 克隆分支指令 | `BranchInst::Create()`, `copyMetadata()` | `LICM.cpp:864, 870` |
+| 统计项 | `NumCreatedBlocks`, `NumClonedBranches` | `LICM.cpp:96, 97` |
+
+---
+
+### 7. 总结
+
+**设计精髓**：通过**惰性 CFG 复制**（Lazy CFG Duplication），在 Preheader 区域构建循环不变分支的"影子图"，使条件执行的不变量得以安全提升。
+
+**最值得深挖的点**：
+1. **Rehoist 修正逻辑**（行 1023-1045）：提升到影子块后，若指令不支配循环内某些 Use，需将其重新移动到支配者块。该逻辑与 `ControlFlowHoisting` 紧密耦合，是保证正确性的关键。
+2. **与 InstCombine/GVN 的交互**：提升后的影子块可能产生冗余计算，依赖后续 Pass 清理；若影子分支最终被证明总是走同一路径，可能引入死代码。
+
+---
+
+## 函数分析：`collectPromotionCandidates`（行 2237-2302）
+
+### 函数签名与目的
+
+```cpp
+static SmallVector<PointersAndHasReadsOutsideSet, 0>
+collectPromotionCandidates(MemorySSA *MSSA, AliasAnalysis *AA, Loop *L)
+```
+
+**功能**：收集循环内可被提升为标量的内存访问候选集。通过 `AliasSetTracker` 将循环内的 load/store 按别名关系分组，筛选出 must-alias 且包含写操作（mod）的指针集合，供后续 `promoteLoopAccessesToScalars` 处理。
+
+---
+
+### 整体结构
+
+```
+collectPromotionCandidates(MSSA, AA, L)
+├── 1. 初始化 AliasSetTracker (AST)
+├── 2. 遍历循环内所有内存访问
+│   └── IsPotentiallyPromotable 检查：
+│       ├── 必须是 Load 或 Store
+│       ├── 指针操作数不能是常量数据
+│       └── 指针必须是循环不变量
+├── 3. 筛选感兴趣的 AliasSet
+│   └── 条件：非 forwarding + isMod() + isMustAlias()
+├── 4. 排除有冲突外部访问的集合
+│   └── 遍历非提升访问，检查是否与候选集冲突：
+│       ├── isModSet(MR) → 直接丢弃（外部写破坏 must-alias 假设）
+│       ├── isRefSet(MR) → 标记 HasReadsOutsideSet=true
+│       └── 若集合仅有 mod 无 ref 且有外部读 → 丢弃
+└── 5. 构建结果：(PointerMustAliases, HasReadsOutsideSet)
+```
+
+---
+
+### 逐段注释
+
+**1. 初始化与遍历（行 2239-2261）**
+
+```cpp
+BatchAAResults BatchAA(*AA);
+AliasSetTracker AST(BatchAA);
+
+auto IsPotentiallyPromotable = [L](const Instruction *I) {
+  if (const auto *SI = dyn_cast<StoreInst>(I)) {
+    const Value *PtrOp = SI->getPointerOperand();
+    return !isa<ConstantData>(PtrOp) && L->isLoopInvariant(PtrOp);
+  }
+  if (const auto *LI = dyn_cast<LoadInst>(I)) {
+    const Value *PtrOp = LI->getPointerOperand();
+    return !isa<ConstantData>(PtrOp) && L->isLoopInvariant(PtrOp);
+  }
+  return false;
+};
+
+SmallPtrSet<Value *, 16> AttemptingPromotion;
+foreachMemoryAccess(MSSA, L, [&](Instruction *I) {
+  if (IsPotentiallyPromotable(I)) {
+    AttemptingPromotion.insert(I);
+    AST.add(I);
+  }
+});
+```
+
+- `BatchAAResults`：批量缓存别名分析结果，减少重复查询。
+- `IsPotentiallyPromotable`：检查指令是否为"可能可提升"的 load/store。要求指针操作数不是常量数据（如 `ConstantData`），且指针本身是循环不变量。
+- `AttemptingPromotion`：记录哪些指令参与了提升候选，用于后续冲突检测时排除自身。
+- `foreachMemoryAccess`：遍历循环内所有 MemorySSA 访问，提取对应的指令。
+
+**2. 筛选 must-alias + mod 集合（行 2264-2267）**
+
+```cpp
+SmallVector<PointerIntPair<const AliasSet *, 1, bool>, 8> Sets;
+for (AliasSet &AS : AST)
+  if (!AS.isForwardingAliasSet() && AS.isMod() && AS.isMustAlias())
+    Sets.push_back({&AS, false});
+```
+
+- 只关注 **must-alias** 集合（所有指针指向同一内存位置）。
+- 必须包含 **mod**（写操作），因为只有读写混合的集合才有提升价值（纯读集合不需要 store 到 exit block）。
+- `isForwardingAliasSet()` 为 true 表示该集合已合并到其他集合，跳过。
+- `PointerIntPair` 的 `bool` 位记录 `HasReadsOutsideSet`。
+
+**3. 排除有冲突外部访问的集合（行 2273-2291）**
+
+```cpp
+foreachMemoryAccess(MSSA, L, [&](Instruction *I) {
+  if (AttemptingPromotion.contains(I))
+    return;
+
+  llvm::erase_if(Sets, [&](auto &Pair) {
+    ModRefInfo MR = Pair.getPointer()->aliasesUnknownInst(I, BatchAA);
+    if (isModSet(MR))
+      return true;  // 外部写 → 丢弃
+    if (isRefSet(MR)) {
+      Pair.setInt(true);  // 标记有外部读
+      return !Pair.getPointer()->isRef();  // 集合仅有 mod 且有外部读 → 丢弃
+    }
+    return false;
+  });
+});
+```
+
+- 遍历循环内**未参与提升**的指令（如 call、volatile load 等）。
+- `aliasesUnknownInst`：检查该指令是否与集合中的指针有别名冲突。
+- **外部写（isModSet）**：直接丢弃集合。因为循环内存在无法追踪的写操作，must-alias 假设被破坏。
+- **外部读（isRefSet）**：
+  - 标记 `HasReadsOutsideSet = true`。
+  - 如果集合只有 mod（无 ref）且有外部读，说明集合内的 store 值可能被外部读观察到，提升 store 会改变语义 → 丢弃。
+  - 如果集合既有 mod 又有 ref（即有 load），则只提升 load（只读提升），不提升 store。
+
+**4. 构建结果（行 2293-2301）**
+
+```cpp
+SmallVector<std::pair<SmallSetVector<Value *, 8>, bool>, 0> Result;
+for (auto [Set, HasReadsOutsideSet] : Sets) {
+  SmallSetVector<Value *, 8> PointerMustAliases;
+  for (const auto &MemLoc : *Set)
+    PointerMustAliases.insert(const_cast<Value *>(MemLoc.Ptr));
+  Result.emplace_back(std::move(PointerMustAliases), HasReadsOutsideSet);
+}
+return Result;
+```
+
+- 将每个 `AliasSet` 转换为 `PointerMustAliases`（指针集合）和 `HasReadsOutsideSet`（是否有外部读）。
+- 返回结果供 `promoteLoopAccessesToScalars` 使用。
+
+---
+
+### 关键数据结构
+
+| 结构 | 含义 |
+|---|---|
+| `AliasSetTracker` | 别名集合追踪器，将内存访问按别名关系分组 |
+| `AliasSet` | 别名集合，包含一组 must/may/no-alias 的指针 |
+| `BatchAAResults` | 批量缓存别名分析结果 |
+| `PointerIntPair<const AliasSet *, 1, bool>` | 存储 AliasSet 指针 + HasReadsOutsideSet 标志 |
+
+---
+
+### 优化意图
+
+1. **must-alias 过滤**：只有 must-alias 集合才能安全提升，因为提升后所有访问都指向同一个标量变量。may-alias 集合无法保证这一点。
+2. **外部访问检测**：循环内可能有无法追踪的内存访问（如 call 指令），需要检查它们是否与候选集冲突。
+3. **只读提升支持**：当集合有外部读时，仍然可以只提升 load（`HasReadsOutsideSet = true`），但不提升 store。
+
+---
+
+## 函数分析：`promoteLoopAccessesToScalars`（行 1911-2224）
+
+### 函数签名与目的
+
+```cpp
+bool llvm::promoteLoopAccessesToScalars(
+    const SmallSetVector<Value *, 8> &PointerMustAliases,
+    SmallVectorImpl<BasicBlock *> &ExitBlocks,
+    SmallVectorImpl<BasicBlock::iterator> &InsertPts,
+    SmallVectorImpl<MemoryAccess *> &MSSAInsertPts, PredIteratorCache &PIC,
+    LoopInfo *LI, DominatorTree *DT, AssumptionCache *AC,
+    const TargetLibraryInfo *TLI, TargetTransformInfo *TTI, Loop *CurLoop,
+    MemorySSAUpdater &MSSAU, ICFLoopSafetyInfo *SafetyInfo,
+    OptimizationRemarkEmitter *ORE, bool AllowSpeculation,
+    bool HasReadsOutsideSet)
+```
+
+**功能**：将循环内对同一内存位置（must-alias 指针集合）的反复 load/store 提升为寄存器标量操作。核心变换：
+1. 在 preheader 插入一次 load（`.promoted`）
+2. 循环内所有 load 替换为 SSA 值
+3. 循环内所有 store 删除，在 exit block 插入 store
+4. 使用 `SSAUpdater` 维护 SSA 形式
+
+---
+
+### 整体结构
+
+```
+promoteLoopAccessesToScalars(...)
+├── 1. 安全性检查（dereferenceable + store safety）
+│   ├── p1: preheader 处可解引用
+│   │   ├── 有 guaranteed store → 满足
+│   │   ├── 有 guaranteed load → 满足
+│   │   └── isSafeToExecuteUnconditionally → 满足
+│   └── p2: exit block 处 store 合法
+│       ├── 有 guaranteed store → 满足
+│       ├── 线程本地对象 → 满足
+│       └── store 支配所有 exit block → 满足
+├── 2. 收集循环内所有 load/store
+│   ├── 检查类型一致性
+│   ├── 收集对齐和 AA 信息
+│   └── 检查原子性一致性
+├── 3. 最终安全检查
+│   ├── 混合原子/非原子 → 返回 false
+│   ├── 无法证明 dereferenceable → 返回 false
+│   └── StoreSafety 仍为 Unknown → 检查线程本地
+├── 4. 执行提升
+│   ├── 创建 LoopPromoter（继承 LoadAndStorePromoter）
+│   ├── 在 preheader 创建 promoted load
+│   ├── SSA.AddAvailableValue(Preheader, PreheaderLoad)
+│   ├── Promoter.run(LoopUses) → 重写 load、删除 store
+│   └── 清理未使用的 preheader load
+└── 返回 true
+```
+
+---
+
+### 逐段注释
+
+**1. 安全性检查框架（行 1936-1983）**
+
+```cpp
+// p1: preheader 处可解引用（load 安全）
+// p2: exit block 处 store 合法（不引入新写路径）
+//
+// 如果至少有一个 store guaranteed to execute，两个条件都满足。
+// 否则需要分别证明。
+
+bool DereferenceableInPH = false;
+bool StoreIsGuaranteedToExecute = false;
+bool LoadIsGuaranteedToExecute = false;
+bool FoundLoadToPromote = false;
+
+enum { StoreSafe, StoreUnsafe, StoreSafetyUnknown } StoreSafety = StoreSafetyUnknown;
+```
+
+- **p1（dereferenceable）**：preheader 中插入的 load 必须安全。如果循环内某个 store guaranteed to execute，说明指针在循环内可解引用，preheader 也可解引用。
+- **p2（store safety）**：exit block 中插入的 store 不能引入新的写路径。有三种方式证明：
+  - 有 guaranteed store
+  - 对象是线程本地的（memory model 不适用）
+  - store 支配所有 exit block
+
+**2. 异常路径检查（行 2002-2011）**
+
+```cpp
+if (StoreSafety == StoreSafetyUnknown && SafetyInfo->anyBlockMayThrow()) {
+  Value *Object = getUnderlyingObject(SomePtr);
+  if (!isNotVisibleOnUnwindInLoop(Object, CurLoop, DT))
+    StoreSafety = StoreUnsafe;
+}
+```
+
+- 如果循环可能抛出异常，需要证明调用者在 unwind 后无法访问该对象（否则插入的 store 可能被观察到）。
+- `isNotVisibleOnUnwindInLoop`：检查对象是否在 unwind 时对外不可见。
+
+**3. 收集循环内访问（行 2016-2115）**
+
+```cpp
+for (Value *ASIV : PointerMustAliases) {
+  for (Use &U : ASIV->uses()) {
+    Instruction *UI = dyn_cast<Instruction>(U.getUser());
+    if (!UI || !CurLoop->contains(UI))
+      continue;
+
+    if (LoadInst *Load = dyn_cast<LoadInst>(UI)) {
+      if (!Load->isUnordered()) return false;  // volatile/ordered 不能提升
+      ...
+      // 检查 dereferenceable
+      if (isSafeToExecuteUnconditionally(*Load, ...)) {
+        DereferenceableInPH = true;
+        Alignment = std::max(Alignment, InstAlignment);
+      }
+    } else if (const StoreInst *Store = dyn_cast<StoreInst>(UI)) {
+      ...
+      // 检查 store safety
+      if (GuaranteedToExecute) {
+        DereferenceableInPH = true;
+        StoreSafety = StoreSafe;
+      }
+      if (StoreSafety == StoreSafetyUnknown &&
+          llvm::all_of(ExitBlocks, [&](BasicBlock *Exit) {
+            return DT->dominates(Store->getParent(), Exit);
+          }))
+        StoreSafety = StoreSafe;
+    }
+    ...
+    LoopUses.push_back(UI);
+  }
+}
+```
+
+- 遍历 must-alias 集合中每个指针的所有使用。
+- 跳过循环外的指令。
+- **Load**：检查是否 unordered，收集对齐信息，检查是否 guaranteed to execute 或 safe to speculate。
+- **Store**：检查是否 unordered，收集对齐信息，检查是否 guaranteed to execute 或支配所有 exit block。
+- **类型一致性**：所有 load/store 必须使用相同的访问类型（`AccessTy`），否则返回 false。
+- **AA 标签合并**：合并所有 load/store 的 AA metadata。
+
+**4. 原子性一致性检查（行 2117-2128）**
+
+```cpp
+if (SawUnorderedAtomic && SawNotAtomic)
+  return false;  // 混合原子/非原子 → 不能提升
+
+if (SawUnorderedAtomic && Alignment < MDL.getTypeStoreSize(AccessTy))
+  return false;  // 原子操作需要自然对齐
+```
+
+- 不能混合提升 atomic 和 non-atomic 访问：无法确定应该使用哪种原子序。
+- 原子操作要求自然对齐，否则无法 lower。
+
+**5. 线程本地对象检查（行 2140-2148）**
+
+```cpp
+if (StoreSafety == StoreSafetyUnknown) {
+  Value *Object = getUnderlyingObject(SomePtr);
+  bool ExplicitlyDereferenceableOnly;
+  if (isWritableObject(Object, ExplicitlyDereferenceableOnly) &&
+      (!ExplicitlyDereferenceableOnly || isDereferenceablePointer(SomePtr, AccessTy, MDL)) &&
+      isThreadLocalObject(Object, CurLoop, DT, TTI))
+    StoreSafety = StoreSafe;
+}
+```
+
+- 如果之前的检查都未能证明 store safety，尝试证明对象是线程本地且可写的。
+- `isThreadLocalObject`：检查对象是否是函数局部且未在循环内被捕获，或者目标是单线程。
+
+**6. 只读提升回退（行 2150-2154）**
+
+```cpp
+if (StoreSafety != StoreSafe && !FoundLoadToPromote)
+  return false;  // 既不能提升 store 也没有 load → 放弃
+```
+
+- 如果 store 不安全但找到了 load，仍然可以只提升 load（只读提升）。
+- 如果连 load 都没有，直接返回 false。
+
+**7. 执行提升（行 2156-2223）**
+
+```cpp
+// 创建 SSAUpdater 和 LoopPromoter
+SSAUpdater SSA(&NewPHIs);
+LoopPromoter Promoter(SomePtr, LoopUses, SSA, ExitBlocks, InsertPts,
+                      MSSAInsertPts, PIC, MSSAU, *LI, DL, Alignment,
+                      SawUnorderedAtomic,
+                      StoreIsGuaranteedToExecute ? AATags : AAMDNodes(),
+                      *SafetyInfo, StoreSafety == StoreSafe);
+
+// 在 preheader 创建 promoted load
+if (FoundLoadToPromote || !StoreIsGuanteedToExecute) {
+  PreheaderLoad = new LoadInst(AccessTy, SomePtr, ..., Preheader->getTerminator()->getIterator());
+  ...
+  SSA.AddAvailableValue(Preheader, PreheaderLoad);
+} else {
+  SSA.AddAvailableValue(Preheader, PoisonValue::get(AccessTy));
+}
+
+// 重写循环内所有 load/store
+Promoter.run(LoopUses);
+
+// 清理未使用的 preheader load
+if (PreheaderLoad && PreheaderLoad->use_empty())
+  eraseInstruction(*PreheaderLoad, *SafetyInfo, MSSAU);
+```
+
+- `LoopPromoter` 继承自 `LoadAndStorePromoter`，是 `SSAUpdater` 的定制回调。
+- 在 preheader 创建 promoted load（如果 store guaranteed to execute 则不需要，因为值来自 store）。
+- `Promoter.run()` 遍历所有 loop uses：
+  - 对 load：用 `SSA.GetValueInMiddleOfBlock` 替换为 SSA 值。
+  - 对 store：调用 `SSA.AddAvailableValue` 注册定义，然后删除 store。
+- `doExtraRewritesBeforeFinalDeletion()`：在 exit block 插入 store（如果 `CanInsertStoresInExitBlocks` 为 true）。
+
+---
+
+### `LoopPromoter` 类（行 1756-1870）
+
+`LoopPromoter` 是 `LoadAndStorePromoter` 的子类，提供定制化的 promotion 行为：
+
+| 方法 | 作用 |
+|---|---|
+| `maybeInsertLCSSAPHI` | 如果值定义在循环内但需要在循环外使用，创建 LCSSA PHI |
+| `insertStoresInLoopExitBlocks` | 在每个 exit block 插入 store，将最终值写回内存 |
+| `doExtraRewritesBeforeFinalDeletion` | 在最终删除前调用，触发 exit block store 插入 |
+| `instructionDeleted` | 指令删除时更新 SafetyInfo 和 MemorySSA |
+| `shouldDelete` | 判断指令是否应被删除：store 仅在 `CanInsertStoresInExitBlocks` 为 true 时删除 |
+
+---
+
+### 关键数据结构
+
+| 结构 | 含义 |
+|---|---|
+| `LoopPromoter` | 继承 `LoadAndStorePromoter`，定制 promotion 行为 |
+| `SSAUpdater` | 维护 SSA 形式，自动插入 PHI 节点 |
+| `LoadAndStorePromoter` | 基类，提供 load/store 重写的通用逻辑 |
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 类型一致性 | 所有 load/store 必须使用相同类型 | 不同类型无法共享同一个标量变量 |
+| 原子性一致性 | 不能混合 atomic 和 non-atomic | 无法确定正确的原子序 |
+| 异常路径 | 循环可能 throw 时需要证明对象 unwind 不可见 | 否则插入的 store 可能被异常处理器观察到 |
+| 外部写 | 循环内存在无法追踪的写操作时不能提升 | must-alias 假设被破坏 |
+| 外部读 | 有外部读时只能提升 load，不能提升 store | store 会改变外部读观察到的值 |
+
+---
+
+### 调用关系
+
+```
+runOnLoop()
+├── collectPromotionCandidates() → 返回 [(PointerMustAliases, HasReadsOutsideSet), ...]
+└── for each candidate:
+    └── promoteLoopAccessesToScalars()
+        ├── LoopPromoter (SSAUpdater 回调)
+        │   ├── insertStoresInLoopExitBlocks()
+        │   ├── doExtraRewritesBeforeFinalDeletion()
+        │   ├── instructionDeleted()
+        │   └── shouldDelete()
+        └── formLCSSARecursively() (在 runOnLoop 中调用)
+```
+
+---
+
+### 统计项
+
+| 统计项 | 含义 |
+|---|---|
+| `NumPromotionCandidates` | 尝试提升的候选集数量 |
+| `NumLoadPromoted` | 只读提升（load only）的次数 |
+| `NumLoadStorePromoted` | 完整提升（load + store）的次数 |
+
+---
+
+## 函数分析：`LoadAndStorePromoter::run`（`SSAUpdater.cpp` 行 369-515）
+
+### 函数签名与目的
+
+```cpp
+void LoadAndStorePromoter::run(const SmallVectorImpl<Instruction *> &Insts)
+```
+
+**功能**：`LoadAndStorePromoter` 是 `SSAUpdater` 的定制化子类，专门用于将一组 load/store 指令提升为 SSA 形式的标量值。它首先处理块内的定义/使用顺序，确定每个块的"可用值"（Available Value）和需要 PHI 节点的"活入加载"（Live-in Loads），然后调用 `SSAUpdater` 插入 PHI 节点并重写所有使用，最后删除原始的 load/store 指令。
+
+---
+
+### 整体结构
+
+```
+LoadAndStorePromoter::run(Insts)
+├── 1. 按基本块分组指令 (UsesByBlock)
+├── 2. 遍历每个块，处理块内依赖
+│   ├── 单指令块：直接注册 AvailableValue 或加入 LiveInLoads
+│   ├── 纯 Load 块：全部加入 LiveInLoads
+│   └── 混合 Load/Store 块：
+│       ├── 按程序顺序排序
+│       ├── 遍历：Load 在 Store 前 → LiveInLoads；Load 在 Store 后 → 替换为 StoredValue
+│       └── 最后一个 Store 的值注册为 AvailableValue
+├── 3. 重写所有 LiveInLoads
+│   └── 调用 SSA.GetValueInMiddleOfBlock() 插入 PHI 并重写
+├── 4. 调用 doExtraRewritesBeforeFinalDeletion() (钩子函数)
+└── 5. 删除原始指令
+    ├── 检查 shouldDelete()
+    ├── 处理仍有使用的 Load (通过 ReplacedLoads 链式查找最终值)
+    ├── 调用 instructionDeleted() (钩子函数)
+    └── eraseFromParent()
+```
+
+---
+
+### 逐段注释
+
+**1. 按基本块分组（行 373-376）**
+
+```cpp
+DenseMap<BasicBlock *, TinyPtrVector<Instruction *>> UsesByBlock;
+for (Instruction *User : Insts)
+  UsesByBlock[User->getParent()].push_back(User);
+```
+
+- `SSAUpdater` 本身只处理跨块的数据流（通过 PHI 节点），块内的 def-use 顺序必须由调用者自行处理。
+- 将传入的指令列表按所属基本块分组，便于后续按块处理。
+
+**2. 遍历块处理块内依赖（行 381-468）**
+
+```cpp
+SmallVector<LoadInst *, 32> LiveInLoads;
+DenseMap<Value *, Value *> ReplacedLoads;
+
+for (Instruction *User : Insts) {
+  BasicBlock *BB = User->getParent();
+  TinyPtrVector<Instruction *> &BlockUses = UsesByBlock[BB];
+  if (BlockUses.empty()) continue; // 已处理过该块
+  ...
+```
+
+- `LiveInLoads`：收集那些需要使用"从块外流入的值"的 load 指令。
+- `ReplacedLoads`：记录被替换的 load 及其新值，用于后续处理链式依赖（如 load 后 store 同一地址）。
+
+**2a. 单指令块处理（行 393-407）**
+
+```cpp
+if (BlockUses.size() == 1) {
+  if (StoreInst *SI = dyn_cast<StoreInst>(User)) {
+    SSA.AddAvailableValue(BB, SI->getOperand(0));
+  } else if (auto *AI = dyn_cast<AllocaInst>(User)) {
+    SSA.AddAvailableValue(BB, getValueToUseForAlloca(AI));
+  } else {
+    LiveInLoads.push_back(cast<LoadInst>(User));
+  }
+  BlockUses.clear();
+  continue;
+}
+```
+
+- **Store**：该块定义了值，将 store 的源操作数注册为该块的 AvailableValue。
+- **Alloca**：视为初始定义（通常用于 mem2reg）。
+- **Load**：该块只读取值，加入 `LiveInLoads` 等待 PHI 插入。
+
+**2b. 纯 Load 块处理（行 409-424）**
+
+```cpp
+bool HasStore = false;
+for (Instruction *I : BlockUses) {
+  if (isa<StoreInst>(I) || isa<AllocaInst>(I)) { HasStore = true; break; }
+}
+if (!HasStore) {
+  for (Instruction *I : BlockUses)
+    LiveInLoads.push_back(cast<LoadInst>(I));
+  BlockUses.clear();
+  continue;
+}
+```
+
+- 如果块内全是 load，没有 store，说明这些 load 都依赖外部流入的值，全部加入 `LiveInLoads`。
+
+**2c. 混合 Load/Store 块处理（行 426-467）**
+
+```cpp
+llvm::sort(BlockUses.begin(), BlockUses.end(),
+           [](Instruction *A, Instruction *B) { return A->comesBefore(B); });
+
+Value *StoredValue = nullptr;
+for (Instruction *I : BlockUses) {
+  if (LoadInst *L = dyn_cast<LoadInst>(I)) {
+    if (StoredValue) {
+      replaceLoadWithValue(L, StoredValue);
+      L->replaceAllUsesWith(StoredValue);
+      ReplacedLoads[L] = StoredValue;
+    } else {
+      LiveInLoads.push_back(L);
+    }
+    continue;
+  }
+  if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+    StoredValue = SI->getOperand(0);
+  }
+  ...
+}
+SSA.AddAvailableValue(BB, StoredValue);
+```
+
+- **排序**：按指令在块中的物理顺序排序。
+- **遍历**：
+  - 遇到 Load：如果前面有 Store，说明它读的是块内定义的值，直接替换为 `StoredValue`；否则是活入值，加入 `LiveInLoads`。
+  - 遇到 Store：更新 `StoredValue`，最后的 Store 决定了该块流出到后继块的值。
+- **注册 AvailableValue**：将块内最后一个 Store 的值注册为该块的 AvailableValue。
+
+**3. 重写 LiveInLoads（行 472-480）**
+
+```cpp
+for (LoadInst *ALoad : LiveInLoads) {
+  Value *NewVal = SSA.GetValueInMiddleOfBlock(ALoad->getParent());
+  replaceLoadWithValue(ALoad, NewVal);
+  if (NewVal == ALoad) NewVal = PoisonValue::get(NewVal->getType());
+  ALoad->replaceAllUsesWith(NewVal);
+  ReplacedLoads[ALoad] = NewVal;
+}
+```
+
+- 调用 `SSA.GetValueInMiddleOfBlock()`。该方法会检查前驱块的 AvailableValue，如果值不统一，则自动在块开头插入 PHI 节点。
+- 用计算出的新值（可能是 PHI，也可能是单一前驱的值）替换 Load 的所有使用。
+
+**4. 钩子函数与删除指令（行 483-514）**
+
+```cpp
+doExtraRewritesBeforeFinalDeletion();
+
+for (Instruction *User : Insts) {
+  if (!shouldDelete(User)) continue;
+  if (!User->use_empty()) {
+    Value *NewVal = ReplacedLoads[User];
+    // 链式查找最终值
+    DenseMap<Value*, Value*>::iterator RLI = ReplacedLoads.find(NewVal);
+    while (RLI != ReplacedLoads.end()) {
+      NewVal = RLI->second;
+      RLI = ReplacedLoads.find(NewVal);
+    }
+    replaceLoadWithValue(cast<LoadInst>(User), NewVal);
+    User->replaceAllUsesWith(NewVal);
+  }
+  instructionDeleted(User);
+  User->eraseFromParent();
+}
+```
+
+- `doExtraRewritesBeforeFinalDeletion()`：子类钩子。在 LICM 中，`LoopPromoter` 重写此方法以在 exit block 插入 store。
+- **删除指令**：
+  - 检查 `shouldDelete()`：在 LICM 中，如果 store 不能被 sink 到 exit block，则不删除。
+  - **链式替换**：如果一个 Load 被替换后仍有使用（例如它被后续的 Store 读取，形成了 load-store 链），需要通过 `ReplacedLoads` 映射表递归查找最终的替换值。
+  - 调用 `instructionDeleted()` 通知子类更新分析结构（如 LICM 更新 MemorySSA 和 SafetyInfo）。
+  - `eraseFromParent()` 物理删除指令。
+
+---
+
+### 关键数据结构
+
+| 结构 | 含义 |
+|---|---|
+| `UsesByBlock` | `DenseMap<BB, TinyPtrVector<Inst *>>`，按块分组待处理的 load/store |
+| `LiveInLoads` | 收集需要从块外（前驱）流入值的 load 指令 |
+| `ReplacedLoads` | `DenseMap<Value *, Value *>`，记录被替换的 load 及其新值，用于处理链式依赖 |
+| `SSAUpdater` | 核心 SSA 重建工具，负责插入 PHI 节点和查询 AvailableValue |
+
+---
+
+### 优化意图
+
+1. **块内顺序敏感**：SSAUpdater 假设每个块最多只有一个定义。对于有多个 load/store 的块，必须先在块内解析 def-use 链，将块内能解决的 load 直接替换为 store 的值，剩下的 load 才交给 SSAUpdater 处理。
+2. **链式依赖处理**：在内存提升场景中，经常出现 `load x; store y, x` 的模式。删除 load 时，如果它还有使用（被 store 读取），必须将其替换为 store 的值（或最终值），否则会产生悬空引用。
+3. **钩子机制**：通过虚函数 `doExtraRewritesBeforeFinalDeletion`、`shouldDelete`、`instructionDeleted`，允许调用者（如 LICM）在标准 SSA 更新前后插入自定义逻辑（如插入 exit store、更新 MemorySSA）。
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 块内顺序 | 必须按程序顺序处理块内的 load/store | 顺序错误会导致 load 读到旧值 |
+| 链式替换 | 删除 Load 前必须检查 `use_empty()` 并递归替换 | 否则会导致 IR 中出现悬空指针，触发 verifier 失败 |
+| 不可达代码 | `GetValueInMiddleOfBlock` 在不可达块可能返回原 Load | 需检查 `NewVal == ALoad` 并替换为 `PoisonValue` |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|---|---|---|
+| 注册块定义值 | `SSA.AddAvailableValue(BB, Val)` | `SSAUpdater.cpp:69` |
+| 查询块中间值 | `SSA.GetValueInMiddleOfBlock(BB)` | `SSAUpdater.cpp:97` |
+| 插入 PHI | `PHINode::Create()` (内部调用) | `SSAUpdater.cpp:158` |
+| 替换 Load 值 | `replaceLoadWithValue()` (虚函数) | `SSAUpdater.h` |
+| 删除前钩子 | `doExtraRewritesBeforeFinalDeletion()` (虚函数) | `SSAUpdater.h` |
+| 删除后钩子 | `instructionDeleted()` (虚函数) | `SSAUpdater.h` |
+
+---
+
+### 与 LICM 的交互
+
+在 LICM 中，`LoopPromoter` 继承自 `LoadAndStorePromoter` 并重写了以下虚函数：
+- `insertStoresInLoopExitBlocks()`：在 `doExtraRewritesBeforeFinalDeletion()` 中调用，负责将提升后的最终值存回内存。
+- `instructionDeleted()`：调用 `MSSAU.removeMemoryAccess()` 和 `SafetyInfo.removeInstruction()` 同步分析结构。
+- `shouldDelete()`：仅当 `CanInsertStoresInExitBlocks` 为 true 时才删除 Store，否则保留 Store（只读提升场景）。
+
+---
+
+## 函数分析：`LoopPromoter::insertStoresInLoopExitBlocks`（行 1805-1853）
+
+### 函数签名与目的
+
+```cpp
+void LoopPromoter::insertStoresInLoopExitBlocks()
+```
+
+**功能**：在内存提升（Promotion）的最后阶段，将提升后的标量值写回内存。由于循环可能有多个出口，该函数遍历所有出口块（Exit Blocks），并在每个出口块中插入 Store 指令，将 SSAUpdater 计算出的最终值存回原始内存地址。
+
+---
+
+### 整体结构
+
+```
+insertStoresInLoopExitBlocks()
+├── 1. 遍历所有循环出口块 (LoopExitBlocks)
+├── 2. 获取当前出口块的活跃值 (LiveInValue)
+│   └── 调用 SSA.GetValueInMiddleOfBlock()
+├── 3. 维护 LCSSA 形式
+│   ├── maybeInsertLCSSAPHI(LiveInValue)
+│   └── maybeInsertLCSSAPHI(Ptr)
+├── 4. 创建并配置 Store 指令
+│   ├── new StoreInst(...)
+│   ├── 设置原子序、对齐、调试位置、AA 元数据
+│   └── 合并 DIAssignID 元数据
+└── 5. 更新 MemorySSA
+    ├── 创建新的 MemoryDef
+    └── 更新 MSSAInsertPts 以维持正确的内存依赖链
+```
+
+---
+
+### 逐段注释
+
+**1. 遍历出口块与获取值（行 1811-1815）**
+
+```cpp
+for (unsigned i = 0, e = LoopExitBlocks.size(); i != e; ++i) {
+  BasicBlock *ExitBlock = LoopExitBlocks[i];
+  Value *LiveInValue = SSA.GetValueInMiddleOfBlock(ExitBlock);
+```
+
+- `SSA.GetValueInMiddleOfBlock(ExitBlock)`：这是核心调用。它查询 SSAUpdater 获取该出口块处的标量值。
+- **为什么是 Middle？** 因为 Store 插入在块的开头（`InsertPts[i]`），此时块内的 PHI 节点已经处理完毕，但非 PHI 指令尚未执行。该方法能正确处理出口块作为多个前驱汇合点的情况（可能需要插入 PHI）。
+
+**2. 维护 LCSSA 形式（行 1816-1817）**
+
+```cpp
+LiveInValue = maybeInsertLCSSAPHI(LiveInValue, ExitBlock);
+Value *Ptr = maybeInsertLCSSAPHI(SomePtr, ExitBlock);
+```
+
+- `maybeInsertLCSSAPHI`：检查值是否定义在循环内。如果是，且当前块在循环外，则必须插入 LCSSA PHI 节点，否则 SSA 形式会被破坏（值从循环内直接跳到循环外，没有经过 PHI）。
+- 对 `SomePtr`（被提升的指针）也做同样处理，防止指针本身也是循环内的定义。
+
+**3. 创建 Store 指令（行 1818-1838）**
+
+```cpp
+BasicBlock::iterator InsertPos = LoopInsertPts[i];
+StoreInst *NewSI = new StoreInst(LiveInValue, Ptr, InsertPos);
+if (UnorderedAtomic)
+  NewSI->setOrdering(AtomicOrdering::Unordered);
+NewSI->setAlignment(Alignment);
+NewSI->setDebugLoc(DL);
+// ... 处理 DIAssignID 和 AA 元数据 ...
+```
+
+- 在预定的插入位置创建 Store。
+- **元数据继承**：
+  - **原子序**：如果原始访问包含无序原子操作，新 Store 也设为 `Unordered`。
+  - **对齐**：使用收集到的最大对齐值。
+  - **DIAssignID**：合并原始指令的调试赋值 ID，确保调试信息连续性。
+  - **AA 元数据**：继承别名分析元数据（如 TBAA）。
+
+**4. 更新 MemorySSA（行 1840-1851）**
+
+```cpp
+MemoryAccess *MSSAInsertPoint = MSSAInsertPts[i];
+MemoryAccess *NewMemAcc;
+if (!MSSAInsertPoint) {
+  NewMemAcc = MSSAU.createMemoryAccessInBB(
+      NewSI, nullptr, NewSI->getParent(), MemorySSA::Beginning);
+} else {
+  NewMemAcc = MSSAU.createMemoryAccessAfter(NewSI, nullptr, MSSAInsertPoint);
+}
+MSSAInsertPts[i] = NewMemAcc;
+MSSAU.insertDef(cast<MemoryDef>(NewMemAcc), true);
+```
+
+- **MemorySSA 链式更新**：
+  - 如果是第一个出口块（`MSSAInsertPoint` 为空），在块开头创建 MemoryAccess。
+  - 否则，在前一个出口块插入的 Store 之后创建（`createMemoryAccessAfter`）。这确保了不同出口块之间的 Store 在 MemorySSA 中有正确的顺序关系（尽管控制流上它们是互斥的，但在 MemorySSA 中通常表现为汇聚到同一个 Phi 或 Def 链）。
+  - `MSSAInsertPts[i] = NewMemAcc`：更新插入点，为下一次迭代（如果有）或后续操作提供正确的锚点。
+  - `MSSAU.insertDef`：将新的 MemoryDef 正式插入 MemorySSA 图，触发必要的重命名（Rename）。
+
+---
+
+### 关键数据结构
+
+| 结构 | 含义 |
+|---|---|
+| `SSAUpdater` | 负责计算出口块处的标量值，必要时插入 PHI |
+| `LoopExitBlocks` | 循环的所有出口块列表 |
+| `LoopInsertPts` | 每个出口块中插入 Store 的位置（通常是第一个非 PHI 指令前） |
+| `MSSAInsertPts` | 每个出口块中插入 MemorySSA 节点的锚点 |
+
+---
+
+### 优化意图
+
+1. **完成内存提升闭环**：LICM 将循环内的 Load/Store 替换为寄存器操作，但必须在循环退出时将结果写回内存，以保证循环外代码的正确性。
+2. **多出口处理**：循环可能有多个出口（如 `break`、异常、正常结束）。该函数确保无论通过哪个路径退出，内存都能被正确更新。
+3. **保持 IR 规范性**：通过插入 LCSSA PHI 和维护 MemorySSA，确保变换后的 IR 仍然符合 LLVM 的标准形式，便于后续 Pass 处理。
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| LCSSA 维护 | 必须为跨边界的值插入 PHI | 否则 verifier 会报错，后续 Pass 可能崩溃 |
+| MemorySSA 顺序 | 多个出口的 Store 需正确链接 | 错误的 MemorySSA 会导致别名分析错误 |
+| 元数据一致性 | 对齐、原子序必须匹配原访问 | 不匹配可能导致代码生成错误或语义改变 |
+
+---
