@@ -2745,6 +2745,323 @@ if (const auto *MU = dyn_cast<MemoryUse>(&MA)) {
 
 ---
 
+## 函数分析：`hoistRegion`（行 889-1060）
+
+### 函数签名与目的（行 889-896）
+
+```cpp
+bool llvm::hoistRegion(DomTreeNode *N, AAResults *AA, LoopInfo *LI,
+                       DominatorTree *DT, AssumptionCache *AC,
+                       TargetLibraryInfo *TLI, Loop *CurLoop,
+                       MemorySSAUpdater &MSSAU, ScalarEvolution *SE,
+                       ICFLoopSafetyInfo *SafetyInfo,
+                       SinkAndHoistLICMFlags &Flags,
+                       OptimizationRemarkEmitter *ORE, bool LoopNestMode,
+                       bool AllowSpeculation)
+```
+
+**功能**: 遍历循环内支配树区域（深度优先），将循环不变量从循环体提升到预置头块（preheader）。核心是**定义先于使用**的遍历顺序，使得 hoist 能一次完成无需迭代。
+
+---
+
+### 整体结构
+
+```
+hoistRegion()
+├── 输入验证（assert 参数非空）
+├── 初始化
+│   ├── 创建 ControlFlowHoister（处理控制流提升）
+│   └── 创建 HoistedInstructions 记录（后续可能需 re-hoist）
+├── 工作列表构建（LoopBlocksRPO）
+├── 主循环：遍历基本块（逆后序）
+│   └── 遍历块内指令
+│       ├── 死指令删除
+│       ├── 普通 hoisting（4 个条件检查）
+│       ├── FP 除转乘（Reciprocal Optimization）
+│       ├── invariant.start / guard 提升
+│       ├── PHI 节点提升（ControlFlowHoister）
+│       └── 算术重结合提升（hoistArithmetics）
+│   └── 收集可能提升的分支
+├── 控制流 re-hoisting（修复 dominance）
+├── 验证（MemorySSA + DT/LI）
+└── 返回 Changed
+```
+
+---
+
+### 逐段注释
+
+**1. 输入验证与初始化（897-906 行）**
+
+```cpp
+assert(N != nullptr && AA != nullptr && LI != nullptr && DT != nullptr &&
+       CurLoop != nullptr && SafetyInfo != nullptr &&
+       "Unexpected input to hoistRegion.");
+
+ControlFlowHoister CFH(LI, DT, CurLoop, MSSAU);
+SmallVector<Instruction *, 16> HoistedInstructions;
+```
+
+- 断言所有关键指针参数有效
+- 创建 `ControlFlowHoister` 辅助对象，用于处理条件分支和 PHI 的复杂提升
+- `HoistedInstructions` 记录所有提升的指令，用于后续检查是否 dominate 所有 use
+
+---
+
+**2. 工作列表构建（908-913 行）**
+
+```cpp
+LoopBlocksRPO Worklist(CurLoop);
+Worklist.perform(LI);
+bool Changed = false;
+BasicBlock *Preheader = CurLoop->getLoopPreheader();
+```
+
+- 使用 `LoopBlocksRPO` 生成循环块的**逆后序**（RPO）遍历序列
+- **关键点**: 逆后序保证在处理块前，其支配祖先已被处理，这对后续 re-hoisting 时的 dominance 修复至关重要
+
+---
+
+**3. 块内指令遍历主循环（915-1014 行）**
+
+```cpp
+for (BasicBlock *BB : Worklist) {
+  if (!LoopNestMode && inSubLoop(BB, CurLoop, LI))
+    continue;
+
+  for (Instruction &I : llvm::make_early_inc_range(*BB)) {
+    // ... 一系列尝试提升 I
+  }
+}
+```
+
+- `inSubLoop`: 跳过子循环体（已由子循环 LICM 处理）
+- `make_early_inc_range`: 允许在循环中安全删除/移动指令
+- 按**顺序**尝试多种提升策略，任一成功则 `continue` 跳过后续检查
+
+---
+
+**4. 普通 hoisting（928-938 行）**
+
+```cpp
+if (CurLoop->hasLoopInvariantOperands(&I) &&
+    canSinkOrHoistInst(I, AA, DT, CurLoop, MSSAU, true, Flags, ORE) &&
+    isSafeToExecuteUnconditionally(I, DT, TLI, CurLoop, SafetyInfo, ORE,
+                                   Preheader->getTerminator(), AC,
+                                   AllowSpeculation)) {
+  hoist(I, DT, CurLoop, CFH.getOrCreateHoistedBlock(BB), SafetyInfo,
+        MSSAU, SE, ORE);
+  HoistedInstructions.push_back(&I);
+  Changed = true;
+  continue;
+}
+```
+
+**三重条件**：
+1. 所有操作数循环不变 (`hasLoopInvariantOperands`)
+2. 可移动（无别名冲突、memory access 安全）
+3. 无条件执行安全（无 side effect 或 speculation 允许）
+
+成功则调用 `hoist()` 移动到目标块（可能是 preheader 或复制的控制流块）
+
+---
+
+**5. FP 除法优化（940-966 行）**
+
+```cpp
+if (I.getOpcode() == Instruction::FDiv && I.hasAllowReciprocal() &&
+    CurLoop->isLoopInvariant(I.getOperand(1))) {
+  // 创建: %reciprocal = fdiv 1.0, %divisor
+  // 创建: %product = fmul %numerator, %reciprocal
+  // 替换所有使用，删除原 FDiv
+  hoist(*ReciprocalDivisor, ...);
+}
+```
+
+- 仅当除数循环不变且允许 `allow_reciprocal`（fast-math 标志）
+- 利用 FP 等价性：`a / b = a * (1/b)`，将除法移出循环
+- 注意：需同时 hoist 新创建的 reciprocal 指令
+
+---
+
+**6. invariant.start / guard 提升（968-985 行）**
+
+```cpp
+if ((IsInvariantStart(I) || isGuard(&I)) &&
+    CurLoop->hasLoopInvariantOperands(&I) &&
+    MustExecuteWithoutWritesBefore(I)) {
+  hoist(I, ...);
+}
+```
+
+- `invariant.start` 是 LLVM 的指针不变性 intrinsic（用于 alias analysis 优化）
+- `guard` 是保护性分支（如 `llvm.experimental.guard`）
+- 需满足：循环前必定执行、循环内不写内存
+
+---
+
+**7. PHI 节点提升（987-1000 行）**
+
+```cpp
+if (PHINode *PN = dyn_cast<PHINode>(&I)) {
+  if (CFH.canHoistPHI(PN)) {
+    // 重定向所有 incoming block 到 hoisted 版本
+    for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i)
+      PN->setIncomingBlock(i, CFH.getOrCreateHoistedBlock(PN->getIncomingBlock(i)));
+    hoist(*PN, ...);
+    assert(DT->dominates(PN, BB) && "Conditional PHIs not expected");
+    Changed = true;
+    continue;
+  }
+}
+```
+
+- `ControlFlowHoister::canHoistPHI`: 检查所有 predecessor 是否被 hoistable 分支覆盖
+- 先将 incoming block 重定向到复制的块，再 hoist PHI
+- 最终 PHI 应在 preheader 或复制控制流后的块中
+
+---
+
+**8. 算术重结合提升（1002-1007 行）**
+
+```cpp
+if (hoistArithmetics(I, *CurLoop, *SafetyInfo, MSSAU, AC, DT)) {
+  Changed = true;
+  continue;
+}
+```
+
+- 在 `hoistArithmetics()` 中尝试将加减/FP 运算的子表达式提前计算
+- 见 STATISTIC: `NumAddSubHoisted`, `NumFPAssociationsHoisted`, `NumBOAssociationsHoisted`
+
+---
+
+**9. 分支收集（1009-1012 行）**
+
+```cpp
+if (BranchInst *BI = dyn_cast<BranchInst>(&I))
+  CFH.registerPossiblyHoistableBranch(BI);
+```
+
+- 暂存可能提升的条件分支，后续用于 PHI 提升判断
+- **不是立即提升**，因为可能需复制控制流
+
+---
+
+**10. Control Flow Re-hoisting（1016-1045 行）**
+
+```cpp
+Instruction *HoistPoint = nullptr;
+if (ControlFlowHoisting) {
+  for (Instruction *I : reverse(HoistedInstructions)) {
+    if (!llvm::all_of(I->uses(),
+                      [&](Use &U) { return DT->dominates(I, U); })) {
+      BasicBlock *Dominator = DT->getNode(I->getParent())->getIDom()->getBlock();
+      if (!HoistPoint || !DT->dominates(HoistPoint->getParent(), Dominator)) {
+        HoistPoint = Dominator->getTerminator();
+      }
+      moveInstructionBefore(*I, HoistPoint->getIterator(), ...);
+      HoistPoint = I;
+      Changed = true;
+    }
+  }
+}
+```
+
+- **目的**: 修复因提升到条件块导致的 dominance 不完整问题
+- 逆序遍历（use 在 def 前），逐步找到最近公共支配者（immediate dominator）
+- 将指令移动到该支配点，确保 dominate 所有 use
+
+---
+
+**11. 验证与返回（1046-1060 行）**
+
+```cpp
+if (VerifyMemorySSA)
+  MSSAU.getMemorySSA()->verifyMemorySSA();
+
+#ifdef EXPENSIVE_CHECKS
+if (Changed) {
+  assert(DT->verify(DominatorTree::VerificationLevel::Fast) && ...);
+  LI->verify(*DT);
+}
+#endif
+
+return Changed;
+```
+
+- MemorySSA 验证（仅 debug 模式）
+- 在 `EXPENSIVE_CHECKS` 下验证 DT 和 LI 一致性
+
+---
+
+### 关键数据结构
+
+| 结构 | 作用 | 关键字段/方法 |
+|---|---|---|
+| `LoopBlocksRPO` | 循环块的逆后序列表 | `perform(LI)` 计算 RPO |
+| `ControlFlowHoister` | 管理条件分支复制与块映射 | `HoistDestinationMap`, `HoistableBranches` |
+| `SinkAndHoistLICMFlags` | 传递优化 cap 参数 | `tooManyMemoryAccesses()` |
+| `ICFLoopSafetyInfo` | 循环安全信息（speculation 边界） | `computeLoopSafetyInfo()` |
+| `HoistedInstructions` | 记录已提升指令（用于 re-hoisting） | `vector<Instruction*>` |
+
+---
+
+### 优化意图
+
+1. **单遍 hoisting**: 通过 RPO 遍历（定义先于使用），确保 sink 一次完成；hoist 也只需一次遍历
+2. **控制流提升**: 通过复制分支和基本块，将循环内条件指令提升到对应路径，避免全部提升到 preheader 导致过度 speculation
+3. **PHI 提升**: 将循环头 PHI 提前，减少循环内 PHI 数量，简化后续分析
+4. **FP 优化**: 将 invariant 除法转为乘法，利用 FP 松弛特性
+5. **重结合**: 将部分算术运算提前计算，减少循环内计算量
+6. **MemorySSA 增量更新**: 所有 IR 修改通过 `MSSAU` 维护一致性
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| LCSSA 形式 | `assert(L->isLCSSAForm(*DT))` (行 424) | LICM 修改 loop boundary 可能破坏 LCSSA |
+| 支配关系 | hoist 后必须 dominate 所有 use | 否则需 re-hoisting (行 1024-1044) |
+| 内存别名 | 通过 `canSinkOrHoistInst` + `noConflictingReadWrites` 检查 | 别名冲突可能导致错误提升 |
+| speculation 安全 | `isSafeToExecuteUnconditionally` 判断 | 可能导致运行时异常（如除零） |
+| 子循环跳过 | `inSubLoop` 避免重复处理 | 否则重复提升，代码膨胀 |
+| preheader 存在 | `Preheader && L->hasDedicatedExits()` | 否则无法插入 hoisted 代码 |
+| MemorySSA 一致性 | 所有修改通过 `MSSAU` | 直接操作 IR 而不更新 MSSA 会导致后续分析错误 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 循环块 RPO 计算 | `LoopBlocksRPO::perform(LoopInfo)` | llvm/lib/Transforms/Utils/LoopUtils.h |
+| 子循环判断 | `inSubLoop(BB, CurLoop, LI)` | 行 176（静态函数） |
+| 指令是否死代码 | `isInstructionTriviallyDead(I, TLI)` | llvm/lib/Transforms/Utils/Local.h |
+| 可移动性检查 | `canSinkOrHoistInst(I, AA, DT, CurLoop, MSSAU, ...)` | llvm/lib/Transforms/Utils/LoopUtils.h |
+| 无条件执行安全 | `isSafeToExecuteUnconditionally(...)` | 行 188-192（声明） |
+| 实际提升 | `hoist(I, DT, CurLoop, Dest, SafetyInfo, MSSAU, SE, ORE)` | 行 181-184 声明，需查看其定义 |
+| 算术重结合 | `hoistArithmetics(I, L, SafetyInfo, MSSAU, AC, DT)` | 行 203-206 声明 |
+| ControlFlowHoister | `getOrCreateHoistedBlock(BB)` | 行 769-880 |
+| PHI 可提升性 | `ControlFlowHoister::canHoistPHI(PN)` | 行 732-767 |
+| MemorySSA 验证 | `MSSA->verifyMemorySSA()` | llvm/lib/Analysis/MemorySSA.cpp |
+
+**hoist() 函数位置**: 未在当前文件显示，应在同一文件的下文部分（使用 offset 继续读取）
+
+---
+
+### 其他补充
+
+- **统计项**: `NumHoisted`, `NumCreatedBlocks`, `NumClonedBranches` 等记录优化效果
+- **命令行选项**: 
+  - `-licm-control-flow-hoisting` (默认 false) 控制是否复制控制流
+  - `-licm-mssa-optimization-cap` (默认 100) 控制 MemorySSA 查询精度/性能权衡
+  - `-licm-mssa-max-acc-promotion` (默认 250) 控制内存提升的门限
+- **与 sinkRegion 关系**: LICM 先 `sinkRegion` 后 `hoistRegion`，两者使用相同遍历模式但方向相反（sink 用 reverse RPO，hoist 用 RPO）
+
+---
+
 ## 函数分析：`isSafeToExecuteUnconditionally()`（行 1729-1753）
 
 ### 函数签名与目的（行 1729-1753）
@@ -6452,3 +6769,1270 @@ MSSAU.insertDef(cast<MemoryDef>(NewMemAcc), true);
 | 元数据一致性 | 对齐、原子序必须匹配原访问 | 不匹配可能导致代码生成错误或语义改变 |
 
 ---
+
+---
+
+## 工具函数分析：`llvm::make_early_inc_range`
+
+### 函数签名与目的（STLExtras.h:632-639）
+
+```cpp
+template <typename RangeT>
+iterator_range<early_inc_iterator_impl<detail::IterOfRange<RangeT>>>
+make_early_inc_range(RangeT &&Range) {
+  using EarlyIncIteratorT =
+      early_inc_iterator_impl<detail::IterOfRange<RangeT>>;
+  return make_range(EarlyIncIteratorT(adl_begin(Range)),
+                    EarlyIncIteratorT(adl_end(Range)));
+}
+```
+
+**功能**: 创建一个"提前递增"（early increment）的范围适配器，使得在遍历容器（如 `BasicBlock` 中的指令列表）时可以**安全地删除或移动当前元素**，而不会破坏迭代器的有效性或导致遍历遗漏。
+
+---
+
+### 为什么需要这个函数
+
+在 LICM 的 `hoistRegion()` 和 `sinkRegion()` 中，遍历循环体内的指令时，需要根据条件**移动或删除**当前指令：
+
+```cpp
+// hoistRegion 行 921
+for (Instruction &I : llvm::make_early_inc_range(*BB)) {
+  if (/* 满足提升条件 */) {
+    hoist(I, ...);  // 将 I 移动到 preheader
+    // I 被移动后，迭代器必须仍然有效，且指向下一条指令
+  }
+}
+
+// sinkRegion 行 583
+for (BasicBlock::iterator II = BB->end(); II != BB->begin();) {
+  Instruction &I = *--II;
+  if (isInstructionTriviallyDead(&I, TLI)) {
+    ++II;  // 手动先递增
+    eraseInstruction(I, ...);  // 再删除
+    continue;
+  }
+}
+```
+
+如果使用普通的 range-based for 循环，当循环体内部删除/移动 `I` 后，底层迭代器会失效，导致未定义行为。
+
+---
+
+### 核心机制：`early_inc_iterator_impl`（STLExtras.h:577-618）
+
+```cpp
+template <typename WrappedIteratorT>
+class early_inc_iterator_impl
+    : public iterator_adaptor_base<early_inc_iterator_impl<WrappedIteratorT>,
+                                   WrappedIteratorT, std::input_iterator_tag> {
+  using BaseT = typename early_inc_iterator_impl::iterator_adaptor_base;
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+  bool IsEarlyIncremented = false;
+#endif
+
+public:
+  early_inc_iterator_impl(WrappedIteratorT I) : BaseT(I) {}
+
+  // 关键：解引用时返回当前元素，同时递增底层迭代器
+  decltype(*std::declval<WrappedIteratorT>()) operator*() {
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+    assert(!IsEarlyIncremented && "Cannot dereference twice!");
+    IsEarlyIncremented = true;
+#endif
+    return *(this->I)++;  // ← 核心：先解引用，再递增底层迭代器
+  }
+
+  // 递增操作（实际为空，因为 operator* 已递增）
+  early_inc_iterator_impl &operator++() {
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+    assert(IsEarlyIncremented && "Cannot increment before dereferencing!");
+    IsEarlyIncremented = false;
+#endif
+    return *this;
+  }
+
+  // 比较操作
+  friend bool operator==(const early_inc_iterator_impl &LHS,
+                         const early_inc_iterator_impl &RHS) {
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+    assert(!LHS.IsEarlyIncremented && "Cannot compare after dereferencing!");
+#endif
+    return (const BaseT &)LHS == (const BaseT &)RHS;
+  }
+};
+```
+
+---
+
+### 工作流程与状态机
+
+该迭代器实现了一个简单的两阶段状态机：
+
+#### 状态转换
+
+```
+┌─────────────┐          operator*()           ┌──────────────────┐
+│  初始状态    │ ────────────────────────────→ │  已解引用状态     │
+│ (可解引用、  │  1. 返回当前元素引用           │ (可递增、不可再   │
+│   可比较)    │  2. 底层迭代器指向下一个元素   │   解引用、不可比较)│
+└─────────────┘                               └───────────────────┘
+       ↑                                              │
+       │                                              │ operator++()
+       └───────────────────────←──────────────────────┘
+```
+
+#### Range-based for 循环展开
+
+```cpp
+for (Instruction &I : llvm::make_early_inc_range(*BB)) {
+  // 循环体
+}
+```
+
+等价于：
+
+```cpp
+auto __range = llvm::make_early_inc_range(*BB);
+auto __it = __range.begin();    // early_inc_iterator，底层指向 BB 第一条指令
+auto __end = __range.end();
+
+while (__it != __end) {          // Step 1: 比较（迭代器在初始状态）
+  Instruction &I = *__it;        // Step 2: 解引用（触发 operator*）
+                                 //   - 返回当前指令 I
+                                 //   - 底层迭代器自动 ++ → 指向下一条指令
+  // 循环体开始 -------------------┐
+  hoist(I, ...);                 // 可以安全删除/移动 I
+                                 // 此时底层迭代器已指向下一条，不受影响
+  // 循环体结束 -------------------┘
+  ++__it;                        // Step 3: 递增（实际是空操作，底层已递增）
+                                   // 将状态重置回初始状态，准备下一轮比较
+}
+```
+
+**关键时序**：
+
+```
+迭代器底层位置： [A] → [B] → [C] → [D] → end
+                 ↑    ↑    ↑    ↑
+循环体执行：      │    │    │    │
+                 ├─删除 A    │    │
+                 │    ├─删除 B    │
+                 │    │    ├─删除 C
+                 │    │    │    └─删除 D
+```
+
+---
+
+### 为什么可以安全删除当前元素
+
+**核心原理**：在用户代码访问当前元素（`*__it`）的**同一时刻**，底层迭代器已经移动到下一个位置。
+
+```cpp
+// operator* 的实现
+return *(this->I)++;  // 顺序：1. 解引用 *I；2. 递增 I
+```
+
+**普通迭代器的问题**：
+
+```cpp
+// 普通迭代器
+for (auto it = list.begin(); it != list.end(); ++it) {
+  auto &elem = *it;      // it 仍指向 elem
+  list.erase(it);        // it 失效，后续遍历崩溃
+}
+```
+
+**early_inc_iterator 的安全保障**：
+
+```cpp
+// early_inc_iterator
+for (auto &elem : make_early_inc_range(list)) {
+  // 此时底层迭代器已经指向下一个元素
+  list.erase(&elem);     // 删除当前元素，但迭代器已经跳过它
+  // 下一轮 ++it 是空操作，状态重置即可
+}
+```
+
+**内存安全保证**：只要删除操作**不释放内存**（或释放发生在迭代器不访问该内存之后），就是安全的。在 LICM 中：
+- `hoist()` 使用 `moveBefore()` 将指令移动到其他块，原位置从容器移除但指令对象本身不销毁
+- `eraseInstruction()` 确实会销毁指令，但此时迭代器早已指向下一条，且 `eraseInstruction` 在 LICM 中调用时：
+  - 对于 sink 场景，迭代器在调用 `eraseInstruction` **之前**已经 `++II`（手动递增）
+  - 对于 hoist 场景，`hoist()` 后通过 `continue` 跳过后续代码，`make_early_inc_range` 的迭代器在下次循环开始时仍处于已递增状态
+
+---
+
+### 使用模式约束
+
+该迭代器**仅适用于特定的使用模式**，违反模式会导致未定义行为：
+
+| 操作 | 允许时机 | 禁止时机 | 后果 |
+|---|---|---|---|
+| `*it` (解引用) | 初始状态 ✓ | 已解引用状态 ✗ | 断言失败（debug）或未定义行为 |
+| `++it` (递增) | 已解引用状态 ✓ | 初始状态 ✗ | 断言失败（debug）或未定义行为 |
+| `it == end` (比较) | 初始状态 ✓ | 已解引用状态 ✗ | 断言失败（debug）或未定义行为 |
+| 多次解引用 | 任何状态 ✗ | - | 第二次会触发断言 |
+
+**合法循环模式**：
+
+```cpp
+// 模式 1: range-based for (标准用法)
+for (auto &elem : make_early_inc_range(container)) {
+  // 循环体内可以安全删除 elem
+  // 每次循环：compare → deref(自动递增) → body → increment(空操作)
+}
+
+// 模式 2: 手动循环（等价展开）
+auto it = begin, end;
+while (it != end) {      // 比较（初始状态）
+  auto &elem = *it;      // 解引用 → 底层迭代器自动++
+  // 循环体（可删除 elem）
+  ++it;                  // 递增（重置状态）
+}
+```
+
+**非法模式示例**：
+
+```cpp
+// ❌ 错误：未解引用就递增
+auto it = make_early_inc_range(container).begin();
+++it;  // 断言失败：IsEarlyIncremented 为 false
+
+// ❌ 错误：解引用两次
+for (auto &elem : make_early_inc_range(container)) {
+  use(elem);     // 第一次解引用（底层 ++）
+  use(elem);     // 第二次解引用 → 断言失败
+}
+
+// ❌ 错误：解引用后继续比较（range-based for 不会，但手动循环可能）
+auto &elem = *it;  // 底层 ++
+if (&elem == something) { ... }  // 此时 it 已非初始状态，比较可能有问题
+```
+
+---
+
+### 与手动递增模式的对比
+
+**LICM 中的两种遍历模式**：
+
+#### 1. `make_early_inc_range`（正向 hoist）
+
+```cpp
+// hoistRegion 行 921
+for (Instruction &I : llvm::make_early_inc_range(*BB)) {
+  if (canHoist(I)) {
+    hoist(I, ...);    // 移动 I 到 preheader
+    continue;         // 迭代器已指向下一条，安全
+  }
+}
+```
+
+#### 2. 手动反向遍历 + 显式 `++II`（sink 场景）
+
+```cpp
+// sinkRegion 行 583
+for (BasicBlock::iterator II = BB->end(); II != BB->begin();) {
+  Instruction &I = *--II;     // 手动递减获取元素
+  if (isDead(I)) {
+    ++II;                     // 先递增迭代器
+    eraseInstruction(I, ...); // 再删除（此时迭代器已指向下一条）
+    continue;
+  }
+}
+```
+
+**为什么 sinkRegion 不用 `make_early_inc_range`**？
+
+因为 sinkRegion 采用**反向遍历**（从 BB 末尾向前），而 `make_early_inc_range` 是正向递增适配器。反向遍历需要：
+- 从 `BB->end()` 开始
+- 每次 `--II` 获取前一条指令
+- 删除前必须 `++II` 将迭代器"回退"到当前位置的下一条（逻辑上的前一条）
+
+这种模式与 `early_inc` 的"解引用即前进"语义不匹配，所以 sinkRegion 采用传统的反向迭代器模式，手动控制递增点。
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 提前递增范围创建 | `llvm::make_early_inc_range(Range)` | `llvm/ADT/STLExtras.h:634` |
+| 提前递增迭代器 | `early_inc_iterator_impl` | `llvm/ADT/STLExtras.h:578` |
+| 迭代器适配基类 | `iterator_adaptor_base` | `llvm/ADT/iterator.h` |
+| Debug 检查开关 | `LLVM_ENABLE_ABI_BREAKING_CHECKS` | 编译时配置 |
+
+---
+
+### 设计权衡与适用场景
+
+**适用场景**：
+- 遍历时删除当前元素（但释放操作需谨慎）
+- 遍历时移动当前元素到其他容器（指令被 hoist/sink）
+- 容器结构在遍历过程中被修改，但不影响"下一个"迭代器
+
+**不适用场景**：
+- 需要访问刚删除的元素（已销毁）
+- 需要在删除后仍能访问迭代器（迭代器已移动）
+- 多线程并发修改同一容器（无同步）
+- 需要双向遍历或随机访问
+
+**性能考量**：
+- `early_inc_iterator_impl` 是零开销抽象：`operator*` 内联后与普通迭代器差异仅在于多一次 `++` 操作
+- Debug 模式下有 `IsEarlyIncremented` 状态检查（`LLVM_ENABLE_ABI_BREAKING_CHECKS`），Release 模式下无额外开销
+- 相比手动管理迭代器递增，代码可读性显著提升
+
+---
+
+### 总结
+
+`make_early_inc_range` 通过**"解引用即递增"**的迭代器设计，巧妙解决了"遍历中修改容器"的迭代器失效问题。其核心是：
+1. 将"获取当前元素"和"移动到下一个"合并为一步
+2. 用户代码在访问元素后，迭代器已自动指向下一条，删除当前元素不会影响后续遍历
+3. 严格的状态机约束防止误用（debug 模式）
+4. 专为 range-based for 设计，要求"恰好一次解引用 + 恰好一次递增"的精确模式
+
+在 LICM 中，这允许 `hoistRegion()` 在单次正向遍历中安全地提升多条指令，无需像 `sinkRegion()` 那样手动管理迭代器位置，代码更清晰且不易出错。
+
+---
+
+## ControlFlowHoisting：支配不完整与 rehoist 修复场景分析（LICM.cpp:1024–1045）
+
+### 触发条件
+
+当 `-licm-control-flow-hoisting` 启用时（默认开启），LICM 会将循环内不变量计算提升到**条件分支块**而非 preheader，而非仅提升到 preheader。这种"条件提升"可能导致：**已提升的指令不支配其未被提升的使用点**，需要后续修复（rehoist）。
+
+---
+
+### 源码调用路径：为什么 `%brmerge` 会被提升到条件块？
+
+| 行号 | 说明 |
+|------|------|
+| **LICM.cpp:933** | `hoist(I, DT, CurLoop, CFH.getOrCreateHoistedBlock(BB), ...)` - 将指令 `I` 提升到 `BB` 对应的目标块 |
+| **LICM.cpp:776-782** | `getOrCreateHoistedBlock(BB)` 检查 `BB` 是否为条件分支的后继：`HasBBAsSuccessor` |
+| **LICM.cpp:794-803** | 若 `BB` 是某个可提升分支（`branchA`、`branchB`）的后继，则创建条件块（如 `else2.licm`） |
+
+**测试用例 IR**（来自 `hoist-phi.ll:862`）：
+
+```llvm
+; @rehoist 示例
+define void @rehoist(ptr %this, i32 %x, i1 %arg) {
+entry:
+  %sub = add nsw i32 %x, -1
+  br label %loop
+
+loop:
+  br i1 %arg, label %if1, label %else1      ; 分支 A (branchA)
+
+if1:
+  call void %this(ptr %this)                 ; 有副作用
+  br label %then1
+
+else1:
+  br label %then1
+
+then1:
+  %cmp = icmp eq i32 0, %sub                 ; 循环不变，可提升
+  br i1 %cmp, label %end, label %else2       ; 分支 B (branchB)
+
+else2:
+  %brmerge = or i1 %cmp, true                ; 循环不变，使用 %cmp，可提升
+  br i1 %brmerge, label %if3, label %end
+
+if3:
+  br label %end
+
+end:
+  br label %loop
+}
+```
+
+---
+
+### Hoist 阶段的执行流程（RPO 顺序）
+
+| 步骤 | 处理的块 | 处理内容 | HoistableBranches 状态 | getOrCreateHoistedBlock(else2) 结果 |
+|------|---------|----------|------------------------|------------------------------------|
+| 1 | `loop` | `br i1 %arg, if1, else1` (branchA) | `branchA → then1` | - |
+| 2 | `then1` | `br i1 %cmp, end, else2` (branchB) | `branchB → end` | - |
+| 3 | `else2` | `%brmerge = or i1 %cmp, true` | - | **检测到 `else2` 是 branchB 的后继 → 创建 `else2.licm`** |
+
+**关键判断逻辑**（LICM.cpp:777-782）：
+```cpp
+auto HasBBAsSuccessor = [&](DenseMap<BranchInst *, BasicBlock *>::value_type &Pair) {
+  return BB != Pair.second && 
+         (Pair.first->getSuccessor(0) == BB ||   // TrueDest == else2?
+          Pair.first->getSuccessor(1) == BB);    // FalseDest == else2?
+};
+auto It = llvm::find_if(HoistableBranches, HasBBAsSuccessor);
+// 对于 else2，branchB 的 FalseDest 正是 else2 → It != end()
+```
+
+因此，`%brmerge` 被提升到新创建的 `else2.licm` 块（条件块）中。
+
+---
+
+### 问题根源：支配关系被破坏
+
+**原始控制流**：
+```
+        loop
+       /    \
+     if1    else1
+       \    /
+       then1
+       /    \
+    end     else2 ← %brmerge 在这里
+```
+
+**提升后的控制流（问题状态）**：
+```
+        entry
+       /    \
+  if1.licm  else1.licm    ← 条件块，相互独立
+      \    /
+    then1.licm
+           \
+       else2.licm ← %brmerge 被提升到这里！
+```
+
+**核心问题**：
+| 指令 | 提升位置 | 支配关系 | 问题 |
+|------|---------|---------|------|
+| `%cmp` | `entry` | ✓ `entry` 支配所有块 | 正常 |
+| `%brmerge` | `if1.licm.else2.licm` | ✗ `if1.licm.else2.licm` **不支配** `else1.licm` | 如果 `%brmerge` 有使用者在其他分支，会违反支配关系 |
+
+条件块之间互不支配——`if1.licm` 和 `else1.licm` 是兄弟关系，它们各自的子块也无法互相支配。如果某个指令被提升到一个条件块中，而该指令的使用者在另一个不相交的条件块中，那么该指令就不再支配其使用点，违反了 SSA 和 Dominator Tree 的基本约束。
+
+---
+
+### Rehoist 修复逻辑（LICM.cpp:1016-1045）
+
+```cpp
+// If we hoisted instructions to a conditional block they may not dominate
+// their uses that weren't hoisted (such as phis where some operands are not
+// loop invariant). If so make them unconditional by moving them to their
+// immediate dominator.
+Instruction *HoistPoint = nullptr;
+if (ControlFlowHoisting) {
+  for (Instruction *I : reverse(HoistedInstructions)) {
+    // 检查：已提升的指令是否支配所有使用点
+    if (!llvm::all_of(I->uses(),
+                      [&](Use &U) { return DT->dominates(I, U); })) {
+      // 不支配 → 重新提升到直接支配块
+      BasicBlock *Dominator =
+          DT->getNode(I->getParent())->getIDom()->getBlock();
+      if (!HoistPoint || !DT->dominates(HoistPoint->getParent(), Dominator)) {
+        if (HoistPoint)
+          assert(DT->dominates(Dominator, HoistPoint->getParent()) &&
+                 "New hoist point expected to dominate old hoist point");
+        HoistPoint = Dominator->getTerminator();
+      }
+      LLVM_DEBUG(dbgs() << "LICM rehoisting to "
+                        << HoistPoint->getParent()->getNameOrAsOperand()
+                        << ": " << *I << "\n");
+      moveInstructionBefore(*I, HoistPoint->getIterator(), ...)  // 行 1039
+      HoistPoint = I;                                         // 行 1041
+      Changed = true;
+    }
+  }
+}
+```
+
+**修复步骤**：
+1. **反向遍历**：按 `reverse(HoistedInstructions)` 顺序，确保先修复使用者，再修复被使用者（避免重复修复）
+2. **支配检查**：`DT->dominates(I, U)` 验证每个使用点是否都被定义点支配
+3. **定位支配块**：`getIDom()->getBlock()` 获取当前块的直接支配者
+4. **更新 HoistPoint**：将 `HoistPoint` 移动到新的支配块终止符处
+5. **MoveBefore**：行 1039 将指令移动到 `HoistPoint` 之前，使其在新的位置上支配所有使用点
+
+---
+
+### 具体场景解析：为什么 `%brmerge` 需要 rehoist？
+
+假设 `%brmerge` 在使用链中有某个使用者不在 `else2.licm` 分支下：
+
+**Rehoist 前**：
+```
+entry:
+  %cmp = icmp eq i32 0, %sub             ; 在 entry
+  br i1 %arg, label %if1.licm, label %else1.licm
+
+if1.licm:
+  br label %then1.licm
+
+else1.licm:
+  br label %then1.licm
+
+else2.licm:                             ; 属于 if1.licm 的子树
+  %brmerge = or i1 %cmp, true           ; 在 else2.licm
+  br i1 %brmerge, label %if3.licm, label %end.licm
+```
+
+此时，如果有一个 PHI 节点在 `then1.licm` 中使用 `%brmerge`：
+- `%brmerge` 的定义块是 `else2.licm`
+- `else2.licm` 的被支配者是 `if1.licm`
+- 但 `then1.licm` 的前驱包括 `else1.licm`，它**不被** `else2.licm` 支配
+- **结论**：`else2.licm` 不支配 `then1.licm`，违反支配关系
+
+**Rehoist 后**：
+```
+entry:
+  %cmp = icmp eq i32 0, %sub             ; 在 entry
+  %brmerge = or i1 %cmp, true           ; 被 rehoist 到 entry!
+  br i1 %arg, label %if1.licm, label %else1.licm
+```
+
+现在 `%brmerge` 在 `entry` 块，`entry` 支配所有块，满足支配关系。
+
+---
+
+### 总结：触发 LICM.cpp:1039 行的场景
+
+| 条件 | 说明 | 源码行号 |
+|------|------|----------|
+| `ControlFlowHoisting` 启用 | `-licm-control-flow-hoisting=1`（默认开启） | LICM.cpp:668 |
+| 存在可提升的条件分支 | 循环内有循环不变的条件分支，且分支后继有共同后继 | LICM.cpp:675-729 |
+| 指令被提升到条件块 | 指令所在块是某个条件分支的后继，触发 `getOrCreateHoistedBlock(BB)` 创建条件块 | LICM.cpp:933, 769-879 |
+| 使用点未被提升 | 指令的使用者在另一条不相交的条件分支中 | - |
+| 支配检查失败 | `DT->dominates(I, U)` 返回 false | LICM.cpp:1026-1027 |
+| **执行 Rehoist** | 移动到直接支配块，恢复支配完整性 | **LICM.cpp:1039** |
+
+**调试命令**：
+```bash
+opt -passes="licm" -debug-only=licm input.ll 2>&1 | grep -i rehoist
+# 输出：LICM rehoisting to entry: %brmerge = or i1 %cmp, true
+```
+
+**相关测试**：
+- `llvm/test/Transforms/LICM/hoist-phi.ll:@rehoist`（行 862）
+- `llvm/test/Transforms/LICM/hoist-phi.ll:@phi_conditional_use`（行 1260）
+- `llvm/test/Transforms/LICM/hoist-phi.ll:@rehoist_wrong_order_*`（行 1381+）
+
+---
+
+## MemorySSA 更新逻辑深度解析
+
+### MemorySSA 的本质：内存操作的 Use-Def 链
+
+MemorySSA 是一个描述**内存操作依赖关系**的 SSA 形式，核心是回答"这个 load/store 可能看到/覆盖哪些内存状态"。
+
+```
+MemoryUse(Load A)  ─── defining access ───> MemoryDef(Store B)
+                                    "Load A 看到的内存状态可能被 Store B 定义"
+```
+
+#### 三种 MemoryAccess 类型
+
+| 类型 | 代表 | 关键字段 | 语义 |
+|---|---|---|---|
+| `MemoryUse` | `load`, `readonly call` | `definingAccess` | 这个 load 可能看到 defining access 定义的值 |
+| `MemoryDef` | `store`, `write call` | `definingAccess` | 这个 store 覆盖了 defining access 的状态，产生新状态 |
+| `MemoryPhi` | CFG merge point | `incoming values` (多个前驱) | 在控制流汇合处合并内存状态 |
+
+**核心约束**：`definingAccess` 必须支配当前的 MemoryAccess。
+
+---
+
+### 为什么 LICM 需要更新 MemorySSA
+
+LICM 移动指令后，**内存操作的执行顺序和支配关系发生了变化**，MemorySSA 必须同步更新，否则：
+
+1. **MemoryUse 的 defining access 可能不再支配它** → MemorySSA 验证失败
+2. **依赖关系语义错误** → 后续 Pass 做出错误的别名判断
+3. **MemoryPhi 的 incoming values 错误** → 反映错误的控制流
+
+---
+
+### 具体场景分析
+
+#### 场景 1：提升 load 到 preheader
+
+**原始 IR + MemorySSA**：
+
+```
+preheader:
+  ...
+  br loop.header
+
+loop.header:
+  ; MemoryPhi %phi = [liveOnEntry, preheader], [def.store, loop.body]
+  
+loop.body:
+  store X, ptr    ; MemoryDef %def.store -> %phi
+  load ptr        ; MemoryUse %use.load -> %phi (假设无 clobber)
+  
+exit:
+```
+
+**问题**：`use.load` 的 defining access 是 `%phi`（在 loop.header），现在 load 移到 preheader：
+
+```
+preheader:
+  load ptr        ; 移到这里！
+  ...
+  br loop.header
+```
+
+**问题分析**：
+- `%phi` 在 loop.header，**不支配** preheader 中的 load
+- MemorySSA 约束被破坏：defining access 必须支配 use
+- 需要更新 `use.load` 的 defining access 为 `liveOnEntry` 或 preheader 之前的某个 `MemoryDef`
+
+**更新逻辑**（`moveInstructionBefore()` 中）：
+
+```cpp
+// LICM.cpp:1463-1466
+if (MemoryUseOrDef *OldMemAcc = cast_or_null<MemoryUseOrDef>(
+        MSSAU.getMemorySSA()->getMemoryAccess(&I)))
+  MSSAU.moveToPlace(OldMemAcc, Dest->getParent(),
+                    MemorySSA::BeforeTerminator);
+```
+
+`moveToPlace` 内部做了什么：
+
+1. 从原位置**移除** MemoryAccess（从原 BB 的 access list 中删除）
+2. **插入**到新 BB 的指定位置
+3. **重新计算 defining access**：调用 `getClobberingMemoryAccess` 查找新位置最近的 clobber
+4. **更新依赖链**：如果定义为 `MemoryDef`，还需更新后续依赖它的 MemoryUse
+
+---
+
+#### 场景 2：删除 store（MemoryDef）
+
+**原始**：
+
+```
+loop.body:
+  store X, ptr    ; MemoryDef %def1 -> %phi
+  load ptr        ; MemoryUse %use -> %def1 (依赖 store)
+  store Y, ptr    ; MemoryDef %def2 -> %def1
+```
+
+**删除 `store X` 后**：
+
+```
+loop.body:
+  load ptr        ; 原来的 MemoryUse，现在 defining access 错误！
+  store Y, ptr    ; MemoryDef %def2 -> 原来指向 %def1，现在 %def1 被删除了
+```
+
+**问题分析**：
+- `MemoryDef %def1` 被删除后，依赖它的 `MemoryUse %use` 和 `MemoryDef %def2` 的 defining access 变成 dangling
+- 需要**修复依赖链**：让后续的 MemoryUse/Def 指向 `%def1` 的 defining access（即 `%phi`）
+
+**更新逻辑**（`eraseInstruction()` 中）：
+
+```cpp
+// LICM.cpp:1449-1454
+static void eraseInstruction(Instruction &I, ICFLoopSafetyInfo &SafetyInfo,
+                             MemorySSAUpdater &MSSAU) {
+  MSSAU.removeMemoryAccess(&I);   // 先移除 MemoryAccess
+  SafetyInfo.removeInstruction(&I);
+  I.eraseFromParent();            // 再删除 IR 指令
+}
+```
+
+**要点**：
+- **必须先** `removeMemoryAccess` 再 `eraseFromParent`
+- `removeMemoryAccess` 会清理 MemoryUse/Def 及相关 Phi 节点
+
+---
+
+#### 场景 3：克隆 load 到出口块
+
+**原始**（sink 场景）：
+
+```
+loop.header:
+  ; MemoryPhi
+  
+loop.body:
+  load ptr        ; MemoryUse -> phi
+  
+exit:
+  phi [load_result, loop.body]  ; LCSSA phi
+```
+
+**克隆 load 到 exit**：
+
+```
+exit:
+  load ptr        ; 新克隆的 load
+  phi ...
+```
+
+**问题分析**：
+- 新 load 需要创建新的 MemoryUse
+- 新 MemoryUse 的 defining access 是什么？
+  - 应该是 exit 块之前（来自 loop.body 的边）的 MemoryDef
+  - 或者如果无 clobber，是 `liveOnEntry`
+
+**更新逻辑**（`cloneInstructionInExitBlock()` 中）：
+
+```cpp
+// LICM.cpp:1411-1426
+if (MSSAU.getMemorySSA()->getMemoryAccess(&I)) {
+  MemoryAccess *NewMemAcc = MSSAU.createMemoryAccessInBB(
+      New, nullptr, New->getParent(), MemorySSA::Beginning,
+      /*CreationMustSucceed=*/false);
+  if (NewMemAcc) {
+    if (auto *MemDef = dyn_cast<MemoryDef>(NewMemAcc))
+      MSSAU.insertDef(MemDef, /*RenameUses=*/true);
+    else {
+      auto *MemUse = cast<MemoryUse>(NewMemAcc);
+      MSSAU.insertUse(MemUse, /*RenameUses=*/true);
+    }
+  }
+}
+```
+
+**要点**：
+- `CreationMustSucceed=false`：允许失败（指令可能已变成非内存操作）
+- `RenameUses=true`：插入后自动执行 use renaming，确保 defining access 正确
+
+---
+
+### getClobberingMemoryAccess：核心查询
+
+这是 MemorySSA 更新的关键函数，**本质是别名分析 + dominance walk**：
+
+```cpp
+// LICM.cpp:1151-1163
+static MemoryAccess *getClobberingMemoryAccess(MemorySSA &MSSA,
+                                                BatchAAResults &BAA,
+                                                SinkAndHoistLICMFlags &Flags,
+                                                MemoryUseOrDef *MA) {
+  if (Flags.tooManyClobberingCalls())
+    return MA->getDefiningAccess();  // fallback：放弃精确性，用保守值
+  
+  MemoryAccess *Source =
+      MSSA.getSkipSelfWalker()->getClobberingMemoryAccess(MA, BAA);
+  Flags.incrementClobberingCalls();
+  return Source;
+}
+```
+
+**语义**：给定一个 `MemoryUse/Def`，找到"最近的可能 clobber 它的 MemoryDef"。
+
+**算法（简化）**：
+
+```text
+getClobberingMemoryAccess(MA):
+  1. 从 MA 的 definingAccess 开始
+  2. 向上 walk（沿 use-def 链）
+  3. 对遇到的每个 MemoryDef：
+     - 检查别名：MA 指令访问的地址 是否与 MemoryDef 指令访问的地址别名？
+     - 如果别名：返回该 MemoryDef（这就是 clobber）
+     - 如果不别名：继续向上 walk
+  4. 最终到达 liveOnEntry：返回 liveOnEntry
+```
+
+**LICM 中的使用**：
+- 在 `pointerInvalidatedByLoop`（行 2375）：检查 load 是否被 loop 内的 store invalidate
+- 在 `noConflictingReadWrites`（行 2307）：检查 store 是否有冲突的读写
+- 在 MemorySSAUpdater 的更新操作中：计算新的 defining access
+
+---
+
+### MemorySSAUpdater 的核心方法内部逻辑
+
+#### `moveToPlace` 的完整逻辑
+
+```cpp
+// llvm/Analysis/MemorySSAUpdater.cpp (伪代码，展示核心逻辑)
+void MemorySSAUpdater::moveToPlace(MemoryUseOrDef *MA, BasicBlock *BB,
+                                   MemorySSA::InsertionPlace Where) {
+  // Step 1: 从原位置移除
+  removeFromLists(MA);
+  
+  // Step 2: 插入到新位置
+  insertIntoLists(MA, BB, Where);
+  
+  // Step 3: 重新计算 defining access（关键！）
+  if (auto *MU = dyn_cast<MemoryUse>(MA)) {
+    MemoryAccess *NewDef = Walker->getClobberingMemoryAccess(MU);
+    MU->setDefiningAccess(NewDef);
+  } else if (auto *MD = dyn_cast<MemoryDef>(MA)) {
+    MemoryAccess *NewDef = Walker->getClobberingMemoryAccess(MD);
+    MD->setDefiningAccess(NewDef);
+    updateDefiningAccesses(MD);  // 修复依赖 MD 的后续 MemoryAccess
+  }
+  
+  // Step 4: 可能需要插入新的 MemoryPhi
+  fixupPhis();
+}
+```
+
+**关键点**：
+- `MemoryDef` 移动比 `MemoryUse` 复杂：Def 移走后，依赖它的 Use/Def 可能需要重新指向
+- `getClobberingMemoryAccess` 是更新 defining access 的核心
+
+---
+
+#### `removeMemoryAccess` 的完整逻辑
+
+```cpp
+void MemorySSAUpdater::removeMemoryAccess(Instruction *I) {
+  MemoryAccess *MA = MSSA->getMemoryAccess(I);
+  if (!MA) return;
+  
+  if (auto *MD = dyn_cast<MemoryDef>(MA)) {
+    // Step 1: 找 MD 的 defining access
+    MemoryAccess *DefOfMD = MD->getDefiningAccess();
+    
+    // Step 2: 找所有依赖 MD 的 MemoryUse/Def
+    SmallVector<MemoryAccess *> Users;
+    for (MemoryAccess *User : MSSA->allMemoryAccesses()) {
+      if (User->getDefiningAccess() == MD)
+        Users.push_back(User);
+    }
+    
+    // Step 3: 重定向依赖
+    for (MemoryAccess *User : Users) {
+      User->setDefiningAccess(DefOfMD);
+    }
+    
+    // Step 4: 删除 MD 本身
+    removeFromLists(MD);
+    
+    // Step 5: 可能简化 MemoryPhi
+    tryRemoveTrivialPhis();
+  } else if (auto *MU = dyn_cast<MemoryUse>(MA)) {
+    removeFromLists(MU);
+  }
+}
+```
+
+**关键点**：
+- 删除 `MemoryDef` 时必须**修复依赖链**（redirect uses）
+- 删除 `MemoryUse` 只需从 list 移除
+
+---
+
+#### `wireOldPredecessorsToNewImmediatePredecessor` 的逻辑
+
+```cpp
+void MemorySSAUpdater::wireOldPredecessorsToNewImmediatePredecessor(
+    BasicBlock *OldBB, BasicBlock *NewBB, ArrayRef<BasicBlock*> NewPreds) {
+  // 场景：
+  //   原来：OldBB 有多个前驱 Pred1, Pred2, ...
+  //   现在：NewBB 是新块，NewPreds 是 OldBB 的部分旧前驱
+  //         NewBB -> OldBB
+  //         其他前驱 -> OldBB
+  
+  if (MemoryPhi *OldPhi = MSSA->getBlockPhi(OldBB)) {
+    MemoryPhi *NewPhi = MSSA->createMemoryPhi(NewBB);
+    
+    for (BasicBlock *Pred : NewPreds) {
+      MemoryAccess *Incoming = OldPhi->getIncomingValue(Pred);
+      NewPhi->addIncoming(Incoming, Pred);
+      OldPhi->removeIncoming(Pred);
+    }
+    
+    OldPhi->addIncoming(NewPhi, NewBB);
+  }
+}
+```
+
+**关键点**：
+- CFG 变化时，MemoryPhi 的 incoming values 必须同步变化
+- 本质是"拆分"一个 MemoryPhi 到两个
+
+---
+
+### LICM 中 MemorySSA 更新的根本动机
+
+归纳起来，LICM 更新 MemorySSA 的根本原因是：
+
+| 操作 | MemorySSA 变化 | 必须更新 |
+|---|---|---|
+| **指令移动** | MemoryAccess 的 BB 改变 → defining access 可能不再支配它 | 重新计算 defining access，修复 dominance |
+| **MemoryDef 删除** | 依赖链断裂 → 后续 MemoryUse/Def 的 defining access dangling | 重定向到被删除 Def 的 defining access |
+| **新指令插入** | 需要新的 MemoryUse/Def → defining access 未设置 | 创建并计算 defining access |
+| **CFG 变化** | MemoryPhi 的 incoming 错误 → 反映错误的控制流 | 拆分/合并 MemoryPhi |
+
+---
+
+### 一个完整例子：load 提升的 MemorySSA 变化
+
+**原始 IR**：
+
+```llvm
+define void @foo(ptr %p) {
+entry:
+  br label %loop.header
+
+loop.header:
+  %i = phi [0, entry], [%i.next, %loop.body]
+  br label %loop.body
+
+loop.body:
+  store i32 1, ptr %q   ; 写另一个地址
+  %v = load i32, ptr %p ; 读 %p，%p loop invariant
+  %i.next = add %i, 1
+  %cond = icmp %i.next, 100
+  br i1 %cond, label %loop.header, label %exit
+
+exit:
+  ret void
+}
+```
+
+**原始 MemorySSA**（简化）：
+
+```
+entry:      MemoryDef(liveOnEntry) [隐式]
+            
+loop.header: MemoryPhi %phi1 = [liveOnEntry, entry], [%def1, loop.body]
+
+loop.body:  
+            MemoryDef %def1 -> %phi1   ; store q
+            MemoryUse %use1 -> %phi1   ; load p（getClobbering 发现 %phi1 是 LoE，无 clobber）
+            
+exit:       (无 MemoryAccess)
+```
+
+**LICM 提升 load 后的 IR**：
+
+```llvm
+entry:
+  br label %loop.header
+
+loop.header:
+  %v = load i32, ptr %p  ; 提升到这里！
+  %i = phi ...
+  br label %loop.body
+
+loop.body:
+  store i32 1, ptr %q
+  %i.next = add %i, 1
+  ...
+```
+
+**更新后的 MemorySSA**：
+
+```
+entry:      MemoryDef(liveOnEntry)
+            
+loop.header: 
+            MemoryUse %use1' -> liveOnEntry  ; load p，现在 defining access 是 LoE
+            MemoryPhi %phi1 = [liveOnEntry, entry], [%def1, loop.body]
+            
+loop.body:  
+            MemoryDef %def1 -> %phi1
+            ; 原 %use1 被删除
+```
+
+**关键变化**：
+
+1. `MemoryUse %use1` 从 `loop.body` 移到 `loop.header`
+2. `use1` 的 defining access 从 `%phi1` 变为 `liveOnEntry`
+   - 为什么？`getClobberingMemoryAccess` 在新位置（loop.header，在 phi 之前）查询，发现无 clobber
+   - `%phi1` 不支配 `loop.header` 的 load（load 在 phi 之前），所以不能用 `%phi1`
+3. 原 `loop.body` 的 `%use1` 被移除
+
+---
+
+### LICM 中 MemorySSA API 使用场景汇总
+
+| API | 使用位置 | 场景 |
+|---|---|---|
+| `MSSAU.removeMemoryAccess(I)` | `eraseInstruction()` :1451 | 删除指令时移除其 MemoryAccess |
+| `MSSAU.moveToPlace(OldMemAcc, BB, Where)` | `moveInstructionBefore()` :1465 | 移动指令时更新 MemoryAccess 位置 |
+| `MSSAU.createMemoryAccessInBB()` | `cloneInstructionInExitBlock()` :1415, `LoopPromoter` :1843, `promoteLoopAccessesToScalars()` :2202 | 在指定块创建新的 MemoryAccess |
+| `MSSAU.createMemoryAccessAfter()` | `LoopPromoter` :1847 | 在指定 MemoryAccess 之后创建 |
+| `MSSAU.insertDef()` / `MSSAU.insertUse()` | `cloneInstructionInExitBlock()` :1420/1423, `LoopPromoter` :1850, `promoteLoopAccessesToScalars()` :2205 | 插入 MemoryDef/Use 并执行重命名 |
+| `MSSAU.wireOldPredecessorsToNewImmediatePredecessor()` | `ControlFlowHoister` :849 | CFG 变化后连接新前驱到新块 |
+
+---
+
+### 正确性约束
+
+| 操作 | 约束 | 违反后果 |
+|---|---|---|
+| 删除指令 | 先 `removeMemoryAccess` 后 `eraseFromParent` | MSSA dangling reference crash |
+| 移动指令 | `moveToPlace` 必须在 IR 移动后调用 | MemoryAccess 与 IR 指令位置不一致 |
+| 克隆指令 | `RenameUses=true` 确保 defining access 正确 | MemoryUse 指向错误的 MemoryDef |
+| CFG 变化 | `wireOldPredecessorsToNewImmediatePredecessor` 更新 Phi | MemoryPhi incoming values 错误 |
+
+---
+
+### 验证机制
+
+```cpp
+if (VerifyMemorySSA)
+  MSSA->verifyMemorySSA();  // 多处调用：行 547, 621, 1046, 2211, 2218
+```
+
+---
+
+### PreservedAnalyses 处理
+
+```cpp
+auto PA = getLoopPassPreservedAnalyses();
+PA.preserve<MemorySSAAnalysis>();  // 行 320, 360
+```
+
+**要点**：LICM 明式 preserve MemorySSA，后续 Pass 可复用更新后的结果。
+
+---
+
+### 深入点建议
+
+如果你想继续深入 MemorySSA 的实现细节：
+
+1. **`getClobberingMemoryAccess` 的实现**（`MemorySSA.cpp`）：核心是 alias walk + phi translation
+2. **`MemorySSAUpdater::insertDef` 的 renaming 逻辑**：如何批量更新后续 MemoryUse
+3. **`optimizeUses`**：MemorySSA 的优化 pass，会简化 defining access
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 创建 MemorySSAUpdater | `MemorySSAUpdater(MSSA)` | `llvm/Analysis/MemorySSAUpdater.h` |
+| 移动 MemoryAccess | `moveToPlace()` | `MemorySSAUpdater.cpp` |
+| 移除 MemoryAccess | `removeMemoryAccess()` | `MemorySSAUpdater.cpp` |
+| 创建 MemoryAccess | `createMemoryAccessInBB()` | `MemorySSAUpdater.cpp` |
+| 插入 MemoryDef/Use | `insertDef()`, `insertUse()` | `MemorySSAUpdater.cpp` |
+| CFG 更新 | `wireOldPredecessorsToNewImmediatePredecessor()` | `MemorySSAUpdater.cpp` |
+| Clobber 查询 | `getClobberingMemoryAccess()` | `MemorySSA.cpp` |
+| 验证 MemorySSA | `verifyMemorySSA()` | `MemorySSA.cpp` |
+
+---
+
+## ICFLoopSafetyInfo 深度解析
+
+### 核心作用
+
+`ICFLoopSafetyInfo` 是 LICM 用来回答**"这个指令在循环内是否必然执行"**这一关键安全性问题的数据结构。它继承自 `LoopSafetyInfo`，但比简单的 `SimpleLoopSafetyInfo` 提供更精确的答案。
+
+---
+
+### 三大核心功能
+
+| 功能 | API | 在 LICM 中的用途 |
+|---|---|---|
+| **判断指令是否必然执行** | `isGuaranteedToExecute(Inst, DT, CurLoop)` | 决定是否能将**有副作用**的指令（如 load、call）提升到 preheader |
+| **判断是否之前无内存写** | `doesNotWriteMemoryBefore(Inst, CurLoop)` | 决定是否能提升 `invariant.start` 或 `guard` intrinsic |
+| **判断块是否可能抛异常** | `blockMayThrow(BB)` / `anyBlockMayThrow()` | 影响"guaranteed to execute"的判断逻辑 |
+
+---
+
+### 关键数据结构（MustExecute.h:133-140）
+
+```cpp
+class ICFLoopSafetyInfo : public LoopSafetyInfo {
+  bool MayThrow = false;                           // 循环是否可能抛异常
+  mutable ImplicitControlFlowTracking ICF;         // 隐式控制流追踪
+  mutable MemoryWriteTracking MW;                 // 内存写追踪
+  DenseMap<BasicBlock *, ColorVector> BlockColors; // Windows EH funclet 着色
+};
+```
+
+**两个关键辅助对象**：
+
+- **`ImplicitControlFlowTracking` (ICF)**：追踪哪些块包含"隐式控制流"——即可能不将执行传递到后继的指令（如 `call that may throw`、`volatile load/store`）
+- **`MemoryWriteTracking` (MW)**：追踪哪些块包含"可能写内存的指令"——用于 `doesNotWriteMemoryBefore` 的判断
+
+---
+
+### 核心算法：`isGuaranteedToExecute`
+
+```cpp
+// MustExecute.cpp:285-290
+bool ICFLoopSafetyInfo::isGuaranteedToExecute(const Instruction &Inst,
+                                               const DominatorTree *DT,
+                                               const Loop *CurLoop) const {
+  return !ICF.isDominatedByICFIFromSameBlock(&Inst) &&
+         allLoopPathsLeadToBlock(CurLoop, Inst.getParent(), DT);
+}
+```
+
+**两个条件**：
+
+1. **`!ICF.isDominatedByICFIFromSameBlock(&Inst)`**：在该指令所在的块内，没有隐式控制流点支配它
+   - 即：如果该块前面有 `call that may throw`，且该 call 在 Inst 之前，则 Inst **不保证执行**
+2. **`allLoopPathsLeadToBlock(CurLoop, Inst.getParent(), DT)`**：从循环 header 到 Inst 所在块的所有路径，都必须经过该块（无旁路）
+
+---
+
+### ICF 和 MW 的内部机制（简化）
+
+```cpp
+// InstructionPrecedenceTracking.h 中的机制（简化描述）
+class ImplicitControlFlowTracking {
+  DenseMap<BasicBlock *, const Instruction*> FirstICF;  // 每个块第一个 ICF 点
+  // isDominatedByICFIFromSameBlock(Inst):
+  //   如果 FirstICF[Inst->getParent()] 存在且支配 Inst → 返回 true
+};
+
+class MemoryWriteTracking {
+  DenseMap<BasicBlock *, const Instruction*> FirstMW;   // 每个块第一个内存写点
+  // isDominatedByMemoryWriteFromSameBlock(Inst):
+  //   如果 FirstMW[Inst->getParent()] 存在且支配 Inst → 返回 true
+};
+```
+
+**关键设计**：每个块只记录**第一个** ICF/MW 点，而不是所有。因为只需回答"是否有 ICF/MW 在 Inst 之前"，第一个就足以判断。
+
+---
+
+### 更新策略：维护缓存的正确性
+
+`ICFLoopSafetyInfo` 内部的 `ICF` 和 `MW` 是**缓存对象**，当 LICM 修改 IR 时，必须同步更新。
+
+#### 三种更新时机
+
+| API | 调用时机 | LICM 中的位置 | 内部逻辑 |
+|---|---|---|---|
+| **`computeLoopSafetyInfo(L)`** | LICM 初始化时 | `runOnLoop` :455-456 | 清空 ICF/MW 缓存，遍历循环所有块，记录每个块的 ICF 和 MW 信息 |
+| **`insertInstructionTo(Inst, BB)`** | 向块插入新指令时 | `moveInstructionBefore` :1461, FDiv 变换 :948/955 | 更新 ICF 和 MW：如果新指令有隐式控制流或写内存，将其加入缓存 |
+| **`removeInstruction(Inst)`** | 从块删除指令时 | `eraseInstruction` :1452, promotion :1861 | 更新 ICF 和 MW：如果被删指令有隐式控制流或写内存，从缓存移除 |
+
+---
+
+### LICM 中的具体使用场景
+
+#### 1. 初始化（runOnLoop :455-456）
+
+```cpp
+ICFLoopSafetyInfo SafetyInfo;
+SafetyInfo.computeLoopSafetyInfo(L);
+```
+
+一次性计算整个循环的安全性信息，后续所有查询都基于这个缓存。
+
+---
+
+#### 2. 判断能否提升有副作用的指令（isSafeToExecuteUnconditionally :1729-1753）
+
+```cpp
+bool GuaranteedToExecute = SafetyInfo->isGuaranteedToExecute(Inst, DT, CurLoop);
+```
+
+- 如果 `GuaranteedToExecute == true`：即使指令可能 trap，也可以提升到 preheader
+- 如果 `GuaranteedToExecute == false`：需要检查 `AllowSpeculation` 是否允许推测执行
+
+---
+
+#### 3. 提升 `invariant.start` / `guard`（hoistRegion :973-985）
+
+```cpp
+auto MustExecuteWithoutWritesBefore = [&](Instruction &I) {
+  return SafetyInfo->isGuaranteedToExecute(I, DT, CurLoop) &&
+         SafetyInfo->doesNotWriteMemoryBefore(I, CurLoop);
+};
+if ((IsInvariantStart(I) || isGuard(&I)) &&
+    CurLoop->hasLoopInvariantOperands(&I) &&
+    MustExecuteWithoutWritesBefore(I)) {
+  hoist(I, ...);
+}
+```
+
+**为什么要 `doesNotWriteMemoryBefore`？**
+
+- `invariant.start` 和 `guard` intrinsic 的语义依赖位置
+- 如果在该 intrinsic 之前有内存写，提升后语义就变了
+
+---
+
+#### 4. 删除指令时更新（eraseInstruction :1449-1454）
+
+```cpp
+static void eraseInstruction(Instruction &I, ICFLoopSafetyInfo &SafetyInfo,
+                             MemorySSAUpdater &MSSAU) {
+  MSSAU.removeMemoryAccess(&I);
+  SafetyInfo.removeInstruction(&I);     // ← 更新 SafetyInfo 缓存
+  I.eraseFromParent();
+}
+```
+
+**顺序**：先更新 SafetyInfo，再删除 IR。因为 `removeInstruction` 需要访问 `I`。
+
+---
+
+#### 5. 移动指令时更新（moveInstructionBefore :1456-1469）
+
+```cpp
+static void moveInstructionBefore(Instruction &I, BasicBlock::iterator Dest,
+                                   ICFLoopSafetyInfo &SafetyInfo,
+                                   MemorySSAUpdater &MSSAU, ScalarEvolution *SE) {
+  SafetyInfo.removeInstruction(&I);              // ← 从原块移除记录
+  SafetyInfo.insertInstructionTo(&I, Dest->getParent());  // ← 加入新块记录
+  I.moveBefore(*Dest->getParent(), Dest);
+  // ...
+}
+```
+
+**两步更新**：先 `removeInstruction`，再 `insertInstructionTo`。
+
+---
+
+#### 6. FDiv → Reciprocal 变换时更新（hoistRegion :948-956）
+
+```cpp
+auto ReciprocalDivisor = BinaryOperator::CreateFDiv(One, Divisor);
+SafetyInfo->insertInstructionTo(ReciprocalDivisor, I.getParent());  // ← 新指令加入缓存
+ReciprocalDivisor->insertBefore(I.getIterator());
+
+auto Product = BinaryOperator::CreateFMul(...);
+SafetyInfo->insertInstructionTo(Product, I.getParent());           // ← 新指令加入缓存
+Product->insertAfter(I.getIterator());
+```
+
+变换时创建了新指令，必须告知 SafetyInfo。
+
+---
+
+#### 7. 内存提升时更新（LoopPromoter::instructionDeleted :1861）
+
+```cpp
+void instructionDeleted(Instruction *I) const override {
+  SafetyInfo.removeInstruction(I);
+  MSSAU.removeMemoryAccess(I);
+}
+```
+
+当 `LoadAndStorePromoter` 删除 load/store 时，同步更新 SafetyInfo 缓存。
+
+---
+
+### 与 SimpleLoopSafetyInfo 的对比
+
+| 特性 | SimpleLoopSafetyInfo | ICFLoopSafetyInfo |
+|---|---|---|
+| **blockMayThrow 判断** | 只看整个块是否可能抛（粗粒度） | 精确追踪块内哪个指令是 ICF 点 |
+| **isGuaranteedToExecute 精度** | 只检查指令是否是块第一个指令（保守） | 精确检查是否有 ICF 点支配它 |
+| **缓存结构** | 只记录 `MayThrow` 和 `HeaderMayThrow` | 维护每个块的 FirstICF 和 FirstMW |
+| **更新机制** | 无增量更新，需重新 compute | 提供 insert/remove 的增量更新 |
+| **性能开销** | 低（只遍历一次） | 较高（维护缓存，但更精确） |
+
+LICM 选择 `ICFLoopSafetyInfo` 是因为需要**精确判断**，以最大化提升机会。
+
+---
+
+### 更新策略核心原则
+
+| 原则 | 说明 |
+|---|---|
+| **先更新再删除** | `removeInstruction` 需要访问指令来判断是否是 ICF/MW 点 |
+| **移动是两步** | `removeInstruction(old)` + `insertInstructionTo(new)` |
+| **新指令要告知** | 变换创建新指令时调用 `insertInstructionTo` |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 计算循环安全信息 | `computeLoopSafetyInfo()` | `MustExecute.cpp:77` |
+| 判断必然执行 | `isGuaranteedToExecute()` | `MustExecute.cpp:285` |
+| 判断无内存写 | `doesNotWriteMemoryBefore()` | `MustExecute.cpp:292` |
+| 判断块可能抛异常 | `blockMayThrow()` | `MustExecute.cpp:69` |
+| 插入指令通知 | `insertInstructionTo()` | `MustExecute.cpp:91` |
+| 删除指令通知 | `removeInstruction()` | `MustExecute.cpp:97` |
+| ICF/MW 追踪 | `ImplicitControlFlowTracking`, `MemoryWriteTracking` | `InstructionPrecedenceTracking.h` |
+| 类定义 | `ICFLoopSafetyInfo` | `MustExecute.h:133` |
+
