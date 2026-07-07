@@ -1697,7 +1697,9 @@ if (ActualEntry < FixedEntry) {
 
 ### 其他补充
 
-`CSRCost` 在 `selectOrSplit` 等路径中作为“是否接受 CSR”的阈值，若区域拆分代价高于 `CSRCost` 则倾向直接使用 CSR（见行 2400-2410 的 `tryRegionSplit` 逻辑）。
+* `CSRCost` 在 `selectOrSplit` 等路径中作为“是否接受 CSR”的阈值，若区域拆分代价高于 `CSRCost` 则倾向直接使用 CSR（见行 2400-2410 的 `tryRegionSplit` 逻辑）。
+
+* CSRCost为Callee Save Register而不是Caller Save Register；CSRCost的计算以函数为单位，并非根据每个寄存器计算，根据函数入口热度计算。
 <!-- Group B: Queue & Core Strategy Functions -->
 
 ## RAGreedy::enqueue 函数分析
@@ -8131,3 +8133,510 @@ if (Copies) {
 ### 其他补充
 
 `report` 只格式化数据，不决定是否 emit；emit 由调用方 `ORE->emit([&]{ ... Stats.report(R); ... })` 控制，并附加 "generated in loop" / "generated in function" 区分层级。
+
+---
+
+## weightCalcHelper 函数分析
+
+### 函数签名与目的（232行）
+
+```cpp
+float VirtRegAuxInfo::weightCalcHelper(LiveInterval &LI)
+```
+
+**功能**: 为一个虚拟寄存器的 `LiveInterval` 计算最终的 **spill weight**（spill 代价权重）并收集/写入 **寄存器分配 hint**，供 RAGreedy 在分配时排序候选与挑选物理寄存器使用。返回负值表示该 LI 不可 spill。被 `calculateSpillWeightAndHint`（行 213-219）调用，后者会把返回的正权重写入 `LI.setWeight()`。
+
+---
+
+### 整体结构
+
+```
+weightCalcHelper(LI)
+├── 1. 初始化上下文 (MRI/TRI/TII/MBB/TotalWeight/NumInstr/Visited/TargetHint)
+├── 2. 继承不可 spill 性 (split 产物继承原 LI 状态)
+├── 3. 定义可排序的 CopyHint 结构 (physreg 优先、高权重优先、非CSR优先)
+├── 4. 主循环：遍历使用 LI.reg() 的所有非调试指令
+│   ├── 跳过 identity copy / implicit def / 已访问指令
+│   ├── 检测 unspillable terminator → markNotSpillable, return -1
+│   ├── 计算单条指令的 spill weight (getSpillWeight)
+│   ├── 对循环归纳变量 ×3 加权
+│   └── 从 COPY 指令收集 hint
+├── 5. 处理收集到的 copy hints
+│   ├── 清理 target 先前加的 generic hint
+│   ├── 排序后 addRegAllocationHint 写回 MRI
+│   └── TotalWeight *= 1.01F (弱提升有 hint 的 LI 优先级)
+├── 6. 若原本不可 spill，直接 return -1.0
+├── 7. 微小 LI 且不在 reg mask / statepoint / inlineasm 处活跃 → markNotSpillable
+├── 8. isRematerializable → TotalWeight *= 0.5F
+├── 9. TotalWeight *= TRI.getSpillWeightScaleFactor(RC)
+└── 10. return normalize(TotalWeight, LI.getSize(), NumInstr)
+```
+
+---
+
+### 逐段注释
+
+**1. 初始化上下文与 spill 性继承（232-255）**
+
+```cpp
+MachineRegisterInfo &MRI = MF.getRegInfo();
+const TargetRegisterInfo &TRI = *MF.getSubtarget().getRegisterInfo();
+const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
+MachineBasicBlock *MBB = nullptr;
+float TotalWeight = 0;
+unsigned NumInstr = 0;
+SmallPtrSet<MachineInstr *, 8> Visited;
+
+std::pair<unsigned, Register> TargetHint = MRI.getRegAllocationHint(LI.reg());
+
+if (LI.isSpillable()) {
+  Register Reg = LI.reg();
+  Register Original = VRM.getOriginal(Reg);
+  const LiveInterval &OrigInt = LIS.getInterval(Original);
+  if (!OrigInt.isSpillable())
+    LI.markNotSpillable();
+}
+
+bool IsSpillable = LI.isSpillable();
+```
+
+目的：取得后续要用的目标描述与 MRI；缓存 `IsSpillable` 之前的"被继承降级"。
+
+注释说明：`VRM.getOriginal(Reg)` 用于追踪 split 来源——如果原 LI 已被标记为不可 spill（例如来自 `markNotSpillable` 的长生命周期寄存器），那么由它分裂出来的子区间也必须继承该属性，否则后续 spiller 会错误地尝试 spill。
+
+---
+
+**2. CopyHint 结构定义（257-275）**
+
+```cpp
+struct CopyHint {
+  Register Reg;
+  float Weight;
+  bool IsCSR;
+  CopyHint(Register R, float W, bool IsCSR)
+      : Reg(R), Weight(W), IsCSR(IsCSR) {}
+  bool operator<(const CopyHint &Rhs) const {
+    if (Reg.isPhysical() != Rhs.Reg.isPhysical())
+      return Reg.isPhysical();
+    if (Weight != Rhs.Weight)
+      return (Weight > Rhs.Weight);
+    if (Reg.isPhysical() && IsCSR != Rhs.IsCSR)
+      return !IsCSR;
+    return Reg.id() < Rhs.Reg.id();
+  }
+};
+```
+
+目的：定义带权重和 CSR 标记的可排序 hint，供后面把多个 COPY 源汇成有序列表。
+
+注释说明：排序优先级 `物理寄存器 > 高权重 > 非 CSR > 寄存器编号`——物理寄存器优先（消除 COPY 的收益直接、确定），CSR 不优先是因为使用 CSR 会引入 prologue/epilogue（参见 `initializeCSRCost` 函数分析）。
+
+---
+
+**3. 主循环：遍历每条使用 LI.reg() 的非调试指令（277-336）**
+
+```cpp
+bool IsExiting = false;
+SmallDenseMap<Register, float, 8> Hint;
+for (MachineRegisterInfo::reg_instr_nodbg_iterator
+         I = MRI.reg_instr_nodbg_begin(LI.reg()),
+         E = MRI.reg_instr_nodbg_end();
+     I != E;) {
+  MachineInstr *MI = &*(I++);
+
+  NumInstr++;
+  bool identityCopy = false;
+  auto DestSrc = TII.isCopyInstr(*MI);
+  if (DestSrc) {
+    const MachineOperand *DestRegOp = DestSrc->Destination;
+    const MachineOperand *SrcRegOp = DestSrc->Source;
+    identityCopy = DestRegOp->getReg() == SrcRegOp->getReg() &&
+                   DestRegOp->getSubReg() == SrcRegOp->getSubReg();
+  }
+
+  if (identityCopy || MI->isImplicitDef())
+    continue;
+  if (!Visited.insert(MI).second)
+    continue;
+  ...
+}
+```
+
+目的：迭代器 `reg_instr_nodbg_begin/end` 跳过 dbg 指令；`NumInstr` 统计使用数（用于后续归一化）。每条指令只处理一次（用 `Visited` 去重，因为一条 MI 可能在多个 subreg lane 上引用同一 vreg）。
+
+注释说明：identity copy (`mov x0, x0`) 和 `IMPLICIT_DEF` 没有实际语义，对 spill 决策无贡献，直接跳过。
+
+---
+
+**4. Unspillable terminator 检测（300-306）**
+
+```cpp
+if (TII.isUnspillableTerminator(MI) &&
+    MI->definesRegister(LI.reg(), /*TRI=*/nullptr)) {
+  LI.markNotSpillable();
+  return -1.0f;
+}
+```
+
+目的：处理"会产出值的终结指令"（典型场景：AArch64 的 cbz/tbz 类条件跳转把比较和跳转融合成一条指令；以及一些 TailBranch/带定义的 call-return 路径）。若 LI 的 def 是这种指令，spill 后无法在原位重建 → 直接整体返回 -1.0F。
+
+注释说明：这是除"继承原 LI 不可 spill"之外的另一条提前退出路径。
+
+---
+
+**5. 单条指令 spill weight 计算与循环归纳变量加权（308-328）**
+
+```cpp
+stack_float_t Weight = 1.0f;
+if (IsSpillable) {
+  if (MI->getParent() != MBB) {
+    MBB = MI->getParent();
+    const MachineLoop *Loop = Loops.getLoopFor(MBB);
+    IsExiting = Loop ? Loop->isLoopExiting(MBB) : false;
+  }
+
+  bool Reads, Writes;
+  std::tie(Reads, Writes) = MI->readsWritesVirtualRegister(LI.reg());
+  Weight = LiveIntervals::getSpillWeight(Writes, Reads, &MBFI, *MI, PSI);
+
+  if (Writes && IsExiting && LIS.isLiveOutOfMBB(LI, MBB))
+    Weight *= 3;
+
+  TotalWeight += Weight;
+}
+```
+
+目的：
+- `stack_float_t` 是强制 x87 使用栈精度的类型别名，避免 x87 用 80-bit 寄存器带来非确定结果。
+- `getSpillWeight` 根据 read/write 与 MI 所在块的频率计算指令权重（`def` 比 `use` 更贵）。
+- "写 + 在循环退出块 + LI 活出此 BB" 三者都成立 → 权重 ×3。
+
+注释说明（这是该函数最值得注意的优化意图）：循环归纳变量的典型更新形如 `i = i + 1`，发生在循环 header 之前的 latch / exiting 块；它既要 write 又要 live-out 才能进入下一次迭代。这类寄存器一旦 spill，每次迭代都会 load/store，代价极高，所以乘以 3 强化其在 spill 候选排序中的优先级，避免被选中 spill。
+
+---
+
+**6. 从 COPY 收集 hint（330-336）**
+
+```cpp
+if (!TII.isCopyInstr(*MI))
+  continue;
+Register HintReg = copyHint(MI, LI.reg(), TRI, MRI);
+if (HintReg && (HintReg.isVirtual() || MRI.isAllocatable(HintReg)))
+  Hint[HintReg] += Weight;
+```
+
+目的：对每条 `COPY` 指令调用 `copyHint`（`CalcSpillWeights.cpp:47`）解析另一端寄存器；把当前指令的权重累加进 `Hint[HintReg]`。hint 累计权重将作为后面排序的依据——同一对寄存器间出现多次 COPY 表明消除它们的收益更高。
+
+---
+
+**7. 处理收集到的 copy hints（338-359）**
+
+```cpp
+if (Hint.size()) {
+  if (TargetHint.first == 0 && TargetHint.second)
+    MRI.clearSimpleHint(LI.reg());
+
+  Register SkipReg = TargetHint.first != 0 ? TargetHint.second : Register();
+  SmallVector<CopyHint, 8> RegHints;
+  for (const auto &[Reg, Weight] : Hint) {
+    if (Reg != SkipReg)
+      RegHints.emplace_back(
+          Reg, Weight,
+          Reg.isPhysical() ? TRI.isCalleeSavedPhysReg(Reg, MF) : false);
+  }
+  sort(RegHints);
+  for (const auto &[Reg, _, __] : RegHints)
+    MRI.addRegAllocationHint(LI.reg(), Reg);
+
+  TotalWeight *= 1.01F;
+}
+```
+
+目的：把累计的 hint 排序后通过 `MRI.addRegAllocationHint` 写回，让 `AllocationOrder` 在分配时优先尝试这些寄存器以消除 COPY。
+
+注释说明：
+- `TargetHint.first` 是 hint 类型 ID；类型 0 表示"普通 simple hint"。若目标先前已设置过普通 hint 而 COPY 又算出新的 hint，需要先 `clearSimpleHint` 再写，避免两个互相覆盖。
+- `SkipReg`：如果 target 给出的是带类型的非平凡 hint（first != 0），则不再重复加入此 hint（避免重复加）。
+- `TRI.isCalleeSavedPhysReg`：在 `CopyHint::operator<` 中用来让非 CSR 物理寄存器优先于 CSR——同 `initializeCSRCost` 的理由，使用 CSR 会引入 save/restore。
+- `TotalWeight *= 1.01F`：极轻的 1% 加权，让"有 hint 的 LI" 在 spill 候选排序里略胜于权重相近的无 hint LI，从而让 hint 真的能落地。
+
+---
+
+**8. 微小 LI 的不可 spill 判定（361-378）**
+
+```cpp
+if (!IsSpillable)
+  return -1.0;
+
+if (LI.isZeroLength(LIS.getSlotIndexes()) &&
+    !LI.isLiveAtIndexes(LIS.getRegMaskSlots()) &&
+    !isLiveAtStatepointVarArg(LI) && !canMemFoldInlineAsm(LI, MRI)) {
+  LI.markNotSpillable();
+  return -1.0;
+}
+```
+
+目的：长度为 0 的 LI（定义和使用紧贴在一起，没有真实跨度）且不被任何 `regmask`（调用点保存的寄存器掩码）覆盖、不在 statepoint vararg、不参与 inline asm mem-fold，则可安全地不 spill——因为 inline spiller 可以把它直接折叠进使用指令（remat/load fold）。
+
+注释说明：四条条件都是"安全折叠"的前提，缺一不可。例如若 LI 跨过某个 `regmask` 调用，意味着调用点必须保证该 vreg 有寄存器或栈位可用，折叠可能不安全。
+
+---
+
+**9. Rematerializable 折半（380-385）**
+
+```cpp
+if (isRematerializable(LI, LIS, VRM, MRI, *MF.getSubtarget().getInstrInfo()))
+  TotalWeight *= 0.5F;
+```
+
+目的：如果该 LI 的所有 def 都可以重新计算（rematerializable），spill 时无需在栈上保留值，只需在使用点重发指令即可——spill 代价大幅降低，因此权重折半。
+
+注释说明：`isRematerializable` 在同文件 81 行实现，会沿 split 引入的 COPY 链回溯到原始定义，并校验所有 use 在 remat 点都可用（`allUsesAvailableAt`，149 行）。
+
+---
+
+**10. 按寄存器类缩放并归一化（387-391）**
+
+```cpp
+const TargetRegisterClass *RC = MRI.getRegClass(LI.reg());
+TotalWeight *= TRI.getSpillWeightScaleFactor(RC);
+
+return normalize(TotalWeight, LI.getSize(), NumInstr);
+```
+
+目的：让目标平台对不同寄存器类（如向量寄存器 vs 通用寄存器）按其稀缺程度做整体缩放，避免向量寄存器因使用频率看似不高却其实更紧张而被错排到 spill。
+
+注释说明：`normalize` 是 `VirtRegAuxInfo` 的虚函数（头文件 105 行），默认实现是 `normalizeSpillWeight(UseDefFreq, Size, NumInstr)`（头文件 34 行）：
+
+```cpp
+return UseDefFreq / (Size + 25*SlotIndex::InstrDist);
+```
+
+分母加 `25*InstrDist` 是个软常数：小 LI 的权重主要由 use 数决定（避免 slot index 间隙的随机性）；大 LI 的权重则趋于"使用密度"。
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段/接口 | 含义 |
+|---|---|---|
+| `VirtRegAuxInfo` | `MF/LIS/VRM/Loops/MBFI/PSI` | 计算所需的上下文，由构造函数注入 |
+| `LiveInterval` | `isSpillable/markNotSpillable/isZeroLength/getSize/getVNInfoAt` | 被计算的目标，结果会写回它（weight/hint） |
+| `CopyHint` (函数内嵌 struct) | `Reg/Weight/IsCSR` + `operator<` | 可排序的 COPY 推荐寄存器 |
+| `SmallDenseMap<Register, float, 8> Hint` | `[HintReg] -> 累计权重` | 同一 hint 寄存器跨多条 COPY 的权重聚合 |
+| `SmallPtrSet<MachineInstr *, 8> Visited` | -- | 防止一条 MI 因多 lane 重复计入 |
+| `VRM.getOriginal(Reg)` | -- | 取 split 之前的原始 vreg，用于继承不可 spill 性 |
+| `MRI.addRegAllocationHint` | -- | 把计算出的 hint 写回，供 `AllocationOrder` 使用 |
+
+---
+
+### 优化意图
+
+1. **权重应反映 spill 真实代价**：每条 use/def 都按所在块频率加权（`getSpillWeight` + MBFI），块越热权重越大；这是基于"profile/block frequency driven spilling"思想。
+2. **特别保护归纳变量**：`Writes && IsExiting && live-out` × 3 这条强加权专门防止 hot loop 的 induction variable 被错误 spill——一旦 spill，每次迭代都会触发栈 load/store，灾难性放大。
+3. **COPY 驱动的 hint 而非生硬选择**：通过累计权重排序的 hint 让 RAGreedy 倾向消除最高频的 COPY，并整体把 LI 权重 ×1.01 弱提升以增加 hint 命中率，但权重弱化到不会显著扭曲整体 spill 排序。
+4. **避免 CSR 优先级**：`CopyHint::operator<` 中显式让非 CSR 排在 CSR 之前，呼应 `CSRCost`：用 CSR 会引入 prologue/epilogue 代价，应仅在必要时使用。
+5. **不可 spill 的多级判定**：(a) split 源已不可 spill、(b) unspillable terminator、(c) 微小 LI 且能 fold——三种情况下返回 -1，让 spiller 直接放弃 spill 该 LI。
+6. **remat 折半**：把可重物化的 LI 权重降到 0.5×，让它在 spill 候选排序中"看起来"更便宜，这正是我们想要的——spill 可重物化的 LI 几乎无成本。
+7. **寄存器类缩放**：让稀缺资源（如向量寄存器）整体获得更高权重，防止被和 GPR 同等对待。
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险/理由 |
+|---|---|---|
+| `Visited` 去重 | 一条 MI 多 lane 引用同一 vreg 会被迭代器多次返回 | 不去重会重复累加权重，污染排序 |
+| 必须跳过 identity copy / `IMPLICIT_DEF` | 它们对 spill 决策无意义 | 否则虚增 NumInstr 与权重 |
+| `stack_float_t` 必须用 | x87 默认 80-bit 精度会让结果不稳定 | 否则同一 IR 在不同机器上 spill 决策不同 |
+| 三条不可 spill 退出必须先于 weight 设置 | 在 `markNotSpillable` 后直接 `return -1.0`，外层 `calculateSpillWeightAndHint` 检测 `Weight < 0` 时跳过 `setWeight` | 否则会用 -1 当作一个"很小"的权重，反而把不可 spill 的 LI 排到最优先 spill |
+| `markNotSpillable` 之后仍要回到主循环之外的处理 | 注意第 4 步直接 `return -1.0f`，而第 2 步（split 继承）只 markNotSpillable 但继续走主循环——因为还要算 hint | 设计上把 hint 计算保留下来，供分配时仍使用 COPY 信息 |
+| `TotalWeight *= 1.01F` 必须极小 | 否则会扭曲 spill 排序 | 1% 是经验阈值，足以打破权重相近的 tie |
+| `IsExiting` 缓存只在 MBB 变化时更新 | 同一 BB 内多条指令共享循环信息 | 性能优化，但若不正确处理 `MBB == nullptr` 初始情况会崩 |
+| 微小 LI 的 4 条 fold 前提缺一不可 | regmask/statepoint-vararg/inline-asm mem-fold | 任一存在都意味着 fold 不安全 |
+| `normalize` 是虚函数 | 子类可覆盖（如 basic regalloc 用不同归一化） | RABasic 走的是默认 normalize |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 主入口（驱动所有 vreg） | `VirtRegAuxInfo::calculateSpillWeightsAndHints` | `CalcSpillWeights.cpp:33` |
+| 单个 LI 的对外接口 | `VirtRegAuxInfo::calculateSpillWeightAndHint` | `CalcSpillWeights.cpp:213` |
+| 本函数 | `VirtRegAuxInfo::weightCalcHelper` | `CalcSpillWeights.cpp:232` |
+| 单条指令 spill 权重 | `LiveIntervals::getSpillWeight` | `LiveIntervals.h:121` |
+| COPY hint 解析 | `VirtRegAuxInfo::copyHint` | `CalcSpillWeights.cpp:47` |
+| Remat 判定 | `VirtRegAuxInfo::isRematerializable` | `CalcSpillWeights.cpp:81` |
+| Remat use 可用性 | `VirtRegAuxInfo::allUsesAvailableAt` | `CalcSpillWeights.cpp:149` |
+| Statepoint vararg 检查 | `VirtRegAuxInfo::isLiveAtStatepointVarArg` | `CalcSpillWeights.cpp:203` |
+| InlineAsm mem-fold 检查 | `canMemFoldInlineAsm` (static) | `CalcSpillWeights.cpp:221` |
+| 默认归一化公式 | `normalizeSpillWeight` | `CalcSpillWeights.h:34` |
+| 写回 hint | `MachineRegisterInfo::addRegAllocationHint` | `MachineRegisterInfo.h` |
+| split 源追溯 | `VirtRegMap::getOriginal` | `VirtRegMap.h` |
+| 类头与基类定义 | `class VirtRegAuxInfo` | `CalcSpillWeights.h:46` |
+
+---
+
+### 其他补充
+
+**调用关系与上下游**：
+
+```
+RAGreedy 主流程之前 (spill weight 预算阶段)
+  └── VirtRegAuxInfo::calculateSpillWeightsAndHints()   // 遍历所有 vreg
+       └── calculateSpillWeightAndHint(LI)              // 每个 LI 调一次
+            └── weightCalcHelper(LI)                    // 真正的权重/hint 计算
+                 ├── LiveIntervals::getSpillWeight(...)  // 单条指令权重
+                 ├── copyHint(...)                       // COPY 解析
+                 ├── isRematerializable(...)            // remat 判定
+                 └── normalize(...)                     // VirtRegAuxInfo 虚函数
+```
+
+`RABasic` 也使用同一 `VirtRegAuxInfo`（基类共用），但可以子类化并覆盖 `normalize` 来定制权重；`RAGreedy` 用的是基类默认归一化公式。
+
+**典型用例**：见 `llvm/test/CodeGen/X86/calc-spill-cost.ll` 等回归测试，以及 `llvm/test/CodeGen/AArch64/regalloc/copy-hint-*` 系列针对 hint 排序的测试。
+
+---
+
+## GlobalPriority 与长 / 短区间处理顺序分析
+
+### 1. `GlobalPriority` 是什么
+
+| 维度 | 内容 |
+|---|---|
+| 定义位置 | `llvm/include/llvm/Target/Target.td:365`（TableGen `bit` 字段，默认 `false`） |
+| C++ 字段 | `const bool TargetRegisterClass::GlobalPriority`（`llvm/include/llvm/CodeGen/TargetRegisterInfo.h:61`） |
+| 使用位置 | `DefaultPriorityAdvisor::getPriority` 中作为 `ForceGlobal` 的两个触发条件之一（`RegAllocGreedy.cpp:457`） |
+| 实际开启 | 仅 AMDGPU 在 `SIRegisterInfo.td` 中 4 处，全部针对 512/1024-bit 超宽 SGPR/VGPR/AGPR 元组类 |
+
+TableGen 中的注释（`Target.td:362-365`）：
+
+```td
+// Force register class to use greedy's global heuristic for all
+// registers in this class. This should more aggressively try to
+// avoid spilling in pathological cases.
+bit GlobalPriority = false;
+```
+
+---
+
+### 2. `ForceGlobal` 决定类内排序启发式
+
+`RegAllocGreedy.cpp:457-460`：
+
+```cpp
+bool ForceGlobal = RC.GlobalPriority ||
+                   (!ReverseLocalAssignment &&
+                    (Size / SlotIndex::InstrDist) >
+                        (2 * RegClassInfo.getNumAllocatableRegs(&RC)));
+```
+
+两条触发路径：**目标显式声明**（`GlobalPriority=true`）或 **LI 太长**（指令数 > 2× 类内可分配物理寄存器数）。
+
+| 路径 | 触发条件 | 优先级计算 | 含义 |
+|---|---|---|---|
+| **Local** | `!ForceGlobal && intervalIsInOneMBB` | 按指令距离 | 单 BB 局部 singly-defined 区间做线性扫描，无全局干涉时可达最优着色 |
+| **Global** | `ForceGlobal` 或跨 BB | `Prio = Size` + `GlobalBit=1` | 长→短排序，长区间先占位，置 GlobalBit 让其排到所有 local 之上 |
+
+---
+
+### 3. 处理顺序：长先 / 短后（不是相反）
+
+```
+优先队列出队顺序：长区间 → 短区间
+                       ↓
+                 短区间是后来者，只能填残留空隙
+```
+
+`spill()` / `trySplit()` 作用在**当前正在处理的 VirtReg 自己**身上，不是把它身上的"短邻居"赶走。源码注释明确说明（`RegAllocGreedy.cpp:476-482`）：
+
+```cpp
+// Allocate global and split ranges in long->short order. Long ranges that
+// don't fit should be spilled (or split) ASAP so they don't create
+// interference.  Mark a bit to prioritize global above local ranges.
+Prio = Size;
+GlobalBit = 1;
+```
+
+---
+
+### 4. 长区间 fit 不下时的策略链（`selectOrSplitImpl`）
+
+```
+tryAssign       找完全空闲寄存器
+  ↓ 失败
+tryEvict        驱逐 weight 比自己更低的 interferer
+                (BestCost.MaxWeight = VirtReg.weight()，只驱逐更轻的)
+                见 RegAllocEvictionAdvisor.cpp:354
+  ↓ 失败
+trySplit        分裂自己（长区间），切掉冷段只留热段
+  ↓ 失败
+tryLastChanceRecoloring   递归重染色（深度 ≤5）
+  ↓ 失败
+spill           溢出自己到栈
+```
+
+每一步失败才走下一步；前 4 步都在想办法让长区间"留下"，最后才 spill 自己。
+
+---
+
+### 5. 设计意图：两层含义
+
+| 层 | 目的 |
+|---|---|
+| **长区间先分配** | 此时其他长区间也还没占位，长区间有最大机会拿到无干涉的寄存器 |
+| **长区间一旦 fit 不下，立刻 split/spill 自己** | 长区间活跨度大，继续留着会卡住后续所有区间，造成**级联 spill**。所以"尽快处理掉"= 把它的 spill/split 局部化，不毒化整张图 |
+
+---
+
+### 6. 短区间为什么天然受保护（不是"特权"，是几何结果）
+
+- **晚处理**：等长区间定型后，短区间只往残留空隙里塞
+- **权重密度高**：`spill weight = UseDefFreq / (Size + 25·InstrDist)`，短区间 use 集中、分母小，单位权重高，tryEvict 难以驱逐（只能驱逐比自己更轻的）
+- **可直接 fold**：极短区间（`isZeroLength` 等）走 `markNotSpillable`，spiller 把它折叠进使用指令，零代价
+
+---
+
+### 7. `GlobalPriority` 的精确作用
+
+> 对极稀缺寄存器类，强制**所有区间**（哪怕局部的）走 **长→短全局排序**，让长区间尽早占位 + 尽早 split/spill 自己，从而**减少整张图的级联 spill 总量**。
+
+——不是单纯"保护长区间不被 spill"。短区间并没有"最后才被 spill"的特权；它只是因晚处理 + 权重密度高**自然**落到不容易被 spill 的位置。一旦真 fit 不进残留空隙，照样被 spill/split。
+
+---
+
+### 8. 与 `AllocationPriority` 的分工
+
+| 字段 | 维度 | 取值 |
+|---|---|---|
+| `AllocationPriority` | **类间**优先级（哪类先分配） | 0~31，编进优先级高位 |
+| `GlobalPriority` | **类内**是否绕过 local 启发式 | bool，仅影响 `ForceGlobal` |
+
+两者互补：`AllocationPriority` 决定类间次序，`GlobalPriority` 决定类内是否绕过 local 启发式。
+
+---
+
+### 9. 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| TableGen 字段定义 | `bit GlobalPriority` | `llvm/include/llvm/Target/Target.td:365` |
+| C++ 字段声明 | `const bool TargetRegisterClass::GlobalPriority` | `llvm/include/llvm/CodeGen/TargetRegisterInfo.h:61` |
+| `ForceGlobal` 计算与使用 | `DefaultPriorityAdvisor::getPriority` | `llvm/lib/CodeGen/RegAllocGreedy.cpp:443-513` |
+| 驱逐成本上限 | `EvictionCost BestCost; BestCost.MaxWeight = VirtReg.weight()` | `llvm/lib/CodeGen/RegAllocEvictionAdvisor.cpp:342-354` |
+| AMDGPU 实际开启（4 处） | `let GlobalPriority = true in { ... }` | `llvm/lib/Target/AMDGPU/SIRegisterInfo.td:971, 1041, 1076, 1208` |
+
+---
+
+### 10. 一句话精炼
+
+> `GlobalPriority` 是目标给"极度稀缺寄存器类"开的开关，强制该类所有区间走长→短全局排序——让长区间尽早占位 / 尽早自我 split/spill，把级联 spill 控制在局部；短区间因晚处理 + 高单位权重而天然受保护，但并非享有"最后才 spill"的特权。
+
+---
+
+### 11. 待深入点
+
+- `shouldEvict` 的策略细节：什么时候才真正允许驱逐一个干涉者？
+- `InlineSpiller` 折叠短区间到使用指令的具体路径（`canMemFoldInlineAsm` / `isZeroLength`）
+- `RegClassPriorityTrumpsGlobalness` 开关切换 bit 位置（行 484-505）的设计原因
