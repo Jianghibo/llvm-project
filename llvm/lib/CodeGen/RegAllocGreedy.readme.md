@@ -2347,7 +2347,7 @@ MCRegister RAGreedy::tryAssign(const LiveInterval &VirtReg,
                                const SmallVirtRegSet &FixedRegisters)
 ```
 
-**功能**: 遍历 AllocationOrder 寻找无干涉的物理寄存器，若发现 hint 偏好则优先返回；否则尝试驱逐 hint 干涉或更便宜的替代寄存器，是 greedy 分配的第一策略。
+**功能**: 遍历 AllocationOrder 寻找无干涉的物理寄存器，若发现 hint 偏好则优先返回；否则尝试驱逐 hint 干涉或更便宜的替代寄存器，是 greedy 分配的第一策略。（注：AllocationOrder中Hint寄存器的顺序是一定排在非Hint寄存器前面的）
 
 ---
 
@@ -8640,3 +8640,657 @@ spill           溢出自己到栈
 - `shouldEvict` 的策略细节：什么时候才真正允许驱逐一个干涉者？
 - `InlineSpiller` 折叠短区间到使用指令的具体路径（`canMemFoldInlineAsm` / `isZeroLength`）
 - `RegClassPriorityTrumpsGlobalness` 开关切换 bit 位置（行 484-505）的设计原因
+
+<!-- Group: LiveRegMatrix Interference Query Functions -->
+
+## LiveRegMatrix::checkInterference(LiveInterval, MCRegister) 函数分析
+
+### 函数签名与目的（行号）
+```cpp
+LiveRegMatrix::InterferenceKind
+LiveRegMatrix::checkInterference(const LiveInterval &VirtReg,
+                                 MCRegister PhysReg);
+```
+
+**功能**: 在把虚拟寄存器 `VirtReg` 分配到物理寄存器 `PhysReg` 之前，检查是否存在干涉。返回值是 `InterferenceKind` 枚举，按"能否通过 unassign 其他 vreg 解除"分级，让调用方（`RAGreedy::tryAssign` 等）据此选择直接分配 / 驱逐 / 分裂 / spill 策略。
+
+---
+
+### 整体结构
+
+```
+checkInterference(VirtReg, PhysReg)              // LiveRegMatrix.cpp:202
+├── if VirtReg.empty(): return IK_Free           // 空区间早退
+├── checkRegMaskInterference(VirtReg, PhysReg)   // 调用点1: regmask（最快、缓存）
+│   └── true → return IK_RegMask
+├── checkRegUnitInterference(VirtReg, PhysReg)   // 调用点2: 固定干涉
+│   └── true → return IK_RegUnit
+├── foreachUnit(TRI, VirtReg, PhysReg, ...)      // 调用点3: 虚拟寄存器干涉
+│   └── query(LR, Unit).checkInterference()
+│       └── true → return IK_VirtReg
+└── return IK_Free
+```
+
+---
+
+### 逐段注释
+
+**1. 空区间早退 (行 205-206)**
+
+```cpp
+if (VirtReg.empty())
+  return IK_Free;
+```
+
+目的作用：空 LiveInterval 不可能在任何 slot 上产生干涉，直接判定为 `IK_Free`，避免后续无谓的 BitVector/迭代查询。
+注释说明：`LiveInterval::empty()` 表示该 vreg 没有任何活跃段（典型场景是被 DCE 删除或全是 implicit_def）。此分支是无代价快路径。
+
+**2. RegMask 干涉检查（最快、缓存）(行 208-210)**
+
+```cpp
+if (checkRegMaskInterference(VirtReg, PhysReg))
+  return IK_RegMask;
+```
+
+目的作用：检查 `VirtReg` 是否跨越了带 regmask 操作数的指令（如函数调用），且 regmask 不保留 `PhysReg`。这是最廉价的检查（基于 BitVector 缓存），所以放在第一位。
+注释说明：
+- 典型场景：`VirtReg` 跨越一个 `call`，而 `PhysReg` 是 caller-saved 寄存器，被调用方 clobber。
+- 返回 `IK_RegMask`：这种干涉**不能通过 unassign 其他 vreg 解除**，因为 regmask 来自指令本身，是物理寄存器层面的固定限制。
+- 缓存机制：`checkRegMaskInterference` 用 `RegMaskVirtReg`+`RegMaskTag==UserTag` 标记是否对当前 `VirtReg` 已计算；同一 VirtReg 对不同 PhysReg 复用同一份 `RegMaskUsable` BitVector。
+- BitVector 按 PhysReg 索引，比 regunit 更细粒度（注释明确举例：Win64 call clobber %ymm8 但保留 %xmm8）。
+
+**3. RegUnit 固定干涉检查 (行 212-214)**
+
+```cpp
+if (checkRegUnitInterference(VirtReg, PhysReg))
+  return IK_RegUnit;
+```
+
+目的作用：检查 `PhysReg` 的某些寄存器单元上是否有"固定 live range"（来自 `LIS->getRegUnit(Unit)`，通常是物理寄存器自身被预先分配，比如调用约定指定的实参寄存器、`INLINEASM` 显式绑定的寄存器等）。
+注释说明：
+- 典型场景：函数入口处 `%rdi` 是第一个整型实参寄存器，存在一个固定的 `LiveRange` 占住该 regunit；若 `VirtReg` 想用 `%rdi` 且与该固定段重叠，会返回 `IK_RegUnit`。
+- 与 `IK_RegMask` 同属"不可通过 unassign 其他 vreg 解决"的固定干涉，但来源不同：regmask 来自指令层面（call clobber list），regunit 来自寄存器自身的预占用 live range。
+- 检查方式：`checkRegUnitInterference` 用 `CoalescerPair` 配合 `LiveRange::overlaps` 逐单元比较；若有 subranges 则按 lane 分裂匹配。
+- 不可驱逐性：分配器看到 `IK_RegUnit` 必须放弃该 PhysReg，不能 tryEvict。
+
+**4. 虚拟寄存器干涉检查（矩阵查询）(行 216-223)**
+
+```cpp
+bool Interference = foreachUnit(TRI, VirtReg, PhysReg,
+                                [&](MCRegUnit Unit, const LiveRange &LR) {
+                                  return query(LR, Unit).checkInterference();
+                                });
+if (Interference)
+  return IK_VirtReg;
+
+return IK_Free;
+```
+
+目的作用：遍历 `PhysReg` 的所有寄存器单元（按 lane 分裂匹配 subrange），查询 `LiveIntervalUnion` 矩阵中是否已有其他 vreg（已分配到该 PhysReg）的 live range 与 `VirtReg` 重叠。这是"软干涉"——可以通过 `unassign` 那些其他 vreg 来解除。
+注释说明：
+- `foreachUnit` 是文件内的静态模板 helper（行 88-111）：若 `VirtReg` 有 subranges，则用 `MCRegUnitMaskIterator` 把每个 regunit 拆到对应 lane 上，只在该 lane 的 subrange 上做查询；否则直接对整个 LiveInterval 走 `TRI->regunits(PhysReg)`。
+- `query(LR, Unit)` 返回内部缓存 `Queries[Unit]` 的引用，并用 `UserTag`+`LR`+`Matrix[Unit]` 初始化（见 `query` 实现，行 195-200）。这意味着**同一 vreg+regunit 的多次查询会复用上次的 LiveIntervalUnion 扫描结果**，前提是 `UserTag` 没变（任何 vreg 修改后 `invalidateVirtRegs()` 会自增 UserTag，让缓存失效）。
+- `LiveIntervalUnion::Query::checkInterference()` 在该 regunit 的 LiveIntervalUnion 中扫一遍已 assign 的 vreg，看是否有活跃段重叠 `LR`。
+- 返回 `IK_VirtReg`：分配器看到这个值就知道可以通过 `tryEvict` 驱逐已有 vreg 来腾出 PhysReg（greedy 的核心策略之一）。
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段/方法 | 含义 |
+|---|---|---|
+| `InterferenceKind` | `IK_Free=0` / `IK_VirtReg` / `IK_RegUnit` / `IK_RegMask` | 干涉类型分级，按可解除性从高到低枚举值递增 |
+| `LiveRegMatrix` | `Matrix` | `LiveIntervalUnion::Array`，按 regunit 索引的冲突矩阵 |
+| `LiveRegMatrix` | `Queries[]` | 每 regunit 一个 `LiveIntervalUnion::Query`，跨调用缓存 |
+| `LiveRegMatrix` | `UserTag` | vreg 修改计数器，缓存失效版本号 |
+| `LiveRegMatrix` | `RegMaskVirtReg` / `RegMaskTag` / `RegMaskUsable` | regmask 干涉缓存（按 PhysReg 索引的 BitVector） |
+| `foreachUnit` helper | (静态模板) | 把 `PhysReg` 的 regunit 与 `VirtReg` 的 subrange 按 lane 对齐 |
+
+---
+
+### 优化意图
+
+1. **按检查成本升序排列**：regmask（BitVector 测试）最便宜 → regunit（live range overlap，但通常数量少）→ vreg（LiveIntervalUnion 扫描，可能跨多个 regunit）。低成本检查前置，避免昂贵查询。
+2. **按可解除性返回分级结果**：返回 `IK_RegMask`/`IK_RegUnit` 表示"物理上不可用"，调用方应直接放弃；返回 `IK_VirtReg` 表示"逻辑上被占但可驱逐"，调用方可以尝试 `tryEvict`。这种分级让 `tryAssign`/`tryEvict` 决策精准化，不会浪费时间尝试驱逐不可能驱逐的干涉。
+3. **多级缓存复用**：`Queries[]` 缓存 LiveIntervalUnion 扫描结果，`RegMaskUsable` 缓存 regmask 查询，避免重复扫描。配合 `invalidateVirtRegs()` 在 vreg 变更后让缓存失效，正确性与性能兼顾。
+4. **subrange 感知**：通过 `foreachUnit` 的 `MCRegUnitMaskIterator` 分支，正确处理带 lane mask 的 subreg 重组场景（如向量寄存器部分 lane 重定义），避免假阳性/假阴性干涉。
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 多种干涉同时存在时返回最高枚举值 | `IK_RegMask(3) > IK_RegUnit(2) > IK_VirtReg(1) > IK_Free(0)` | 调用方需理解分级语义：高枚举值=更不可解除，不能误以为有 IK_VirtReg 就 tryEvict |
+| 必须先调用 `invalidateVirtRegs()` | 任何 vreg 的 LiveInterval 修改后，`Queries[]` 缓存会失效 | 否则 `checkInterference` 返回 stale 结果，导致分配错误 |
+| regmask 缓存以 VirtReg 为键 | 同一 VirtReg 切换 PhysReg 查询时复用 BitVector | 若中途 `LIS`/`RegMaskUsable` 被外部修改会得到错误结果（不应发生） |
+| `foreachUnit` 的 subrange 分支需 lane 正确匹配 | `(S.LaneMask & Mask).any()` 决定该 subrange 是否覆盖该 regunit 的 lane | lane mask 计算错误会漏掉干涉或误报干涉 |
+| `VirtReg.empty()` 必须先判空 | 否则后续 `checkRegMaskInterference` 等可能空指针访问 | 早退分支不可移除 |
+| regmask BitVector 按 PhysReg 索引 | 比 regunit 更细（Win64 例：ymm8 vs xmm8） | 不能用 regunit 替代 regmask 检查 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| regmask 干涉（缓存） | `LiveRegMatrix::checkRegMaskInterference` | LiveRegMatrix.cpp:162 |
+| regunit 固定干涉 | `LiveRegMatrix::checkRegUnitInterference` | LiveRegMatrix.cpp:181 |
+| regunit 遍历 helper | `foreachUnit` (static template) | LiveRegMatrix.cpp:88 |
+| 缓存查询接口 | `LiveRegMatrix::query` | LiveRegMatrix.cpp:195 |
+| LiveIntervalUnion 查询 | `LiveIntervalUnion::Query::checkInterference` | LiveIntervalUnion.h |
+| InterferenceKind 枚举定义 | `LiveRegMatrix::InterferenceKind` | LiveRegMatrix.h:84 |
+| 调用点（典型消费者） | `RAGreedy::tryAssign` 调用 `Matrix->checkInterference` | RegAllocGreedy.cpp:540-551 |
+
+---
+
+### 其他补充
+
+- **调用者视角**：`RAGreedy::tryAssign`（行 540-551）循环遍历 `AllocationOrder`，每一步都用 `checkInterference` 检查；只有返回 `IK_Free`（`!checkInterference(...)`）才视为可用。`tryEvict` 内部则用更细粒度的 `Matrix->query(LR, Unit).interferingVRegs()` 列出可驱逐的具体 vreg。所以本函数是"是否需要进入驱逐/分裂分支"的总开关。
+- **分级语义的设计动机**：传统图染色分配器只需布尔结果"冲突/不冲突"；greedy 分配器需要知道冲突能否解除（可驱逐的 vreg vs 物理固定占用），因此返回 `InterferenceKind` 而不是 `bool`。这是 greedy 区别于基本分配器的一个关键 API 设计。
+- **与下文 SlotIndex 重载的对比**：本重载面向"已构造好 LiveInterval 的 vreg"，可缓存；下面那个 SlotIndex 重载面向"任意时段是否空闲"，因 LR 是栈上临时对象，**不能复用缓存**，详见下一节。
+
+---
+
+## LiveRegMatrix::checkInterference(SlotIndex, SlotIndex, MCRegister) 函数分析
+
+### 函数签名与目的（行号）
+```cpp
+bool LiveRegMatrix::checkInterference(SlotIndex Start, SlotIndex End,
+                                       MCRegister PhysReg);
+```
+
+**功能**: 检查指定时段 `[Start, End)` 上 `PhysReg` 是否空闲（与已分配的 vreg 是否冲突）。与上面的重载不同：① 不针对某个特定 vreg，而是任意时段；② 返回 `bool` 而非 `InterferenceKind`；③ 不检查 regmask / regunit 固定干涉，只查 LiveIntervalUnion 矩阵中的 vreg 干涉。主要用于 split / region split 决策时评估"如果在这段区间用 PhysReg 会不会撞已分配的 vreg"。
+
+---
+
+### 整体结构
+
+```
+checkInterference(Start, End, PhysReg)            // LiveRegMatrix.cpp:227
+├── 构造栈上临时 LiveRange LR (单段 [Start, End))
+│   ├── VNInfo valno(0, Start)
+│   ├── LiveRange::Segment Seg(Start, End, &valno)
+│   └── LR.addSegment(Seg)
+├── for each Unit in TRI->regunits(PhysReg):
+│   ├── 构造未缓存 Query Q (栈上)
+│   ├── Q.reset(UserTag, LR, Matrix[Unit])
+│   └── if Q.checkInterference(): return true
+└── return false
+```
+
+---
+
+### 逐段注释
+
+**1. 构造临时 LiveRange (行 229-233)**
+
+```cpp
+VNInfo valno(0, Start);
+LiveRange::Segment Seg(Start, End, &valno);
+LiveRange LR;
+LR.addSegment(Seg);
+```
+
+目的作用：拼出一个只含单段 `[Start, End)` 的栈上 `LiveRange`，作为 `LiveIntervalUnion::Query` 的查询输入。`VNInfo valno(0, Start)` 是 dummy 值编号，仅用于满足 Segment 持有 `VNInfo*` 的接口要求。
+注释说明：这里构造的是 `LiveRange` 而非 `LiveInterval`——`LiveIntervalUnion::Query::checkInterference` 只关心活跃段是否重叠，不关心是哪个 vreg。
+
+**2. 逐 regunit 查询 + 不缓存 (行 236-253)**
+
+```cpp
+for (MCRegUnit Unit : TRI->regunits(PhysReg)) {
+  // LR is stack-allocated. LiveRegMatrix caches queries by a key that
+  // includes the address of the live range. ...
+  LiveIntervalUnion::Query Q;
+  Q.reset(UserTag, LR, Matrix[Unit]);
+  if (Q.checkInterference())
+    return true;
+}
+return false;
+```
+
+目的作用：对 `PhysReg` 的每个 regunit，构造一个**全新的、栈上**的 `Query` 对象，调用 `Q.reset(UserTag, LR, Matrix[Unit])` 后查询该 regunit 的 LiveIntervalUnion 中是否与 `LR` 重叠。任意一个 regunit 命中即返回 true。
+注释说明（**关键**）：
+- 上面那段长注释专门解释为什么这里**不复用 `Queries[Unit]` 缓存**：LiveIntervalUnion::Query 的缓存键包含 LR 地址。本函数每次调用时 `LR` 都在栈上同位置构造，第二次调用时栈地址很可能复用，但 `Start/End/valno` 不同——若直接用缓存会拿到上次的查询结果，导致**假阴性**（误判无干涉）。
+- 因此这里每次构造独立的 `Query Q`（不写入 `Queries[Unit]`），代价是不能跨调用复用，但保证正确性。
+- FIXME 注释（行 246-248）明确指出 Query API 的可用性问题，建议未来简化（比如完全不缓存或换 key 设计）。
+- 不调用 `checkRegMaskInterference` / `checkRegUnitInterference`：这个重载只关心 vreg 矩阵干涉，假设调用方（split 决策）已经单独处理 regmask/regunit（或只关注 vreg 是否能塞进去）。
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段/方法 | 含义 |
+|---|---|---|
+| `LiveRange` | `addSegment(Segment)` | 单活跃段的栈上 LR，作为 Query 输入 |
+| `VNInfo` | `(id, def)` | dummy 值编号，仅为满足 Segment 接口 |
+| `LiveIntervalUnion::Query` | `reset(UserTag, LR, Matrix)` + `checkInterference()` | 一次性查询，不复用内部缓存 |
+
+---
+
+### 优化意图
+
+1. **提供"任意时段"查询能力**：LiveInterval 版本只回答"某个 vreg 的整个 live range 能否放进 PhysReg"；本重载回答"我感兴趣的某个 slot 区间上 PhysReg 是否空闲"，这是 split / region split 决策（`tryRegionSplit` 评估候选区域时）需要的粒度。
+2. **正确性优先于性能**：宁愿每次构造独立 Query 牺牲缓存复用，也不冒 stale 缓存的风险。这反映 LiveIntervalUnion::Query API 的设计缺陷，通过规避使用来保证正确。
+3. **不重复检查 regmask/regunit**：split 场景下这些固定干涉在别处已处理，这里只查 vreg 矩阵，避免重复工作。
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| 必须不复用 `Queries[Unit]` 缓存 | LR 是栈对象，地址可能重复但内容不同 | 复用会得到 stale 结果（假阴性干涉） |
+| 不检查 regmask / regunit 固定干涉 | 只查 LiveIntervalUnion 矩阵 | 调用方必须自行处理固定干涉，否则会误判 PhysReg 可用 |
+| `LR` 生命周期必须覆盖整个 for 循环 | 栈对象，函数返回前不会失效 | 若误把 LR 移出作用域会悬空 |
+| `valno` 不会被 Query 真正使用 | 仅作为 Segment 的占位 | 但不能传 nullptr，否则 Segment 构造可能失败 |
+| FIXME 警示 API 设计 | 未来若改 Query 缓存策略需同步检查 | 改 Query 后此函数可能可以优化缓存 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| regunit 枚举 | `TargetRegisterInfo::regunits(PhysReg)` | MCRegisterInfo.h |
+| 一次性 Query | `LiveIntervalUnion::Query::reset` + `checkInterference` | LiveIntervalUnion.h |
+| regunit mask 迭代（带 lane） | `MCRegUnitMaskIterator` | MCRegisterInfo.h（用于 `checkInterferenceLanes`） |
+| 典型调用方 | `RAGreedy` 的 split 决策路径 | RegAllocGreedy.cpp（`tryRegionSplit` 等） |
+
+---
+
+### 其他补充
+
+- **配套的 `checkInterferenceLanes`（行 257-290）**：与本重载几乎一样的实现，但用 `MCRegUnitMaskIterator` 而非 `MCRegUnit` 迭代，且把每个 regunit 的 lane mask 通过 `InterferingLanes |= Lanes` 累加返回。这让 split 决策能知道"哪些 lane 上有干涉"，从而做部分 lane split 而非整体放弃。它同样不缓存，原因相同。
+- **三个 checkInterference 的角色分工**：
+
+  | 重载 | 用途 | 返回 | 缓存 |
+  |---|---|---|---|
+  | `(LiveInterval, PhysReg)` | 分配前总检查 | `InterferenceKind` 分级 | 缓存（UserTag 失效） |
+  | `(SlotIndex, SlotIndex, PhysReg)` | 时段是否空闲（split 用） | `bool` | **不缓存** |
+  | `checkInterferenceLanes(...)` | 哪些 lane 干涉（lane split 用） | `LaneBitmask` | **不缓存** |
+
+- **为何不统一用一个接口**：分级返回 + 缓存设计只对"针对某个 vreg 的完整 live range"有意义；任意时段查询要么没 vreg 上下文，要么需要 lane 粒度结果，因此三个接口分离，各自匹配调用方需求。
+- **栈地址复用导致 stale 的根因**：`LiveIntervalUnion::Query` 的缓存身份（identity）用 LR 指针参与 key，所以同一栈地址多次调用会被误判为"同一次查询"。这是 LLVM FIXME 标记的已知 API 缺陷，目前通过规避缓存来保证正确性，未来若重构 Query API 可考虑彻底移除缓存或换为内容寻址。
+
+<!-- Group: EvictionAdvisor Cost & Hint Decision Functions -->
+
+## DefaultEvictionAdvisor::canEvictHintInterference 函数分析
+
+### 函数签名与目的（行号）
+```cpp
+bool DefaultEvictionAdvisor::canEvictHintInterference(
+    const LiveInterval &VirtReg, MCRegister PhysReg,
+    const SmallVirtRegSet &FixedRegisters) const;
+```
+
+**功能**: 判定能否为 `VirtReg` 驱逐其 **hint 寄存器 `PhysReg`** 上现有的干涉。是 `RAGreedy::tryAssign` 在"hint 被占但想抢回"分支的入口检查。本身只是一个轻量包装：构造一个"允许打破最多 1 个 hint"的代价上限，再委托给 `canEvictInterferenceBasedOnCost`。
+
+---
+
+### 整体结构
+
+```
+canEvictHintInterference(VirtReg, PhysReg, FixedRegisters)    // RegAllocEvictionAdvisor.cpp:238
+├── EvictionCost MaxCost                                      // 默认 {BrokenHints=0, MaxWeight=0}
+├── MaxCost.setBrokenHints(MRI->getRegClass(VirtReg)->getCopyCost())
+│                                                              // 上限 = VirtReg 类的 copy 代价
+└── return canEvictInterferenceBasedOnCost(VirtReg, PhysReg,
+                                          /*IsHint=*/true, MaxCost, FixedRegisters)
+```
+
+---
+
+### 逐段注释
+
+**1. 构造代价上限 (行 241-242)**
+
+```cpp
+EvictionCost MaxCost;
+MaxCost.setBrokenHints(MRI->getRegClass(VirtReg.reg())->getCopyCost());
+```
+
+目的作用：建立"驱逐成本天花板"。`EvictionCost` 按 `(BrokenHints, MaxWeight)` 字典序比较，`BrokenHints` 优先级更高。这里把 `MaxCost.BrokenHints` 设为 `VirtReg` 所属寄存器类的 `getCopyCost()`（GPR 通常为 1，向量类可能更大，TableGen 中 `CopyCost` 字段，未设默认 1）。
+注释说明：
+- 设计意图是"为满足一个 hint 愿意付出的最大代价 = 一个 copy 的代价"。如果驱逐会破坏超过 1 个已满足的 hint，那已经比"放弃 hint、生成一条 COPY 指令"更亏，应当放弃。
+- 注意 `MaxWeight` 仍是默认 0：意味着 hint 路径上**只**用 `BrokenHints` 维度作天花板，不限制被驱逐 vreg 的 spill 权重——`canEvictInterferenceBasedOnCost` 内部会用 `Cost >= MaxCost` 判定，`EvictionCost` 字典序比较下 `MaxWeight=0` 会让任何非零 MaxWeight 候选都超 ceiling，但只有当 `BrokenHints` 也相同时才比较 MaxWeight。实际 hint 路径常见情况是 `BrokenHints` 累加到 1 就触顶，因此 MaxWeight 维度很少被用到。
+
+**2. 委托给通用代价判定 (行 243-244)**
+
+```cpp
+return canEvictInterferenceBasedOnCost(VirtReg, PhysReg, true, MaxCost,
+                                       FixedRegisters);
+```
+
+目的作用：把真正的逐 regunit / 逐 Intf 的合法性 + 代价计算交给通用函数，并传入 `IsHint=true`——这会影响内部 `shouldEvict` 的策略：hint 路径下只要 `CanSplit && IsHint && !BreaksHint` 就直接允许驱逐，不要求 `A.weight() > B.weight()`。`MaxCost` 以引用传入，成功时会被更新为实际代价（供调用方继续做"最便宜候选"比较）。
+注释说明：本函数本身不做任何干涉扫描，纯粹是"语义包装 + 代价上限设定"，复杂逻辑全部下沉到 `canEvictInterferenceBasedOnCost`。这种"thin wrapper + 通用核心"结构与 `tryFindEvictionCandidate`（设 `BestCost` 后扫描 Order）形成对称：两个 caller 各自定 ceiling，共享同一份代价模型。
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段/方法 | 含义 |
+|---|---|---|
+| `EvictionCost` | `BrokenHints` | 累计打破的 hint 数，比较优先级高 |
+| `EvictionCost` | `MaxWeight` | 被驱逐 vreg 的最大 spill 权重，比较优先级低 |
+| `EvictionCost` | `setBrokenHints(N)` | 把上限的 BrokenHints 设为 N |
+| `TargetRegisterClass` | `getCopyCost()` | 该类一个 COPY 的代价（GPR=1，未设默认 1） |
+| `SmallVirtRegSet` | - | `SmallPtrSet<Register,16>`，recoloring 会话中已 Fixed 的 vreg |
+
+---
+
+### 优化意图
+
+1. **代价对称性**：hint 的"价值"等于一个 COPY 的代价（满足 hint 省一条 COPY），所以"为抢回 hint 愿意打破的 hint 数"也设为同一个值，使收益与代价在同一把尺子上衡量。
+2. **复用通用判定**：所有驱逐决策（hint 抢回、cheap reg 搜索、eviction chain）走同一个 `canEvictInterferenceBasedOnCost`，保证 FixedRegisters / Cascade / RS_Done 等约束一致，避免策略分叉。
+3. ** ceiling 透传**：`MaxCost` 用引用传入并在成功时被改写为实际代价，让调用方据此选最便宜候选，而非简单 yes/no。
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| `IsHint` 必须传 true | 内部 `shouldEvict` 在 hint 路径下放宽权重比较 | 误传 false 会让 hint 抢回变得过严 |
+| `MaxCost` 是 in-out 参数 | 成功时被改写为 Cost | 调用方不能假设返回后 MaxCost 不变 |
+| `getCopyCost()` 默认 1 | TableGen 未显式设时 | 向量等大类可能更高，需查目标 td |
+| `MaxWeight=0` 的隐含语义 | 字典序下 BrokenHints 相同时任何 MaxWeight>0 都超 ceiling | hint 路径几乎只看 BrokenHints 维度 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 通用代价判定 | `DefaultEvictionAdvisor::canEvictInterferenceBasedOnCost` | RegAllocEvictionAdvisor.cpp:256 |
+| 寄存器类 copy 代价 | `TargetRegisterClass::getCopyCost` | llvm/include/llvm/CodeGen/TargetRegisterInfo.h |
+| EvictionCost 定义 | `struct EvictionCost` | RegAllocEvictionAdvisor.h:78 |
+| 调用点 | `RAGreedy::tryAssign` 在 missed-hint 分支调用 | RegAllocGreedy.cpp:557-575 |
+
+---
+
+### 其他补充
+
+- **与 `tryFindEvictionCandidate` 的对比**：后者把 `BestCost.setMax()`（无穷大）或 `BestCost.MaxWeight = VirtReg.weight()`（cheap reg 路径）作为初始 ceiling，循环找最便宜；本函数则用"1 个 copy 代价"作为 ceiling，**只要不超过就允许**，不做多候选比较——因为 hint 路径只针对特定 `PhysReg`，无需在多个寄存器间选最便宜。
+- **ML advisor 的对应实现**：`MLRegAllocEvictAdvisor` 不调用本函数，而是直接在 `tryFindEvictionCandidate` 中由模型给出候选；`canEvictHintInterference` 是 default advisor 专有的 hint 路径决策。
+
+---
+
+## DefaultEvictionAdvisor::canEvictInterferenceBasedOnCost 函数分析
+
+### 函数签名与目的（行号）
+```cpp
+bool DefaultEvictionAdvisor::canEvictInterferenceBasedOnCost(
+    const LiveInterval &VirtReg, MCRegister PhysReg, bool IsHint,
+    EvictionCost &MaxCost, const SmallVirtRegSet &FixedRegisters) const;
+```
+
+**功能**: 通用驱逐代价判定核心。给定 `VirtReg`、目标 `PhysReg`、当前代价 ceiling `MaxCost`，逐 regunit 收集所有干涉 vreg，对每个 Intf 做硬性约束检查（Fixed / RS_Done / Cascade 防环）+ 软代价累计（BrokenHints、MaxWeight），最终若所有 Intf 都可通过且累计 Cost < MaxCost，则把 `MaxCost` 更新为实际 Cost 并返回 true。是 default advisor 所有驱逐决策的统一入口。
+
+---
+
+### 整体结构
+
+```
+canEvictInterferenceBasedOnCost(VirtReg, PhysReg, IsHint, MaxCost, FixedRegisters)  // :256
+├── [硬约束 0] 固定干涉早退
+│   └── if Matrix->checkInterference > IK_VirtReg: return false     // regmask/regunit 不可驱逐
+├── IsLocal = VirtReg.empty() || LIS->intervalIsInOneMBB(VirtReg)
+├── Cascade = getCascadeOrCurrentNext(VirtReg.reg())                // 防 eviction 环的版本号
+├── EvictionCost Cost                                                // 累计代价，从 0 开始
+├── for Unit in TRI->regunits(PhysReg):
+│   ├── Q = Matrix->query(VirtReg, Unit)
+│   ├── Interferences = Q.interferingVRegs(EvictInterferenceCutoff) // 默认 cutoff=10
+│   ├── if Interferences.size() >= cutoff: return false             // 干涉太多，放弃（编译时保护）
+│   │
+│   └── for Intf in reverse(Interferences):
+│       ├── [硬约束 1] FixedRegisters.count(Intf): return false     // recolor 会话已 Fixed
+│       ├── [硬约束 2] Stage(Intf) == RS_Done: return false           // spill 产物不可驱逐
+│       ├── Urgent = isUrgentEviction(VirtReg, *Intf)                // 不可 spill + 跨类
+│       ├── IntfCascade = getCascade(Intf)
+│       ├── [硬约束 3] Cascade == IntfCascade: return false            // 同 chain，防环
+│       ├── [硬约束 4] Cascade < IntfCascade && !Urgent: return false // 反向边，防环
+│       │   └── if Urgent: Cost.BrokenHints += 10 * CopyCost(Intf)   // 罚款：10× copy 代价
+│       ├── BreaksHint = VRM->hasPreferredPhys(Intf)                 // Intf 已满足自己的 hint？
+│       ├── if BreaksHint: Cost.BrokenHints += CopyCost(Intf)        // 累加 hint 打破代价
+│       ├── Cost.MaxWeight = max(Cost.MaxWeight, Intf->weight())     // 累加最大权重
+│       ├── if Cost >= MaxCost: return false                          // 超 ceiling 放弃
+│       ├── if Urgent: continue                                        // urgent 跳过 shouldEvict 与 local 检查
+│       ├── [软约束] if !shouldEvict(...): return false               // 权重/hint 策略
+│       └── [软约束] if !MaxCost.isMax() && IsLocal && Intf局部
+│                   && (!EnableLocalReassign || !canReassign(Intf, PhysReg)):
+│                   return false                                       // 局部分配保护
+└── MaxCost = Cost; return true                                       // 全部通过，更新 ceiling
+```
+
+---
+
+### 逐段注释
+
+**1. 固定干涉早退 (行 259-261)**
+
+```cpp
+if (Matrix->checkInterference(VirtReg, PhysReg) > LiveRegMatrix::IK_VirtReg)
+  return false;
+```
+
+目的作用：用 `LiveRegMatrix::checkInterference` 一次性检查 `PhysReg` 上是否有 regmask（call clobber）或 regunit（参数寄存器等预占用）级别的固定干涉。这些干涉来自物理层面，**无法通过 unassign 其他 vreg 解除**，所以直接放弃。
+注释说明：这是 `InterferenceKind` 分级语义的体现——只有 `IK_VirtReg`（及以下，即 `IK_Free`）才是可驱逐的。`IK_RegUnit`/`IK_RegMask` 比较时枚举值更大，`> IK_VirtReg` 一刀切掉。
+
+**2. 局部性 + Cascade 准备 (行 263-272)**
+
+```cpp
+bool IsLocal = VirtReg.empty() || LIS->intervalIsInOneMBB(VirtReg);
+
+unsigned Cascade = RA.getExtraInfo().getCascadeOrCurrentNext(VirtReg.reg());
+```
+
+目的作用：① `IsLocal` 标记 `VirtReg` 是否为单 MBB 局部 live range，后面会用来防止"局部驱逐局部"导致次优染色；② `Cascade` 取 `VirtReg` 当前所属驱逐链编号，若未参与过驱逐则取即将分配的下一个编号。
+注释说明：
+- `getCascadeOrCurrentNext`（RegAllocGreedy.h:123）的设计很关键：未参与过驱逐的 vreg 拿到 `NextCascade`（即将分配但尚未分配的编号），使得"新 vreg Cascade > 任何已分配 Cascade"——所以新 vreg 可以驱逐任何已分配的 vreg（除非同 cascade 或更晚）。
+- Cascade 编号是单调递增的全局计数器，每个新驱逐链分配一个新号；同号 = 同一驱逐链内互相驱逐（环），禁止。
+
+**3. 逐 regunit 收集干涉 + cutoff 保护 (行 274-280)**
+
+```cpp
+EvictionCost Cost;
+for (MCRegUnit Unit : TRI->regunits(PhysReg)) {
+  LiveIntervalUnion::Query &Q = Matrix->query(VirtReg, Unit);
+  const auto &Interferences = Q.interferingVRegs(EvictInterferenceCutoff);
+  if (Interferences.size() >= EvictInterferenceCutoff)
+    return false;
+```
+
+目的作用：对 `PhysReg` 的每个 regunit 查询 LiveIntervalUnion 中已 assign 的 vreg。`EvictInterferenceCutoff`（默认 10，`-regalloc-eviction-max-interference-cutoff` 可改）是编译时保护：干涉太多直接放弃，避免 O(N²) 扫描退化。
+注释说明：
+- `Matrix->query` 返回内部缓存 `Queries[Unit]`，跨调用复用扫描结果（前提是 `UserTag` 未变）。
+- `interferingVRegs(cutoff)` 返回最多 `cutoff+1` 个干涉 vreg，所以用 `>= cutoff` 判定"超限"。
+- 注意每个 regunit 独立判定 cutoff，所以 PhysReg 涉及多个 regunit 时累加可能更多——但任一 regunit 超限即整体放弃。
+
+**4. 逐 Intf 硬约束：Fixed / RS_Done / Cascade (行 283-301)**
+
+```cpp
+for (const LiveInterval *Intf : reverse(Interferences)) {
+  assert(Intf->reg().isVirtual());
+
+  if (FixedRegisters.count(Intf->reg()))
+    return false;
+
+  if (RA.getExtraInfo().getStage(*Intf) == RS_Done)
+    return false;
+
+  bool Urgent = isUrgentEviction(VirtReg, *Intf);
+  unsigned IntfCascade = RA.getExtraInfo().getCascade(Intf->reg());
+  if (Cascade == IntfCascade)
+    return false;
+```
+
+目的作用：三条硬性约束保证正确性。
+注释说明：
+- `FixedRegisters`：last-chance recoloring 会话中已被 scavenge 出物理寄存器的 vreg，不可再被驱逐，否则递归会无限往返。
+- `RS_Done`：spill 产物（reload vreg 等）不能再 split/spill，所以不可驱逐——它们没有退路。
+- `Cascade == IntfCascade`：同一驱逐链内的 vreg 互相驱逐会形成环，禁止。注意此处用 `getCascade`（已分配的真实值）而非 `getCascadeOrCurrentNext`。
+- `reverse(Interferences)`：反向遍历，让 LiveIntervalUnion 中较新插入的 Intf 先被评估——它们通常更可能被驱逐（cascade 更新、stage 更早）。这只是遍历顺序优化，不影响正确性。
+
+**5. Cascade < IntfCascade：反向边仅 urgent 允许 + 重罚 (行 303-309)**
+
+```cpp
+if (Cascade < IntfCascade) {
+  if (!Urgent)
+    return false;
+  Cost.BrokenHints += 10 * MRI->getRegClass(Intf->reg())->getCopyCost();
+}
+```
+
+目的作用：若 `Intf` 的 cascade 编号比 `VirtReg` 的更新（即 Intf 是更晚的驱逐链产物），通常禁止驱逐——否则新链可以反向驱逐老链，又形成环。例外是 **urgent 驱逐**（`isUrgentEviction`：VirtReg 不可 spill 且 Intf 可 spill 或来自更小的分配顺序），此时允许打破 cascade，但代价极重：`10 × copy cost`。
+注释说明：
+- `isUrgentEviction`（行 198-204）：当 VirtReg 不可 spill（如 tied-to-physreg、inline asm 操作数）且 Intf 可 spill，或 VirtReg 来自更小的分配顺序（更稀缺寄存器类）时为 urgent。urgent 是"不惜代价也要找到寄存器"的场景。
+- 10× 罚款让 urgent 路径在 `Cost >= MaxCost` 比较中很容易超 ceiling，因此只有 ceiling 很宽（如 `MaxCost.isMax()`）时才会真的执行——这是 urgent 打破 cascade 的"最后手段"语义。
+
+**6. BreaksHint 累加 + MaxWeight + ceiling 检查 (行 311-319)**
+
+```cpp
+bool BreaksHint = VRM->hasPreferredPhys(Intf->reg());
+if (BreaksHint)
+  Cost.BrokenHints += MRI->getRegClass(Intf->reg())->getCopyCost();
+
+Cost.MaxWeight = std::max(Cost.MaxWeight, Intf->weight());
+if (Cost >= MaxCost)
+  return false;
+```
+
+目的作用：把 Intf 的"打破其已满足 hint"和"其 spill 权重"都累加进 `Cost`，再用 `Cost >= MaxCost` 判定是否超 ceiling。`EvictionCost::operator>=` 用字典序：先比 BrokenHints，相同再比 MaxWeight。
+注释说明：
+- `VRM->hasPreferredPhys(Intf)`：Intf 当前物理寄存器是否就是它的 preferred（即 hint 已被满足）。打破它意味着 Intf 重新分配后会产生一条 COPY（或失去 coalescing 机会），代价等于该类 copy cost。
+- `MaxWeight` 取最大而非累加：因为驱逐多个 vreg 后，最重的那个决定了"被驱逐 vreg 重新分配时的最难场景"——这是 greedy 驱逐模型的关键简化，避免预测整条重分配链的代价。
+
+**7. Urgent 跳过策略检查 (行 320-321)**
+
+```cpp
+if (Urgent)
+  continue;
+```
+
+目的作用：urgent 驱逐不要求 `shouldEvict` 通过——因为 VirtReg 不可 spill，无论 Intf 多重都必须让位。continue 跳过下面的策略检查，直接处理下一个 Intf。
+注释说明：这是 urgent 路径的第二个特权（第一个是允许打破 cascade）。代价已经通过 `10 × copy cost` 罚款体现在 BrokenHints 上，再叠加 `shouldEvict` 就过严了。
+
+**8. shouldEvict 软策略 (行 322-324)**
+
+```cpp
+if (!shouldEvict(VirtReg, IsHint, *Intf, BreaksHint))
+  return false;
+```
+
+目的作用：调用 `shouldEvict`（行 219-234）做权重/hint 策略判定。
+注释说明：`shouldEvict` 的两条规则：
+- `CanSplit && IsHint && !BreaksHint` → 允许（hint 路径下，只要 Intf 还能 split 且不打破 Intf 自己的 hint，就驱逐，不要求 VirtReg 更重）。
+- `A.weight() > B.weight()` → 允许（VirtReg spill 权重严格大于 Intf 才驱逐）。
+两条都不满足则拒绝。注意是严格大于，相等也不驱逐——避免驱逐同等重要的 vreg。
+
+**9. 局部分配保护 (行 325-331)**
+
+```cpp
+if (!MaxCost.isMax() && IsLocal && LIS->intervalIsInOneMBB(*Intf) &&
+    (!EnableLocalReassign || !canReassign(*Intf, PhysReg))) {
+  return false;
+}
+```
+
+目的作用：在"找便宜寄存器"（非 hint，`!MaxCost.isMax()`）路径下，若 VirtReg 与 Intf 都是单 MBB 局部，且 Intf 不能换到别的 PhysReg，则禁止驱逐。理由：两个局部 vreg 互相争夺局部寄存器会导致次优染色——本应让其中一个去 split/spill 而不是抢另一个的位置。
+注释说明：
+- `!MaxCost.isMax()`：只在"cheap reg 搜索"路径生效，hint 路径（`canEvictHintInterference` 设的上限）和 `tryFindEvictionCandidate` 的初始 `BestCost.setMax()` 都不触发此分支。
+- `EnableLocalReassign`（`-enable-local-reassign`，默认 false）：开启时会先尝试 `canReassign(Intf, PhysReg)`——Intf 能否换到同寄存器类的其他 PhysReg，能换则允许驱逐（Intf 会找到新家）。这是可选的更激进策略，但编译时开销大。
+- `canReassign`（RegAllocGreedy.cpp:594）逐 AllocationOrder 检查 Intf 是否能在排除 PhysReg 后找到无干涉寄存器。
+
+**10. 成功路径：更新 ceiling (行 334-335)**
+
+```cpp
+MaxCost = Cost;
+return true;
+```
+
+目的作用：所有 Intf 都通过后，把实际累计代价 `Cost` 写回 `MaxCost`（in-out 参数），让调用方据此更新"当前最便宜候选"。返回 true 表示 `PhysReg` 可驱逐。
+注释说明：这是"ceiling 收紧"模式——`tryFindEvictionCandidate` 把 `BestCost` 作为 ceiling 传入，每找到一个可驱逐 PhysReg，`MaxCost` 就被收紧为实际代价，下一个候选必须更便宜才能通过，从而选出全局最便宜的 PhysReg。
+
+---
+
+### 关键数据结构
+
+| 结构 | 字段/方法 | 含义 |
+|---|---|---|
+| `EvictionCost` | `BrokenHints` / `MaxWeight` | 字典序代价（BrokenHints 优先） |
+| `EvictionCost` | `operator>=` | `!(*this < O)`，字典序比较 |
+| `EvictionCost` | `isMax()` | `BrokenHints == ~0u`，表示无穷大 ceiling |
+| `LiveRegMatrix` | `checkInterference` | 一次性返回 `InterferenceKind` 分级 |
+| `LiveRegMatrix` | `query(LR, Unit).interferingVRegs(cutoff)` | 缓存的 LiveIntervalUnion 扫描 |
+| `ExtraInfo` | `getCascadeOrCurrentNext` | 未参与过驱逐则取 NextCascade |
+| `ExtraInfo` | `getCascade` | 取真实 cascade 编号（0 表未参与） |
+| `ExtraInfo` | `getStage` | 取 LiveRangeStage，`RS_Done` 不可驱逐 |
+| `VirtRegMap` | `hasPreferredPhys` | Intf 当前 physreg 是否为 preferred |
+| `EvictInterferenceCutoff` | cl::opt 默认 10 | 每 regunit 干涉数上限（编译时保护） |
+
+---
+
+### 优化意图
+
+1. **多级过滤**：硬约束（固定干涉 / Fixed / RS_Done / Cascade 环）→ 编译时保护（cutoff）→ 软代价（BrokenHints / MaxWeight）→ 软策略（shouldEvict / local 保护）。从最廉价最严格的检查到最昂贵的策略逐级过滤，避免无谓计算。
+2. **字典序代价模型**：BrokenHints 优先于 MaxWeight，反映"打破 hint 比驱逐重 vreg 更糟"的优先级——打破 hint 一定产生 COPY，而重 vreg 还可能 split 找到位置。
+3. **ceiling 收紧**：`MaxCost` in-out 设计让多个 PhysReg 候选间形成"竞价"，自动选最便宜。
+4. **Cascade 防环**：用单调递增编号把驱逐关系限制为 DAG（新 cascade 可驱逐旧 cascade，反之不可，除非 urgent 重罚），从结构上消除无限驱逐环。
+5. **urgent 特权**：不可 spill 的 vreg 走重罚 + 跳过策略检查的快通道，保证一定能找到寄存器（即便代价高）。
+6. **局部分配保护**：避免局部 vreg 互相驱逐导致次优染色，仅在 cheap-reg 路径生效以保护染色质量。
+7. **cutoff 编译时保护**：默认 10 个干涉即放弃，避免大型函数 O(N²) 退化。
+
+---
+
+### 约束与易错点
+
+| 约束 | 说明 | 风险 |
+|---|---|---|
+| `MaxCost` 是 in-out 参数 | 成功时被改写为 Cost | 调用方不能假设 MaxCost 不变；失败时保持原值 |
+| `checkInterference > IK_VirtReg` 一票否决 | regmask/regunit 不可驱逐 | 若 `InterferenceKind` 枚举顺序变化需同步检查 |
+| `Cascade == IntfCascade` 严格禁止 | 同链驱逐 = 环 | 必须用 `getCascade`（真实值）而非 `getCascadeOrCurrentNext` |
+| `Cascade < IntfCascade` 仅 urgent 允许 | 反向边防环 | urgent 重罚必须足够大，否则可能频繁打破 cascade |
+| `Intf->reg()` 必须是 vreg | assert 检查 | query 已保证只返回 vreg 干涉 |
+| `RS_Done` 不可驱逐 | spill 产物无退路 | 若 stage 状态机被破坏会误驱逐 |
+| `interferingVRegs(cutoff)` 返回最多 cutoff+1 | 用 `>= cutoff` 判超限 | 误用 `> cutoff` 会少一个 |
+| `shouldEvict` 严格大于 | 相等不驱逐 | 避免同等权重互相驱逐 |
+| `!MaxCost.isMax()` 决定 local 保护是否生效 | hint 与初始 `setMax()` 路径跳过 | cheap-reg 路径才有染色质量保护 |
+| `canReassign` 编译时昂贵 | 默认关闭 | 开启 `EnableLocalReassign` 会显著增加编译时间 |
+
+---
+
+### 关键 API / 源码路径
+
+| 功能 | API | 位置 |
+|------|-----|------|
+| 干涉分级 | `LiveRegMatrix::checkInterference` | LiveRegMatrix.cpp:202 |
+| LiveIntervalUnion 查询 | `LiveIntervalUnion::Query::interferingVRegs` | LiveIntervalUnion.h |
+| cascade 编号 | `ExtraInfo::getCascadeOrCurrentNext` / `getCascade` | RegAllocGreedy.h:123/107 |
+| stage 查询 | `ExtraInfo::getStage` | RegAllocGreedy.h |
+| preferred 检查 | `VirtRegMap::hasPreferredPhys` | VirtRegMap.cpp:124 |
+| urgent 判定 | `RegAllocEvictionAdvisor::isUrgentEviction` | RegAllocEvictionAdvisor.cpp:198 |
+| 驱逐策略 | `DefaultEvictionAdvisor::shouldEvict` | RegAllocEvictionAdvisor.cpp:219 |
+| 局部重分配 | `RegAllocEvictionAdvisor::canReassign` | RegAllocGreedy.cpp:594 |
+| cutoff 配置 | `EvictInterferenceCutoff` cl::opt | RegAllocEvictionAdvisor.cpp:50 |
+| 调用方 1（hint 抢回） | `canEvictHintInterference` 包装 | RegAllocEvictionAdvisor.cpp:238 |
+| 调用方 2（cheap-reg 搜索） | `tryFindEvictionCandidate` 循环 | RegAllocEvictionAdvisor.cpp:338 |
+| 调用方 3（eviction chain） | `RAGreedy::evictInterference` 间接通过 `tryEvict` | RegAllocGreedy.cpp:620/716 |
+
+---
+
+### 其他补充
+
+- **三个调用方对 `MaxCost` 的不同设定**：
+
+  | 调用方 | 初始 MaxCost | IsHint | 语义 |
+  |---|---|---|---|
+  | `canEvictHintInterference` | `BrokenHints = CopyCost(VirtReg)` | true | 满足 hint，允许打破 1 个 hint |
+  | `tryFindEvictionCandidate`（cheap-reg 路径） | `BrokenHints=0, MaxWeight=VirtReg.weight()` | false | 找比 VirtReg 更轻的候选，不许打破任何 hint |
+  | `tryFindEvictionCandidate`（初始路径） | `setMax()`（无穷大） | false | 接受任意代价，找第一个可驱逐的 |
+
+  三种 ceiling 对应"hint 抢回" / "找便宜替代" / "实在不行就驱逐" 三种语义层次，体现了 greedy 驱逐模型的分层代价容忍度。
+
+- **与 ML advisor 的关系**：`MLRegAllocEvictAdvisor`（`MLRegAllocEvictAdvisor.cpp`）的 `tryFindEvictionCandidate` 直接由模型给出候选，但仍调用本函数做合法性检查（Fixed / RS_Done / Cascade 等硬约束），保证 ML 决策不违反正确性。`canEvictInterferenceBasedOnCost` 因此是"正确性 + 启发式"的统一闸门，ML 只能在它允许的范围内选 PhysReg。
+- **字典序代价模型的微妙之处**：因为 `BrokenHints` 优先于 `MaxWeight`，"打破 1 个 hint" 比 "驱逐权重最大的 vreg" 还要糟——这与直觉的"权重越大越不愿意驱逐"略有出入。设计动机是：BrokenHints 一定产生 COPY（确定代价），而 MaxWeight 只是"被驱逐 vreg 重分配可能困难"（不确定代价），所以确定代价优先判定。
+- **`reverse(Interferences)` 的作用**：LiveIntervalUnion 内部按 vreg 编号顺序维护，reverse 让较新插入的 Intf 先评估。较新的 Intf 通常 cascade 更新、stage 更早，更可能通过硬约束，先评估可以更早遇到首个失败 Intf 而提前 return——这是微优化，不影响正确性。
