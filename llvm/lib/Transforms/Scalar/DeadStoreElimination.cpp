@@ -72,6 +72,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Value.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
@@ -984,6 +985,9 @@ struct DSEState {
   SmallVector<MemoryDef *, 64> MemDefs;
   // Any that should be skipped as they are already deleted
   SmallPtrSet<MemoryAccess *, 4> SkipStores;
+  // Defer phi simplification until the MemoryAccess worklists are no longer
+  // used. Track blocks rather than phis, which other updates may delete.
+  SmallSetVector<BasicBlock *, 8> BlocksWithPhiUses;
   // Keep track whether a given object is captured before return or not.
   DenseMap<const Value *, bool> CapturedBeforeReturn;
   // Keep track of all of the objects that are invisible to the caller after
@@ -2043,6 +2047,9 @@ void DSEState::deleteDeadInstruction(Instruction *SI,
     if (MA) {
       if (IsMemDef) {
         auto *MD = cast<MemoryDef>(MA);
+        for (User *U : MD->users())
+          if (auto *Phi = dyn_cast<MemoryPhi>(U))
+            BlocksWithPhiUses.insert(Phi->getBlock());
         SkipStores.insert(MD);
         if (Deleted)
           Deleted->insert(MD);
@@ -2815,6 +2822,15 @@ static bool eliminateDeadStores(Function &F, AliasAnalysis &AA, MemorySSA &MSSA,
     Instruction *DeadInst = State.ToRemove.pop_back_val();
     DeadInst->eraseFromParent();
   }
+
+  // Preserve the precision of cached clobbers for subsequent MemorySSA users.
+  // Simplifying phis during deletion could invalidate DSE's worklist entries.
+  // Use weak handles because simplifying one phi can recursively delete others.
+  SmallVector<WeakVH, 8> PhisToOptimize;
+  for (BasicBlock *BB : State.BlocksWithPhiUses)
+    if (MemoryPhi *Phi = MSSA.getMemoryAccess(BB))
+      PhisToOptimize.emplace_back(Phi);
+  MemorySSAUpdater(&MSSA).tryRemoveTrivialPhis(PhisToOptimize);
 
   return MadeChange;
 }
