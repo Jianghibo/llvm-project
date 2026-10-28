@@ -276,7 +276,8 @@ void BinaryBasicBlock::addSuccessor(BinaryBasicBlock *Succ, uint64_t Count,
 void BinaryBasicBlock::replaceSuccessor(BinaryBasicBlock *Succ,
                                         BinaryBasicBlock *NewSucc,
                                         uint64_t Count,
-                                        uint64_t MispredictedCount) {
+                                        uint64_t MispredictedCount,
+                                        CycleStats Cycles) {
   Succ->removePredecessor(this, /*Multiple=*/false);
   auto I = succ_begin();
   auto BI = BranchInfo.begin();
@@ -289,7 +290,7 @@ void BinaryBasicBlock::replaceSuccessor(BinaryBasicBlock *Succ,
   assert(I != succ_end() && "no such successor!");
 
   *I = NewSucc;
-  *BI = BinaryBranchInfo{Count, MispredictedCount};
+  *BI = BinaryBranchInfo{Count, MispredictedCount, Cycles};
   NewSucc->addPredecessor(this);
 }
 

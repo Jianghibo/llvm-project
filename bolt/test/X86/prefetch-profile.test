@@ -1,0 +1,33 @@
+# REQUIRES: system-linux
+# RUN: split-file %s %t
+# RUN: merge-fdata %t/first %t/second > %t/merged
+# RUN: FileCheck %s --input-file=%t/merged --check-prefix=MERGED
+# RUN: yaml2obj %p/Inputs/blarge.yaml -o %t.exe
+# RUN: llvm-bolt %t.exe --data %t/merged -o %t.out
+# RUN: not merge-fdata %t/first %t/incompatible 2>&1 | FileCheck %s --check-prefix=MISMATCH
+# RUN: not llvm-bolt %t.exe --data %t/truncated -o %t.bad 2>&1 | FileCheck %s --check-prefix=INVALID
+# RUN: not llvm-bolt %t.exe --data %t/version -o %t.bad 2>&1 | FileCheck %s --check-prefix=VERSION
+# MERGED: bolt-prefetch 1 llc_miss
+# MERGED: 1 usqrt 3d 1 usqrt 10 3 30 190 13
+# MERGED: 7 usqrt 10 5 13
+# MISMATCH: cannot merge incompatible
+# INVALID: missing cycle statistics
+# VERSION: unsupported bolt-prefetch version
+
+#--- first
+bolt-prefetch 1 llc_miss
+1 usqrt 3d 1 usqrt 10 1 10 100 10
+7 usqrt 10 2 5
+#--- second
+bolt-prefetch 1 llc_miss
+7 usqrt 10 3 8
+1 usqrt 3d 1 usqrt 10 2 20 90 3
+#--- incompatible
+bolt-prefetch 1 l1d_miss
+1 usqrt 3d 1 usqrt 10 0 1 0 0
+#--- truncated
+bolt-prefetch 1 llc_miss
+1 usqrt 3d 1 usqrt 10 0 1
+#--- version
+bolt-prefetch 99 llc_miss
+1 usqrt 3d 1 usqrt 10 0 1 0 0

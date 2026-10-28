@@ -17,6 +17,7 @@
 
 #include "llvm/ADT/Twine.h"
 #include "llvm/MC/MCSymbol.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include <string>
 #include <vector>
@@ -25,6 +26,30 @@ namespace llvm {
 namespace bolt {
 
 class BinarySection;
+
+/// Repeated-branch intervals. Samples == 0 means unknown; -1 means invalid.
+struct CycleStats {
+  int64_t Total{0};
+  int64_t Samples{0};
+
+  CycleStats() = default;
+  CycleStats(int64_t Total, int64_t Samples) : Total(Total), Samples(Samples) {}
+
+  void merge(const CycleStats &Other) {
+    int64_t NewTotal, NewSamples;
+    if (Samples < 0 || Other.Samples < 0 ||
+        AddOverflow(Total, Other.Total, NewTotal) ||
+        AddOverflow(Samples, Other.Samples, NewSamples)) {
+      Total = 0;
+      Samples = -1;
+      return;
+    }
+    Total = NewTotal;
+    Samples = NewSamples;
+  }
+
+  int64_t average() const { return Samples > 0 ? Total / Samples : 0; }
+};
 
 /// \p BinaryData represents an indivisible part of a data section section.
 /// BinaryData's may contain sub-components, e.g. jump tables but they are
@@ -233,6 +258,24 @@ inline raw_ostream &operator<<(raw_ostream &OS,
   }
 
   OS << TotalCount << " total counts : " << TempString;
+  return OS;
+}
+
+/// Sampled miss and access counts attached to an original load instruction.
+struct CacheMissProfile {
+  uint64_t InstrOffset; ///< Original instruction offset within its function.
+  uint64_t MissCount;   ///< Number of sampled cache misses.
+  uint64_t AccessCount; ///< Number of sampled accesses.
+  bool operator==(const CacheMissProfile &Other) const {
+    return InstrOffset == Other.InstrOffset && MissCount == Other.MissCount &&
+           AccessCount == Other.AccessCount;
+  }
+};
+
+inline raw_ostream &operator<<(raw_ostream &OS,
+                               const bolt::CacheMissProfile &CMP) {
+  OS << "Misses: " << CMP.MissCount << ", Accesses: " << CMP.AccessCount
+     << "\n";
   return OS;
 }
 

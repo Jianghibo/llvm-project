@@ -7,6 +7,7 @@ set(LLVM_LINK_COMPONENTS
 
 add_bolt_unittest(ProfileTests
   DataAggregator.cpp
+  DataReader.cpp
   PerfSpeEvents.cpp
   PerfScripts.cpp
 

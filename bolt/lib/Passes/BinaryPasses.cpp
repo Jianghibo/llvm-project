@@ -296,7 +296,7 @@ void NormalizeCFG::runOnFunction(BinaryFunction &BF) {
 
       BinaryBasicBlock::BinaryBranchInfo &BI = Predecessor->getBranchInfo(BB);
       Predecessor->replaceSuccessor(&BB, Successor, BI.Count,
-                                    BI.MispredictedCount);
+                                    BI.MispredictedCount, BI.Cycles);
       // We need to fix branches even if we failed to replace all successors
       // and remove the block.
       NeedsFixBranches = true;

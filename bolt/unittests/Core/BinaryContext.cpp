@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "bolt/Core/BinaryContext.h"
+#include "bolt/Core/BinaryFunction.h"
 #include "bolt/Rewrite/RewriteInstance.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/BinaryFormat/ELF.h"
@@ -72,6 +73,27 @@ protected:
 };
 
 } // namespace
+
+TEST_P(BinaryContextTester, CycleMetadata) {
+  auto *BF = BC->createInjectedBinaryFunction("loop");
+  auto From = BF->createBasicBlock(BC->Ctx->createTempSymbol());
+  auto To = BF->createBasicBlock(BC->Ctx->createTempSymbol());
+  auto Split = BF->createBasicBlock(BC->Ctx->createTempSymbol());
+  CycleStats Cycles(100, 10);
+  Cycles.merge({90, 3});
+  EXPECT_EQ(Cycles.average(), 14);
+  From->addSuccessor(To.get(), {20, 0, Cycles});
+  From->moveAllSuccessorsTo(Split.get());
+  EXPECT_EQ(Split->getBranchInfo(*To).Cycles.Total, 190);
+  EXPECT_EQ(Split->getBranchInfo(*To).Cycles.Samples, 13);
+  Split->replaceSuccessor(To.get(), From.get(), 20, 0, Cycles);
+  EXPECT_EQ(Split->getBranchInfo(*From).Cycles.average(), 14);
+  Split->replaceSuccessor(From.get(), To.get(), 20, 0);
+  EXPECT_EQ(Split->getBranchInfo(*To).Cycles.Samples, 0);
+  Cycles = {INT64_MAX, 1};
+  Cycles.merge({1, 1});
+  EXPECT_EQ(Cycles.Samples, -1);
+}
 
 #ifdef X86_AVAILABLE
 

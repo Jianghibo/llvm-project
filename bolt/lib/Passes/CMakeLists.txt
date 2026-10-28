@@ -21,6 +21,7 @@ add_llvm_library(LLVMBOLTPasses
   Instrumentation.cpp
   JTFootprintReduction.cpp
   LongJmp.cpp
+  LoopDataPrefetch.cpp
   LoopInversionPass.cpp
   LivenessAnalysis.cpp
   MCF.cpp

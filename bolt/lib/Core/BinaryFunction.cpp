@@ -1520,7 +1520,8 @@ add_instruction:
 
     // Record offset of the instruction for profile matching, for control-flow
     // instructions, and for instructions on a DWARF lexical-scope boundary.
-    if (keepOffsetForInstruction(Instruction, static_cast<uint32_t>(Offset)))
+    if (keepOffsetForInstruction(Instruction, static_cast<uint32_t>(Offset)) ||
+        (opts::EnableLoopDataPrefetch && MIB->mayLoad(Instruction)))
       MIB->setOffset(Instruction, static_cast<uint32_t>(Offset));
 
     if (BC.isX86() && BC.MIB->isNoop(Instruction)) {
@@ -2570,7 +2571,8 @@ void BinaryFunction::postProcessCFG() {
   if (!requiresPreciseAddressMap() && !opts::Instrument) {
     for (BinaryBasicBlock &BB : blocks())
       for (MCInst &Inst : BB)
-        BC.MIB->clearOffset(Inst);
+        if (!opts::EnableLoopDataPrefetch || !BC.MIB->mayLoad(Inst))
+          BC.MIB->clearOffset(Inst);
   }
 
   assert((!isSimple() || validateCFG()) &&

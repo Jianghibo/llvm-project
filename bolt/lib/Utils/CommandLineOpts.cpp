@@ -42,6 +42,20 @@ cl::OptionCategory BoltInstrCategory("BOLT instrumentation options");
 cl::OptionCategory HeatmapCategory("Heatmap options");
 cl::OptionCategory BinaryAnalysisCategory("BinaryAnalysis options");
 
+cl::opt<bool> EnableLoopDataPrefetch(
+    "enable-loop-data-prefetch", cl::Hidden, cl::init(false),
+    cl::desc("enable experimental loop data prefetching"),
+    cl::cat(BoltOptCategory));
+
+cl::opt<unsigned> LoopPrefetchDistance(
+    "loop-prefetch-distance",
+    cl::desc("manual distance in loop iterations (0 disables)"),
+    cl::cat(BoltOptCategory));
+cl::opt<std::string>
+    LoopPrefetchHints("loop-prefetch-hints",
+                      cl::desc("versioned, build-id-bound loop prefetch hints"),
+                      cl::cat(BoltOptCategory));
+
 cl::opt<unsigned> AlignText("align-text",
                             cl::desc("alignment of .text section"), cl::Hidden,
                             cl::cat(BoltCategory));

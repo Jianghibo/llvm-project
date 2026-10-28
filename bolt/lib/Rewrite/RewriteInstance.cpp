@@ -566,9 +566,13 @@ Error RewriteInstance::setProfile(StringRef Filename) {
   }
 
   // Spawn a profile reader based on file contents.
-  if (DataAggregator::checkPerfDataMagic(Filename))
+  if (DataAggregator::checkPerfDataMagic(Filename)) {
+    if (opts::EnableLoopDataPrefetch && !opts::AggregateOnly)
+      return createStringError(
+          errc::not_supported,
+          "loop data prefetch requires fdata; run perf2bolt without -nl first");
     ProfileReader = std::make_unique<DataAggregator>(Filename);
-  else if (YAMLProfileReader::isYAML(Filename))
+  } else if (YAMLProfileReader::isYAML(Filename))
     ProfileReader = std::make_unique<YAMLProfileReader>(Filename);
   else
     ProfileReader = std::make_unique<DataReader>(Filename);
@@ -3839,6 +3843,12 @@ void RewriteInstance::selectFunctionsToProcess() {
     }
 
     if (opts::Lite) {
+      // Manual prefetch selection must not depend on profile presence.
+      if (opts::EnableLoopDataPrefetch &&
+          (opts::LoopPrefetchDistance.getNumOccurrences() ||
+           !opts::LoopPrefetchHints.empty()))
+        return true;
+
       // Forcibly include functions specified in the -function-order file.
       if (opts::ReorderFunctions == ReorderFunctions::RT_USER) {
         for (const StringRef Name : Function.getNames())

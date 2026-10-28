@@ -358,6 +358,8 @@ private:
 
   bool HasMemoryProfile{false};
 
+  bool HasCacheMissProfile{false};
+
   /// Execution halts whenever this function is entered.
   bool TrapsOnEntry{false};
 
@@ -1499,6 +1501,8 @@ public:
   bool hasProfileAvailable() const { return HasProfileAvailable; }
 
   bool hasMemoryProfile() const { return HasMemoryProfile; }
+
+  bool hasCacheMissProfile() const { return HasCacheMissProfile; }
 
   /// Return true if the body of the function was merged into another function.
   bool isFolded() const { return FoldedIntoFunction != nullptr; }

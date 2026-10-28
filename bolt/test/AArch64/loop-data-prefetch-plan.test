@@ -1,0 +1,113 @@
+# REQUIRES: system-linux
+## The planner rewrites an ELF but never executes it or runs a benchmark.
+# RUN: rm -rf %t
+# RUN: split-file %p/loop-data-prefetch.s %t/source
+# RUN: split-file %s %t/test
+# RUN: llvm-mc -filetype=obj -triple aarch64 %t/source/input.s -o %t.o
+# RUN: ld.lld --emit-relocs --build-id=0x11223344 -e _start %t.o -o %t.exe
+# RUN: llvm-nm %t.exe > %t/symbols
+# RUN: %python %t/test/prepare.py %t/symbols %t/test
+# RUN: %python %p/../../utils/loop-data-prefetch-plan.py --hints %t/test/first %t/test/second %t/test/first --output-dir %t/merged
+# RUN: FileCheck %s --check-prefix=MERGED --input-file=%t/merged/plan.json
+# RUN: not test -e %t/merged/planned.hints
+# RUN: %python %p/../../utils/loop-data-prefetch-plan.py --hints %t/test/first %t/test/second --binary %t.exe --bolt %llvm_bolt --max-per-loop=1 --output-dir %t/static
+# RUN: FileCheck %s --check-prefix=STATIC --input-file=%t/static/plan.json
+# RUN: FileCheck %s --check-prefix=HINTS --input-file=%t/static/planned.hints
+# RUN: %python %p/../../utils/loop-data-prefetch-plan.py --hints %t/test/first %t/test/second --binary %t.exe --bolt %llvm_bolt --max-per-loop=0 --output-dir %t/disabled
+# RUN: FileCheck %s --check-prefix=DISABLED --input-file=%t/disabled/plan.json
+# RUN: not %python %p/../../utils/loop-data-prefetch-plan.py --hints %t/test/first %t/test/conflict --output-dir %t/conflict 2>&1 | FileCheck %s --check-prefix=CONFLICT
+# RUN: not %python %p/../../utils/loop-data-prefetch-plan.py --hints %t/test/first %t/test/other-id --output-dir %t/other-id 2>&1 | FileCheck %s --check-prefix=IDENTITY
+# RUN: not %python %p/../../utils/loop-data-prefetch-plan.py --hints %t/test/wrong-opcode --binary %t.exe --bolt %llvm_bolt --output-dir %t/failed-static 2>&1 | FileCheck %s --check-prefix=STATIC-ERROR
+# RUN: FileCheck %s --check-prefix=FAILED --input-file=%t/failed-static/plan.json
+# RUN: not test -e %t/failed-static/planned.hints
+# RUN: chmod +x %t/test/no-pass.py
+# RUN: not %python %p/../../utils/loop-data-prefetch-plan.py --hints %t/test/first --binary %t.exe --bolt %t/test/no-pass.py --output-dir %t/no-pass 2>&1 | FileCheck %s --check-prefix=NO-PASS
+# RUN: FileCheck %s --check-prefix=FAILED --input-file=%t/no-pass/plan.json
+# RUN: not test -e %t/no-pass/planned.hints
+# RUN: %python %t/test/choices.py %p/../../utils/loop-data-prefetch-bench.py
+
+# MERGED: "status": "unverified"
+# MERGED: "performance_validated": false
+# MERGED: "requested_loads": 2
+# STATIC: "status": "static_checked"
+# STATIC: "performance_validated": false
+# STATIC: "status": "planned"
+# STATIC: "status": "skipped"
+# STATIC: request budget
+# STATIC: "planned_loads": 1
+# HINTS: bolt-prefetch-hints 1 11223344
+# HINTS: pc {{0x[0-9a-f]+}} LDRXroX 4 pldl1keep 8
+# HINTS-NOT: LDRQroX
+# DISABLED: "status": "static_checked"
+# DISABLED: "performance_validated": false
+# DISABLED: "planned_loads": 0
+# CONFLICT: conflicting hints for PC
+# IDENTITY: incompatible build-id
+# STATIC-ERROR: BOLT static check failed
+# NO-PASS: BOLT did not run loop data prefetch
+# FAILED: "status": "failed"
+# FAILED: "performance_validated": false
+
+#--- prepare.py
+from pathlib import Path
+import sys
+
+address = int(next(line.split()[0] for line in Path(sys.argv[1]).read_text().splitlines()
+                   if line.split()[-1] == "compete"), 16)
+root = Path(sys.argv[2])
+header = "bolt-prefetch-hints 1 11223344\n"
+first = f"pc {address:x} LDRXroX 4 pldl1keep 8\n"
+second = f"pc {address + 4:x} LDRQroX 4 pldl1keep 8\n"
+(root / "first").write_text(header + first)
+(root / "second").write_text(header + second)
+(root / "conflict").write_text(header + first.replace(" 4 ", " 8 "))
+(root / "other-id").write_text(header.replace("11223344", "55667788") + second)
+(root / "wrong-opcode").write_text(header + first.replace("LDRXroX", "LDRQroX"))
+
+#--- no-pass.py
+#!/usr/bin/env python3
+import shutil
+import sys
+
+shutil.copyfile(sys.argv[1], sys.argv[sys.argv.index("-o") + 1])
+
+#--- choices.py
+import copy
+import runpy
+import sys
+
+select = runpy.run_path(sys.argv[1])["select_candidate_choices"]
+report = {
+    "completed": True, "failures": [], "predicted_distance": 4,
+    "configuration": {"samples": 3, "threads": [1], "min_speedup_pct": 5,
+                      "max_noise_pct": 1},
+    "candidates": [{"function": "scan", "pc": "0x1000", "opcode": "LDRXui"}],
+    "variants": {"base": {},
+                 "noisy": {"pc": "0x1000", "inserted": True, "distance": 4,
+                           "hints": "noisy.hints"},
+                 "stable": {"pc": "0x1000", "inserted": True, "distance": 8,
+                            "hints": "stable.hints"}},
+    "summary": [],
+}
+for variant, median, speedup, noise in (("base", 1, 0, 0.1),
+                                       ("noisy", 0.8, 25, 10),
+                                       ("stable", 0.9, 11, 0.2)):
+    report["summary"].append(dict(mode="scan", threads=1, variant=variant,
+                                  median=median, speedup_pct=speedup,
+                                  median_absolute_deviation_pct=noise))
+choice, = select(report)
+assert choice["eligible"] and choice["hints"] == "stable.hints"
+assert choice["validation_scope"] == "single_pc_same_input"
+assert not choice["combination_validated"] and not choice["independent_input_validated"]
+failed = copy.deepcopy(report)
+failed["failures"] = ["code growth"]
+choice, = select(failed)
+assert not choice["eligible"] and choice["hints"] is None
+unconfigured = copy.deepcopy(report)
+unconfigured["configuration"]["max_noise_pct"] = None
+assert not select(unconfigured)[0]["eligible"]
+invalid = copy.deepcopy(report)
+invalid["summary"][0]["median_absolute_deviation_pct"] = float("nan")
+choice, = select(invalid)
+assert not choice["eligible"] and choice["hints"] is None
+assert select({"completed": False}) == []
