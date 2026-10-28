@@ -33,6 +33,7 @@
 #include "llvm/Support/DataExtractor.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 
 #define DEBUG_TYPE "mcplus"
 
@@ -1313,16 +1314,20 @@ public:
     return true;
   }
 
+  MCPhysReg getAliasSized(MCPhysReg Reg, uint8_t Size) const override {
+    if (Size != 4 && Size != 8)
+      return 0;
+    Reg = getXRegFromWReg(Reg);
+    if (!RegInfo->getRegClass(AArch64::GPR64RegClassID).contains(Reg))
+      return 0;
+    return Size == 4 ? getWRegFromXReg(Reg).id() : Reg;
+  }
+
   BitVector getRegsUsedAsParams() const override {
     BitVector Regs = BitVector(RegInfo->getNumRegs(), false);
-    Regs |= getAliases(AArch64::X0);
-    Regs |= getAliases(AArch64::X1);
-    Regs |= getAliases(AArch64::X2);
-    Regs |= getAliases(AArch64::X3);
-    Regs |= getAliases(AArch64::X4);
-    Regs |= getAliases(AArch64::X5);
-    Regs |= getAliases(AArch64::X6);
-    Regs |= getAliases(AArch64::X7);
+    getDefaultLiveOut(Regs);
+    // X8 carries the address for an indirect result.
+    Regs |= getAliases(AArch64::X8);
     return Regs;
   }
 
@@ -1343,9 +1348,16 @@ public:
   }
 
   void getDefaultLiveOut(BitVector &Regs) const override {
-    // According to the AArch64 ABI the return registers are X0 to X7,
-    // which happen to be the same as the parameter registers.
-    Regs |= getRegsUsedAsParams();
+    // Conservatively include X0-X7 for general-purpose return values.
+    // X8 is an input for indirect results, not a return-value register.
+    Regs |= getAliases(AArch64::X0);
+    Regs |= getAliases(AArch64::X1);
+    Regs |= getAliases(AArch64::X2);
+    Regs |= getAliases(AArch64::X3);
+    Regs |= getAliases(AArch64::X4);
+    Regs |= getAliases(AArch64::X5);
+    Regs |= getAliases(AArch64::X6);
+    Regs |= getAliases(AArch64::X7);
   }
 
   void getGPRegs(BitVector &Regs, bool IncludeAlias = true) const override {
@@ -3163,6 +3175,611 @@ public:
     if (RegInfo->getRegClass(AArch64::GPR32RegClassID).contains(Dest))
       return createMOVImm(Dest, 32, Imm);
     llvm_unreachable("Unexpected RegClass");
+  }
+
+private:
+  void setLoopBranchTarget(MCInst &Branch, const MCSymbol *Target,
+                           MCContext &Ctx) const {
+    Branch.addOperand(MCOperand::createExpr(getTargetExprFor(
+        Branch, MCSymbolRefExpr::create(Target, Ctx), Ctx, 0)));
+  }
+
+  /// Add a modular delta into Dst without changing NZCV. Large deltas require
+  /// distinct source and destination registers.
+  void emitAddDelta(MCPhysReg Dst, MCPhysReg Src, uint64_t Delta,
+                    SmallVectorImpl<MCInst> &Code) const {
+    const bool Is32 =
+        RegInfo->getRegClass(AArch64::GPR32RegClassID).contains(Dst);
+    if (Is32)
+      Delta = uint32_t(Delta);
+    const bool Negative = Is32 ? int32_t(Delta) < 0 : int64_t(Delta) < 0;
+    const uint64_t Magnitude =
+        Negative ? (Is32 ? uint32_t(-Delta) : -Delta) : Delta;
+    if (Magnitude <= 0xffffff) {
+      const unsigned Opcode =
+          Is32 ? (Negative ? AArch64::SUBWri : AArch64::ADDWri)
+               : (Negative ? AArch64::SUBXri : AArch64::ADDXri);
+      if (Magnitude >> 12) {
+        Code.push_back(MCInstBuilder(Opcode)
+                           .addReg(Dst)
+                           .addReg(Src)
+                           .addImm(Magnitude >> 12)
+                           .addImm(12));
+        Src = Dst;
+      }
+      if ((Magnitude & 4095) || Src != Dst)
+        Code.push_back(MCInstBuilder(Opcode)
+                           .addReg(Dst)
+                           .addReg(Src)
+                           .addImm(Magnitude & 4095)
+                           .addImm(0));
+      return;
+    }
+    assert(Dst != Src && "Large delta needs a distinct destination");
+    const auto Constant = createLoadImmediate(Dst, Delta);
+    Code.append(Constant.begin(), Constant.end());
+    if (!Is32 && Src == AArch64::SP)
+      Code.push_back(
+          MCInstBuilder(AArch64::ADDXrx64)
+              .addReg(Dst)
+              .addReg(Src)
+              .addReg(Dst)
+              .addImm(AArch64_AM::getArithExtendImm(AArch64_AM::UXTX, 0)));
+    else
+      Code.push_back(MCInstBuilder(Is32 ? AArch64::ADDWrs : AArch64::ADDXrs)
+                         .addReg(Dst)
+                         .addReg(Src)
+                         .addReg(Dst)
+                         .addImm(0));
+  }
+
+  static std::optional<unsigned> getPrefetchHintEncoding(StringRef Hint) {
+    const auto *Op = AArch64PRFM::lookupPRFMByName(Hint);
+    if (!Op || Op->Encoding >= 24)
+      return std::nullopt;
+    return Op->Encoding;
+  }
+
+  static unsigned getPrefetchImmOpcode(int64_t Offset) {
+    if (Offset >= 0 && Offset <= 32760 && Offset % 8 == 0)
+      return AArch64::PRFMui;
+    return isInt<9>(Offset) ? unsigned(AArch64::PRFUMi) : 0u;
+  }
+
+  static void emitPrefetch(MCPhysReg Base, int64_t Offset, unsigned Hint,
+                           SmallVectorImpl<MCInst> &Code) {
+    const unsigned Opcode = getPrefetchImmOpcode(Offset);
+    assert(Opcode && "Prefetch offset must be encodable");
+    Code.push_back(MCInstBuilder(Opcode).addImm(Hint).addReg(Base).addImm(
+        Opcode == AArch64::PRFMui ? Offset / 8 : Offset));
+  }
+
+  /// Form a future address, retaining directly encodable operands when
+  /// possible. MaterializeAddress forces the complete address into Scratch[0].
+  std::optional<LoopMemoryAccess>
+  materializeLoopAddress(const LoopMemoryAccess &A, int64_t BaseDelta,
+                         int64_t IndexDelta, ArrayRef<MCPhysReg> Scratch,
+                         SmallVectorImpl<MCInst> &Code,
+                         bool MaterializeAddress) const {
+    auto Future = A;
+    uint64_t Offset = uint64_t(BaseDelta) + uint64_t(A.Offset);
+    // Fold X-index deltas into the offset. W indices must wrap before
+    // extension.
+    if (A.Index && A.IndexBits == 64) {
+      Offset += uint64_t(IndexDelta) << A.Shift;
+      IndexDelta = 0;
+    }
+    Future.Offset = Offset;
+    const bool Immediate =
+        getPrefetchImmOpcode(Offset) &&
+        getPrefetchImmOpcode(Offset + (A.Elements - 1) * A.Size);
+    if (!MaterializeAddress &&
+        ((!A.Index && Immediate) ||
+         (A.Index && !IndexDelta && !Offset && (A.Shift == 0 || A.Shift == 3))))
+      return Future;
+    if (Scratch.empty() || (A.Index && IndexDelta && Scratch.size() < 2))
+      return std::nullopt;
+    const MCPhysReg Address = Scratch[0];
+    MCPhysReg Index = A.Index;
+    if (Index && IndexDelta) {
+      Index = getAliasSized(Scratch[1], A.IndexBits / 8);
+      emitAddDelta(Index, A.Index, IndexDelta, Code);
+    }
+    auto AddIndex = [&](MCPhysReg Base) {
+      if (A.IndexBits == 32 || Base == AArch64::SP)
+        Code.push_back(MCInstBuilder(A.IndexBits == 32 ? AArch64::ADDXrx
+                                                       : AArch64::ADDXrx64)
+                           .addReg(Address)
+                           .addReg(Base)
+                           .addReg(Index)
+                           .addImm(AArch64_AM::getArithExtendImm(
+                               A.IndexBits == 64 ? AArch64_AM::UXTX
+                               : A.SignExtend    ? AArch64_AM::SXTW
+                                                 : AArch64_AM::UXTW,
+                               A.Shift)));
+      else
+        Code.push_back(
+            MCInstBuilder(AArch64::ADDXrs)
+                .addReg(Address)
+                .addReg(Base)
+                .addReg(Index)
+                .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSL, A.Shift)));
+    };
+    if (Index && Immediate && (!MaterializeAddress || !Offset)) {
+      AddIndex(A.Base);
+    } else {
+      emitAddDelta(Address, A.Base, Offset, Code);
+      if (Index)
+        AddIndex(Address);
+      Offset = 0;
+    }
+    Future.Base = Address;
+    Future.Index = 0;
+    Future.Offset = Offset;
+    return Future;
+  }
+
+public:
+  std::optional<LoopMemoryAccess>
+  analyzeLoopMemory(const MCInst &Inst) const override {
+    LoopMemoryAccess A;
+    unsigned BaseOp = 1, OffsetOp = 2, Scale = 0;
+    bool RegisterOffset = false, PostIndex = false;
+    switch (Inst.getOpcode()) {
+      // clang-format off
+#define ACCESS(NAME, BYTES, LOG)                                               \
+    case AArch64::NAME##ui: A.Size = BYTES; Scale = LOG; break;               \
+    case AArch64::NAME##roW: A.IndexBits = 32; [[fallthrough]];               \
+    case AArch64::NAME##roX:                                                  \
+      A.Size = BYTES; A.Shift = LOG; RegisterOffset = true; break;            \
+    case AArch64::NAME##post: PostIndex = true; [[fallthrough]];              \
+    case AArch64::NAME##pre:                                                   \
+      A.Size = BYTES; BaseOp = 2; OffsetOp = 3;                             \
+      A.HasWriteback = true; break;
+      ACCESS(LDRBB, 1, 0)
+      ACCESS(LDRHH, 2, 1)
+      ACCESS(LDRW, 4, 2)
+      ACCESS(LDRX, 8, 3)
+      ACCESS(LDRB, 1, 0)
+      ACCESS(LDRH, 2, 1)
+      ACCESS(LDRS, 4, 2)
+      ACCESS(LDRD, 8, 3)
+      ACCESS(LDRQ, 16, 4)
+      ACCESS(LDRSBW, 1, 0)
+      ACCESS(LDRSBX, 1, 0)
+      ACCESS(LDRSHW, 2, 1)
+      ACCESS(LDRSHX, 2, 1)
+      ACCESS(LDRSW, 4, 2)
+#undef ACCESS
+#define UNSCALED(NAME, BYTES)                                                  \
+    case AArch64::NAME##i: A.Size = BYTES; break;
+      UNSCALED(LDURBB, 1)
+      UNSCALED(LDURHH, 2)
+      UNSCALED(LDURW, 4)
+      UNSCALED(LDURX, 8)
+      UNSCALED(LDURB, 1)
+      UNSCALED(LDURH, 2)
+      UNSCALED(LDURS, 4)
+      UNSCALED(LDURD, 8)
+      UNSCALED(LDURQ, 16)
+      UNSCALED(LDURSBW, 1)
+      UNSCALED(LDURSBX, 1)
+      UNSCALED(LDURSHW, 2)
+      UNSCALED(LDURSHX, 2)
+      UNSCALED(LDURSW, 4)
+#undef UNSCALED
+#define PAIR(NAME, BYTES, LOG)                                                 \
+    case AArch64::NAME##post: PostIndex = true; [[fallthrough]];              \
+    case AArch64::NAME##pre:                                                 \
+      BaseOp = 3; OffsetOp = 4; A.HasWriteback = true; [[fallthrough]];       \
+    case AArch64::NAME##i:                                                     \
+      A.Size = BYTES; A.Elements = 2; Scale = LOG;                            \
+      if (BaseOp == 1) { BaseOp = 2; OffsetOp = 3; } break;
+      PAIR(LDPW, 4, 2)
+      PAIR(LDPX, 8, 3)
+      PAIR(LDPS, 4, 2)
+      PAIR(LDPD, 8, 3)
+      PAIR(LDPQ, 16, 4)
+      PAIR(LDPSW, 4, 2)
+#undef PAIR
+    default:
+      return std::nullopt;
+    }
+    // clang-format on
+    A.Base = Inst.getOperand(BaseOp).getReg();
+    if (RegisterOffset) {
+      A.Index = Inst.getOperand(2).getReg();
+      A.SignExtend = Inst.getOperand(3).getImm();
+      if (!Inst.getOperand(4).getImm())
+        A.Shift = 0;
+    } else {
+      if (!Inst.getOperand(OffsetOp).isImm())
+        return std::nullopt; // Relocation-dependent address.
+      A.Offset = Inst.getOperand(OffsetOp).getImm() * (int64_t(1) << Scale);
+      if (A.HasWriteback) {
+        A.Writeback = A.Offset;
+        if (PostIndex)
+          A.Offset = 0;
+        // A load defining its own address is not an affine recurrence.
+        for (unsigned I = 1; I < BaseOp; ++I)
+          if (getAliases(A.Base).test(Inst.getOperand(I).getReg()))
+            return std::nullopt;
+      }
+    }
+    A.Dest = Inst.getOperand(A.HasWriteback ? 1 : 0).getReg();
+    if (A.Dest == AArch64::XZR)
+      A.Dest = 0;
+    return A;
+  }
+
+  bool getLoopRegisterUpdate(const MCInst &Inst, MCPhysReg Reg,
+                             int64_t &Step) const override {
+    switch (Inst.getOpcode()) {
+    case AArch64::ADDXri:
+    case AArch64::SUBXri:
+    case AArch64::ADDSXri:
+    case AArch64::SUBSXri:
+    case AArch64::ADDWri:
+    case AArch64::SUBWri:
+    case AArch64::ADDSWri:
+    case AArch64::SUBSWri: {
+      if (Inst.getOperand(0).getReg() != Reg ||
+          Inst.getOperand(1).getReg() != Reg || !Inst.getOperand(2).isImm())
+        return false;
+      Step = Inst.getOperand(2).getImm() << Inst.getOperand(3).getImm();
+      if (Inst.getOpcode() == AArch64::SUBXri ||
+          Inst.getOpcode() == AArch64::SUBSXri ||
+          Inst.getOpcode() == AArch64::SUBWri ||
+          Inst.getOpcode() == AArch64::SUBSWri)
+        Step = -Step;
+      return true;
+    }
+    default:
+      break;
+    }
+    if (auto A = analyzeLoopMemory(Inst)) {
+      if (A->Base == Reg && A->HasWriteback) {
+        Step = A->Writeback;
+        return true;
+      }
+    }
+    // Store writeback has the same tied base operand as load writeback.
+    unsigned BaseOp = 0, Scale = 0;
+    switch (Inst.getOpcode()) {
+      // clang-format off
+#define STORE(NAME)                                                           \
+    case AArch64::NAME##pre: case AArch64::NAME##post: BaseOp = 2; break;
+      STORE(STRBB)
+      STORE(STRHH)
+      STORE(STRW)
+      STORE(STRX)
+      STORE(STRB)
+      STORE(STRH)
+      STORE(STRS)
+      STORE(STRD)
+      STORE(STRQ)
+#undef STORE
+#define STORE_PAIR(NAME, LOG)                                                  \
+    case AArch64::NAME##pre: case AArch64::NAME##post:                        \
+      BaseOp = 3; Scale = LOG; break;
+      STORE_PAIR(STPW, 2)
+      STORE_PAIR(STPX, 3)
+      STORE_PAIR(STPS, 2)
+      STORE_PAIR(STPD, 3)
+      STORE_PAIR(STPQ, 4)
+#undef STORE_PAIR
+    default:
+      return false;
+    }
+    // clang-format on
+    if (Inst.getOperand(0).getReg() != Reg ||
+        Inst.getOperand(BaseOp).getReg() != Reg ||
+        !Inst.getOperand(BaseOp + 1).isImm())
+      return false;
+    for (unsigned I = 1; I < BaseOp; ++I)
+      if (getAliases(Reg).test(Inst.getOperand(I).getReg()))
+        return false;
+    Step = Inst.getOperand(BaseOp + 1).getImm() * (int64_t(1) << Scale);
+    return true;
+  }
+
+  std::optional<LoopRegisterAssignment>
+  analyzeLoopRegisterAssignment(const MCInst &Inst,
+                                MCPhysReg Reg) const override {
+    LoopRegisterAssignment A;
+    switch (Inst.getOpcode()) {
+    case AArch64::ADDXri:
+    case AArch64::SUBXri:
+      if (!Inst.getOperand(2).isImm())
+        return std::nullopt;
+      A.Base = Inst.getOperand(1).getReg();
+      break;
+    case AArch64::ORRXrs:
+      if (Inst.getOperand(1).getReg() != AArch64::XZR ||
+          Inst.getOperand(3).getImm())
+        return std::nullopt;
+      A.Base = Inst.getOperand(2).getReg();
+      break;
+    case AArch64::ADDXrs:
+    case AArch64::SUBXrs: {
+      const unsigned Shift = Inst.getOperand(3).getImm();
+      if (AArch64_AM::getShiftType(Shift) != AArch64_AM::LSL)
+        return std::nullopt;
+      A.Base = Inst.getOperand(1).getReg();
+      A.Index = Inst.getOperand(2).getReg();
+      A.Shift = AArch64_AM::getShiftValue(Shift);
+      A.SubtractIndex = Inst.getOpcode() == AArch64::SUBXrs;
+      break;
+    }
+    case AArch64::UBFMXri: {
+      const unsigned Rotate = Inst.getOperand(2).getImm();
+      const unsigned Mask = Inst.getOperand(3).getImm();
+      if (Mask == 63 || Rotate != Mask + 1)
+        return std::nullopt; // Only the LSL alias is affine.
+      A.Index = Inst.getOperand(1).getReg();
+      A.Shift = 63 - Mask;
+      break;
+    }
+    default:
+      return std::nullopt;
+    }
+    if (Inst.getOperand(0).getReg() != Reg)
+      return std::nullopt;
+    if (A.Base == AArch64::XZR)
+      A.Base = 0;
+    if (A.Index == AArch64::XZR)
+      A.Index = 0;
+    return A;
+  }
+
+  bool isLoopPrefetchBarrier(const MCInst &Inst) const override {
+    if (isCFI(Inst) || isNoop(Inst))
+      return false;
+    const MCInstrDesc &Desc = Info->get(Inst.getOpcode());
+    if (isCall(Inst) || isReturn(Inst) || isIndirectBranch(Inst) ||
+        Desc.hasUnmodeledSideEffects() ||
+        (Desc.TSFlags & AArch64::SMEMatrixTypeMask) ||
+        isAArch64ExclusiveLoad(Inst) || isAArch64ExclusiveStore(Inst))
+      return true;
+    // SVE/SME registers are outside the scalar/SIMD analysis contract.
+    for (const MCOperand &Operand : MCPlus::primeOperands(Inst)) {
+      if (!Operand.isReg())
+        continue;
+      const MCRegister Reg = Operand.getReg();
+      if (RegInfo->getRegClass(AArch64::ZPRRegClassID).contains(Reg) ||
+          RegInfo->getRegClass(AArch64::PPRRegClassID).contains(Reg))
+        return true;
+    }
+    // Use explicit opcode classifications. Name prefixes also match SVE and
+    // authenticated loads, whose legality is not established here.
+    if (Desc.mayLoad() || Desc.mayStore())
+      return !mayLoad(Inst) && !mayStore(Inst) && !analyzeLoopMemory(Inst);
+    return false;
+  }
+
+  bool isPrefetchHint(StringRef Hint) const override {
+    return getPrefetchHintEncoding(Hint).has_value();
+  }
+
+private:
+  MCPhysReg matchLoopCountDown(const MCInst &Update,
+                               const MCInst &Backedge) const {
+    const bool Is32 = Update.getOpcode() == AArch64::SUBSWri;
+    if ((!Is32 && Update.getOpcode() != AArch64::SUBSXri) ||
+        Backedge.getOpcode() != AArch64::Bcc ||
+        Backedge.getOperand(0).getImm() != AArch64CC::NE ||
+        !Update.getOperand(2).isImm() || Update.getOperand(2).getImm() != 1 ||
+        Update.getOperand(3).getImm())
+      return 0;
+    const MCPhysReg Count = Update.getOperand(0).getReg();
+    if (Update.getOperand(1).getReg() != Count)
+      return 0;
+    return Count;
+  }
+
+public:
+  MCPhysReg getLoopCountDownReg(const MCInst &Update, const MCInst &Backedge,
+                                const MCInst &Entry,
+                                bool &EntryOnZero) const override {
+    MCPhysReg Count = matchLoopCountDown(Update, Backedge);
+    if (!Count)
+      return 0;
+    const bool Is32 = Update.getOpcode() == AArch64::SUBSWri;
+    EntryOnZero = Entry.getOpcode() == (Is32 ? AArch64::CBZW : AArch64::CBZX);
+    if ((!EntryOnZero &&
+         Entry.getOpcode() != (Is32 ? AArch64::CBNZW : AArch64::CBNZX)) ||
+        Entry.getOperand(0).getReg() != Count)
+      return 0;
+    return Count;
+  }
+
+  std::optional<LoopConstantCount>
+  getLoopConstantCount(const MCInst &Init, const MCInst &Update,
+                       const MCInst &Backedge) const override {
+    MCPhysReg Reg = matchLoopCountDown(Update, Backedge);
+    const bool Is32 = Update.getOpcode() == AArch64::SUBSWri;
+    if (!Reg ||
+        Init.getOpcode() != (Is32 ? AArch64::MOVZWi : AArch64::MOVZXi) ||
+        Init.getOperand(0).getReg() != Reg || !Init.getOperand(1).isImm())
+      return std::nullopt;
+    uint64_t Count = uint64_t(Init.getOperand(1).getImm())
+                     << Init.getOperand(2).getImm();
+    if (Is32)
+      Count = uint32_t(Count);
+    if (!Count)
+      return std::nullopt;
+    return LoopConstantCount{Reg, Count};
+  }
+
+  bool createLoopIndirectPrefetch(
+      const LoopIndirectAccess &Source, const LoopMemoryAccess &Target,
+      unsigned Distance, ArrayRef<MCPhysReg> Scratch, StringRef Hint,
+      const MCSymbol *Skip, MCContext *Ctx, SmallVectorImpl<MCInst> &Code,
+      SmallVectorImpl<MCInst> &Guard) const override {
+    if (Scratch.size() < 2 || !Distance || Distance > MaxLoopPrefetchDistance)
+      return false;
+    unsigned LoadOpcode, UnscaledOpcode, ResultSize;
+    switch (Source.IndexLoad->getOpcode()) {
+      // clang-format off
+#define INDEX_LOAD(NAME, UNSCALED, BYTES)                                      \
+    case AArch64::NAME##ui: case AArch64::NAME##roW:                          \
+    case AArch64::NAME##roX: case AArch64::NAME##pre:                         \
+    case AArch64::NAME##post: case AArch64::UNSCALED:                         \
+      LoadOpcode = AArch64::NAME##ui; UnscaledOpcode = AArch64::UNSCALED;     \
+      ResultSize = BYTES; break;
+      INDEX_LOAD(LDRW, LDURWi, 4)
+      INDEX_LOAD(LDRX, LDURXi, 8)
+      INDEX_LOAD(LDRSW, LDURSWi, 8)
+#undef INDEX_LOAD
+    default:
+      return false;
+    }
+    // clang-format on
+    const bool Is32 =
+        RegInfo->getRegClass(AArch64::GPR32RegClassID).contains(Source.Count);
+    MCPhysReg Work = getAliasSized(Scratch[0], Is32 ? 4 : 8);
+    emitAddDelta(Work, Source.Count, -uint64_t(Distance + 1), Guard);
+    // Distance + 1 is positive and below the sign bit. Borrow is exactly the
+    // top bit of (Count - (Distance + 1)) & ~Count, including large counts.
+    // All operations preserve NZCV and the original count.
+    Guard.push_back(MCInstBuilder(Is32 ? AArch64::BICWrs : AArch64::BICXrs)
+                        .addReg(Work)
+                        .addReg(Work)
+                        .addReg(Source.Count)
+                        .addImm(0));
+    MCInst Branch = MCInstBuilder(Is32 ? AArch64::TBNZW : AArch64::TBNZX)
+                        .addReg(Work)
+                        .addImm(Is32 ? 31 : 63);
+    setLoopBranchTarget(Branch, Skip, *Ctx);
+    Guard.push_back(Branch);
+
+    const MCPhysReg Loaded = getAliasSized(Scratch[0], ResultSize);
+    int64_t Offset;
+    if (AddOverflow(Source.Address.Offset, Source.BaseDelta, Offset))
+      return false;
+    if (!Source.Address.Index && Offset >= 0 &&
+        Offset % Source.Address.Size == 0 &&
+        isUInt<12>(Offset / Source.Address.Size)) {
+      Code.push_back(MCInstBuilder(LoadOpcode)
+                         .addReg(Loaded)
+                         .addReg(Source.Address.Base)
+                         .addImm(Offset / Source.Address.Size));
+    } else if (!Source.Address.Index && isInt<9>(Offset)) {
+      Code.push_back(MCInstBuilder(UnscaledOpcode)
+                         .addReg(Loaded)
+                         .addReg(Source.Address.Base)
+                         .addImm(Offset));
+    } else {
+      auto Address = materializeLoopAddress(Source.Address, Source.BaseDelta,
+                                            Source.IndexDelta, Scratch, Code,
+                                            /*MaterializeAddress=*/true);
+      if (!Address)
+        return false;
+      Code.push_back(MCInstBuilder(LoadOpcode)
+                         .addReg(Loaded)
+                         .addReg(Address->Base)
+                         .addImm(0));
+    }
+    auto Future = Target;
+    Future.Index = getAliasSized(Scratch[0], Target.IndexBits / 8);
+    const MCPhysReg AddressScratch[] = {Scratch[1], Scratch[0]};
+    return createLoopPrefetch(Future, 0, 0, AddressScratch, Hint, Code,
+                              /*MaterializeAddress=*/false);
+  }
+
+  bool createLoopPrefetch(const LoopMemoryAccess &A, int64_t BaseDelta,
+                          int64_t IndexDelta, ArrayRef<MCPhysReg> Scratch,
+                          StringRef Hint, SmallVectorImpl<MCInst> &Code,
+                          bool MaterializeAddress) const override {
+    auto Encoding = getPrefetchHintEncoding(Hint);
+    if (!Encoding)
+      return false;
+    auto Address = materializeLoopAddress(A, BaseDelta, IndexDelta, Scratch,
+                                          Code, MaterializeAddress);
+    if (!Address)
+      return false;
+    if (Address->Index) {
+      Code.push_back(MCInstBuilder(Address->IndexBits == 32 ? AArch64::PRFMroW
+                                                            : AArch64::PRFMroX)
+                         .addImm(*Encoding)
+                         .addReg(Address->Base)
+                         .addReg(Address->Index)
+                         .addImm(Address->SignExtend)
+                         .addImm(Address->Shift != 0));
+      return true;
+    }
+    for (unsigned Element = 0; Element < Address->Elements; ++Element)
+      emitPrefetch(Address->Base,
+                   uint64_t(Address->Offset) + Element * Address->Size,
+                   *Encoding, Code);
+    return true;
+  }
+
+  bool createLoopPrefetchSpill(ArrayRef<MCPhysReg> Registers, MCInst &Save,
+                               MCInst &Restore) const override {
+    if (Registers.empty() || Registers.size() > 2)
+      return false;
+    for (MCPhysReg Reg : Registers)
+      if (!Reg || getAliasSized(Reg, 8) != Reg || Reg == AArch64::SP ||
+          Reg == AArch64::XZR)
+        return false;
+    if (Registers.size() == 2) {
+      if (Registers[0] == Registers[1])
+        return false;
+      createPushRegisters(Save, Registers[0], Registers[1]);
+      createPopRegisters(Restore, Registers[0], Registers[1]);
+      return true;
+    }
+    Save = MCInstBuilder(AArch64::STRXpre)
+               .addReg(AArch64::SP)
+               .addReg(Registers[0])
+               .addReg(AArch64::SP)
+               .addImm(-16);
+    Restore = MCInstBuilder(AArch64::LDRXpost)
+                  .addReg(AArch64::SP)
+                  .addReg(Registers[0])
+                  .addReg(AArch64::SP)
+                  .addImm(16);
+    return true;
+  }
+
+  bool createLoopPrefetchGuard(MCPhysReg Address, MCPhysReg Scratch,
+                               int64_t Step, unsigned LineSize,
+                               const MCSymbol *Skip, MCContext *Ctx,
+                               SmallVectorImpl<MCInst> &Code) const override {
+    const uint64_t Magnitude = AbsoluteValue(Step);
+    if (!Magnitude || Magnitude >= LineSize || LineSize > 4096 ||
+        !isPowerOf2_32(LineSize))
+      return false;
+    if (isPowerOf2_64(Magnitude)) {
+      // Select one stride-sized portion of each line, including unaligned
+      // streams. Testing only the low log2(LineSize) bits handles W wrap too.
+      const uint64_t Mask = (LineSize - 1) & ~(Magnitude - 1);
+      Code.push_back(MCInstBuilder(AArch64::ANDXri)
+                         .addReg(Scratch)
+                         .addReg(Address)
+                         .addImm(AArch64_AM::encodeLogicalImmediate(Mask, 64)));
+    } else {
+      // Compare with the virtual preceding address. The first partial line
+      // need not be prefetched; no original memory access is moved or added.
+      emitAddDelta(Scratch, Address, -uint64_t(Step), Code);
+      Code.push_back(MCInstBuilder(AArch64::EORXrs)
+                         .addReg(Scratch)
+                         .addReg(Scratch)
+                         .addReg(Address)
+                         .addImm(0));
+      Code.push_back(MCInstBuilder(AArch64::UBFMXri)
+                         .addReg(Scratch)
+                         .addReg(Scratch)
+                         .addImm(Log2_32(LineSize))
+                         .addImm(63));
+    }
+    MCInst Branch =
+        MCInstBuilder(isPowerOf2_64(Magnitude) ? AArch64::CBNZX : AArch64::CBZX)
+            .addReg(Scratch);
+    setLoopBranchTarget(Branch, Skip, *Ctx);
+    Code.push_back(Branch);
+    return true;
   }
 
   void createIndirectCallInst(MCInst &Inst, bool IsTailCall,

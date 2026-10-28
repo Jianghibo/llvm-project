@@ -26,6 +26,7 @@
 #include "bolt/Rewrite/RewriteInstance.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
+#include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInstBuilder.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/SubtargetFeature.h"
@@ -910,6 +911,251 @@ TEST_P(MCPlusBuilderTester, AArch64_isCleanReg) {
                                            *BC->Ctx.get()))
           .addImm(48);
   ASSERT_FALSE(BC->MIB->isCleanReg(MOVZXiWithExpr));
+}
+
+TEST_P(MCPlusBuilderTester, AArch64_IndirectResultRegister) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  const BitVector Params = BC->MIB->getRegsUsedAsParams();
+  EXPECT_TRUE(Params.test(AArch64::X8));
+  EXPECT_TRUE(Params.test(AArch64::W8));
+
+  BitVector LiveOut(BC->MRI->getNumRegs());
+  BC->MIB->getDefaultLiveOut(LiveOut);
+  EXPECT_FALSE(LiveOut.test(AArch64::X8));
+  EXPECT_FALSE(LiveOut.test(AArch64::W8));
+  EXPECT_TRUE(LiveOut.test(AArch64::X0));
+}
+
+TEST_P(MCPlusBuilderTester, AArch64_LoadClassification) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  auto &MIB = *BC->MIB;
+  MCInst Hint = MCInstBuilder(AArch64::HINT).addImm(1);
+  // The descriptor also marks HINT as a load. Memory analyses must not
+  // interpret its immediate operand as a base register.
+  EXPECT_FALSE(MIB.mayLoad(Hint));
+  EXPECT_FALSE(MIB.getAuthCheckedReg(Hint, /*MayOverwrite=*/false));
+  EXPECT_FALSE(MIB.getAuthCheckedReg(Hint, /*MayOverwrite=*/true));
+  MCInst Pair = MCInstBuilder(AArch64::LDPXi)
+                    .addReg(AArch64::X1)
+                    .addReg(AArch64::X2)
+                    .addReg(AArch64::X0)
+                    .addImm(0);
+  EXPECT_TRUE(MIB.mayLoad(Pair));
+}
+
+TEST_P(MCPlusBuilderTester, AArch64_GPRAliases) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  auto &MIB = *BC->MIB;
+  for (MCPhysReg Reg : {AArch64::X9, AArch64::W9}) {
+    EXPECT_EQ(MIB.getAliasSized(Reg, 4), AArch64::W9);
+    EXPECT_EQ(MIB.getAliasSized(Reg, 8), AArch64::X9);
+    EXPECT_EQ(MIB.getAliasSized(Reg, 1), 0);
+    EXPECT_EQ(MIB.getAliasSized(Reg, 16), 0);
+  }
+  EXPECT_EQ(MIB.getAliasSized(AArch64::Q9, 8), 0);
+}
+
+TEST_P(MCPlusBuilderTester, LoopPrefetchEncoding) {
+  if (GetParam() != Triple::aarch64)
+    GTEST_SKIP();
+  auto &MIB = *BC->MIB;
+  MCInst Load = MCInstBuilder(AArch64::LDRQroW)
+                    .addReg(AArch64::Q0)
+                    .addReg(AArch64::X0)
+                    .addReg(AArch64::W1)
+                    .addImm(1)
+                    .addImm(1);
+  MIB.addAnnotation(Load, "test", 7u);
+  auto Address = MIB.analyzeLoopMemory(Load);
+  ASSERT_TRUE(Address);
+  EXPECT_EQ(Address->Size, 16u);
+  EXPECT_EQ(Address->Shift, 4u);
+  EXPECT_EQ(Address->IndexBits, 32u);
+  EXPECT_TRUE(Address->SignExtend);
+  SmallVector<MCInst, 8> Code;
+  const MCPhysReg Scratch[] = {AArch64::X9, AArch64::X10};
+  ASSERT_TRUE(MIB.createLoopPrefetch(*Address, 0, 1, Scratch, "pldl2strm", Code,
+                                     /*MaterializeAddress=*/false));
+  // A future W index must wrap before extension, even with a 64-bit address.
+  EXPECT_EQ(Code.front().getOpcode(), unsigned(AArch64::ADDWri));
+  EXPECT_EQ(Code.front().getOperand(0).getReg(), unsigned(AArch64::W10));
+  EXPECT_EQ(Code.back().getOperand(0).getImm(), 3);
+
+  struct ScaledLoad {
+    unsigned Opcode;
+    MCPhysReg Dest;
+    unsigned Size, Shift;
+  };
+  for (const ScaledLoad &L :
+       {ScaledLoad{AArch64::LDRBBroX, AArch64::W3, 1, 0},
+        ScaledLoad{AArch64::LDRHHroX, AArch64::W3, 2, 1},
+        ScaledLoad{AArch64::LDRWroX, AArch64::W3, 4, 2},
+        ScaledLoad{AArch64::LDRSroX, AArch64::S3, 4, 2},
+        ScaledLoad{AArch64::LDRXroX, AArch64::X3, 8, 3},
+        ScaledLoad{AArch64::LDRDroX, AArch64::D3, 8, 3},
+        ScaledLoad{AArch64::LDRQroX, AArch64::Q3, 16, 4}}) {
+    Load = MCInstBuilder(L.Opcode)
+               .addReg(L.Dest)
+               .addReg(AArch64::X0)
+               .addReg(AArch64::X1)
+               .addImm(0)
+               .addImm(1);
+    Address = MIB.analyzeLoopMemory(Load);
+    ASSERT_TRUE(Address);
+    EXPECT_EQ(Address->Size, L.Size);
+    EXPECT_EQ(Address->Shift, L.Shift);
+    Code.clear();
+    ASSERT_TRUE(MIB.createLoopPrefetch(*Address, 0, 1, Scratch, "pldl1keep",
+                                       Code, /*MaterializeAddress=*/false));
+    EXPECT_EQ(Code.front().getOpcode(), unsigned(AArch64::ADDXrs));
+    EXPECT_EQ(Code.front().getOperand(3).getImm(), L.Shift);
+    const MCInst &PF = Code.back();
+    const unsigned Scale = PF.getOpcode() == AArch64::PRFMui ? 8 : 1;
+    EXPECT_EQ(PF.getOperand(2).getImm() * Scale, L.Size);
+  }
+  for (unsigned Opcode : {AArch64::LDPXpre, AArch64::LDPXpost}) {
+    Load = MCInstBuilder(Opcode)
+               .addReg(AArch64::X0)
+               .addReg(AArch64::X2)
+               .addReg(AArch64::X3)
+               .addReg(AArch64::X0)
+               .addImm(2);
+    Address = MIB.analyzeLoopMemory(Load);
+    ASSERT_TRUE(Address);
+    EXPECT_EQ(Address->Writeback, 16);
+    EXPECT_EQ(Address->Offset, Opcode == AArch64::LDPXpre ? 16 : 0);
+    EXPECT_EQ(Address->Elements, 2u);
+  }
+  MCSymbol *Skip = BC->Ctx->createTempSymbol();
+  MCInst IndexLoad = MCInstBuilder(AArch64::LDRWpost)
+                         .addReg(AArch64::X0)
+                         .addReg(AArch64::W3)
+                         .addReg(AArch64::X0)
+                         .addImm(4);
+  MCInst IndirectLoad = MCInstBuilder(AArch64::LDRXroW)
+                            .addReg(AArch64::X4)
+                            .addReg(AArch64::X1)
+                            .addReg(AArch64::W3)
+                            .addImm(0)
+                            .addImm(1);
+  // Interpret the emitted bounds guard at the unsigned tail and sign-bit
+  // boundaries. The guard must skip all extra memory accesses for Count <= D.
+  for (unsigned Bits : {32u, 64u}) {
+    const MCPhysReg Count = Bits == 32 ? AArch64::W2 : AArch64::X2;
+    const MCPhysReg Work = Bits == 32 ? AArch64::W9 : AArch64::X9;
+    const uint64_t Mask = Bits == 32 ? UINT32_MAX : UINT64_MAX;
+    for (unsigned Distance :
+         {4u, 64u, MCPlusBuilder::MaxLoopPrefetchDistance}) {
+      MCPlusBuilder::LoopIndirectAccess Source;
+      Source.IndexLoad = &IndexLoad;
+      Source.Address = *MIB.analyzeLoopMemory(IndexLoad);
+      Source.Address.Offset = -4;
+      Source.BaseDelta = int64_t(Distance) * 4;
+      Source.Count = Count;
+      SmallVector<MCInst, 8> IndirectCode, Guard;
+      ASSERT_TRUE(MIB.createLoopIndirectPrefetch(
+          Source, *MIB.analyzeLoopMemory(IndirectLoad), Distance, Scratch,
+          "pldl1keep", Skip, BC->Ctx.get(), IndirectCode, Guard));
+      for (uint64_t Remaining :
+           {uint64_t(0), uint64_t(Distance), uint64_t(Distance) + 1,
+            uint64_t(1) << (Bits - 1), Mask}) {
+        uint64_t Value = 0;
+        bool Skipped = false;
+        auto Read = [&](MCPhysReg Reg) {
+          if (Reg == Count)
+            return Remaining;
+          EXPECT_EQ(Reg, Work);
+          return Value;
+        };
+        for (const MCInst &MI : Guard) {
+          BitVector Written(BC->MRI->getNumRegs());
+          MIB.getWrittenRegs(MI, Written);
+          EXPECT_FALSE(Written.test(AArch64::NZCV));
+          EXPECT_FALSE(Written.test(Count));
+          if (MI.getOpcode() == AArch64::SUBWri ||
+              MI.getOpcode() == AArch64::SUBXri)
+            Value = Read(MI.getOperand(1).getReg()) -
+                    (uint64_t(MI.getOperand(2).getImm())
+                     << MI.getOperand(3).getImm());
+          else if (MI.getOpcode() == AArch64::BICWrs ||
+                   MI.getOpcode() == AArch64::BICXrs)
+            Value = Read(MI.getOperand(1).getReg()) &
+                    ~Read(MI.getOperand(2).getReg());
+          else {
+            EXPECT_EQ(MI.getOpcode(),
+                      unsigned(Bits == 32 ? AArch64::TBNZW : AArch64::TBNZX));
+            Skipped =
+                (Read(MI.getOperand(0).getReg()) >> MI.getOperand(1).getImm()) &
+                1;
+          }
+          Value &= Mask;
+        }
+        EXPECT_EQ(Skipped, Remaining <= Distance);
+      }
+    }
+  }
+  MCInst Store = MCInstBuilder(AArch64::STRXpost)
+                     .addReg(AArch64::X0)
+                     .addReg(AArch64::X2)
+                     .addReg(AArch64::X0)
+                     .addImm(8);
+  int64_t Update;
+  ASSERT_TRUE(MIB.getLoopRegisterUpdate(Store, AArch64::X0, Update));
+  EXPECT_EQ(Update, 8);
+  Store.getOperand(3) =
+      MCOperand::createExpr(MCSymbolRefExpr::create(Skip, *BC->Ctx));
+  EXPECT_FALSE(MIB.getLoopRegisterUpdate(Store, AArch64::X0, Update));
+  for (int64_t Step : {8, -8, 3, -3}) {
+    SmallVector<MCInst, 4> Guard;
+    ASSERT_TRUE(MIB.createLoopPrefetchGuard(AArch64::X9, AArch64::X10, Step, 64,
+                                            Skip, BC->Ctx.get(), Guard));
+    EXPECT_EQ(Guard.size(), (Step == 8 || Step == -8) ? 2u : 4u);
+    EXPECT_EQ(
+        Guard.back().getOpcode(),
+        unsigned((Step == 8 || Step == -8) ? AArch64::CBNZX : AArch64::CBZX));
+    BitVector Written(BC->MRI->getNumRegs());
+    for (const MCInst &MI : Guard)
+      MIB.getWrittenRegs(MI, Written);
+    EXPECT_FALSE(Written.test(AArch64::NZCV));
+    EXPECT_FALSE(Written.test(AArch64::X9));
+    EXPECT_TRUE(Written.test(AArch64::X10));
+  }
+  MCPlusBuilder::LoopMemoryAccess Immediate;
+  Immediate.Base = AArch64::X0;
+  Immediate.Size = 8;
+  for (int64_t Offset : {32760, -256, 32768, -257}) {
+    Immediate.Offset = Offset;
+    Code.clear();
+    const bool Encodable = Offset == 32760 || Offset == -256;
+    EXPECT_EQ(MIB.createLoopPrefetch(Immediate, 0, 0, {}, "pldl1keep", Code,
+                                     /*MaterializeAddress=*/false),
+              Encodable);
+    if (!Encodable)
+      continue;
+    ASSERT_EQ(Code.size(), 1u);
+    EXPECT_EQ(Code.front().getOpcode(),
+              unsigned(Offset == 32760 ? AArch64::PRFMui : AArch64::PRFUMi));
+    EXPECT_EQ(Code.front().getOperand(2).getImm(),
+              Offset == 32760 ? 4095 : -256);
+  }
+
+  // A logical immediate should use the existing constant materializer rather
+  // than a MOVZ/MOVK sequence that would consume a larger instruction budget.
+  Immediate.Offset = 0x0001000100010001;
+  Code.clear();
+  ASSERT_TRUE(MIB.createLoopPrefetch(Immediate, 0, 0, Scratch, "pldl1keep",
+                                     Code, /*MaterializeAddress=*/false));
+  ASSERT_EQ(Code.size(), 3u);
+  EXPECT_EQ(Code.front().getOpcode(), unsigned(AArch64::ORRXri));
+  EXPECT_EQ(Code.back().getOpcode(), unsigned(AArch64::PRFMui));
+  BitVector Written(BC->MRI->getNumRegs());
+  for (const MCInst &MI : Code)
+    MIB.getWrittenRegs(MI, Written);
+  EXPECT_FALSE(Written.test(AArch64::NZCV));
+  EXPECT_FALSE(Written.test(AArch64::X0));
 }
 
 #endif // AARCH64_AVAILABLE

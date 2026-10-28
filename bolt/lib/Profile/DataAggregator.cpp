@@ -46,7 +46,7 @@ using namespace bolt;
 
 namespace opts {
 
-static cl::opt<bool>
+cl::opt<bool>
     BasicAggregation("basic-events",
                      cl::desc("aggregate basic events (without brstack info)"),
                      cl::cat(AggregatorCategory));
@@ -55,7 +55,7 @@ static cl::alias BasicAggregationAlias("ba",
                                        cl::desc("Alias for --basic-events"),
                                        cl::aliasopt(BasicAggregation));
 
-static cl::opt<bool> DeprecatedBasicAggregationNl(
+cl::opt<bool> DeprecatedBasicAggregationNl(
     "nl", cl::desc("Alias for --basic-events (deprecated. Use --ba)"),
     cl::cat(AggregatorCategory), cl::ReallyHidden);
 
@@ -135,9 +135,46 @@ TimeAggregator("time-aggr",
   cl::init(false),
   cl::cat(AggregatorCategory));
 
+enum CacheMissKind { NoCache_Miss, TLB_Miss, L1D_Miss, LLC_Miss };
+
+static cl::opt<CacheMissKind> CacheMissSample(
+    "cache-miss", cl::init(NoCache_Miss),
+    cl::desc("generate data cache miss into fdata"),
+    cl::values(clEnumValN(NoCache_Miss, "none", "No cache miss statistics"),
+               clEnumValN(TLB_Miss, SPECacheEvents[0].Name.data(),
+                          "TLB cache miss statistics"),
+               clEnumValN(L1D_Miss, SPECacheEvents[1].Name.data(),
+                          "L1D cache miss statistics"),
+               clEnumValN(LLC_Miss, SPECacheEvents[2].Name.data(),
+                          "LLC miss statistics")),
+    cl::cat(AggregatorCategory));
+
 } // namespace opts
 
 namespace {
+
+const SPECacheEvent &getCacheMissEvent() {
+  switch (opts::CacheMissSample) {
+  case opts::TLB_Miss:
+    return SPECacheEvents[0];
+  case opts::L1D_Miss:
+    return SPECacheEvents[1];
+  case opts::LLC_Miss:
+    return SPECacheEvents[2];
+  case opts::NoCache_Miss:
+    llvm_unreachable("cache-miss sampling is disabled");
+  }
+  llvm_unreachable("invalid cache miss kind");
+}
+
+bool isCacheMissMode() { return opts::CacheMissSample != opts::NoCache_Miss; }
+
+bool hasCacheMissEvent(StringRef Event) {
+  if (!isCacheMissMode())
+    return false;
+  const SPECacheEvent &Selected = getCacheMissEvent();
+  return Event == Selected.Access || Event == Selected.Miss;
+}
 
 const char TimerGroupName[] = "aggregator";
 const char TimerGroupDesc[] = "Aggregator";
@@ -169,7 +206,19 @@ void DataAggregator::addInputFile(StringRef Filename) {
   InputFilenames.emplace_back(Filename);
 }
 
-void DataAggregator::mergeFrom(const DataAggregator &Other) {
+Error DataAggregator::mergeFrom(const DataAggregator &Other) {
+  if (isCacheMissMode()) {
+    const auto &Header = Other.CacheMissHeader;
+    if (CacheMissHeader.Period &&
+        std::tie(CacheMissHeader.Event, CacheMissHeader.BuildID,
+                 CacheMissHeader.Period, CacheMissHeader.Config,
+                 CacheMissHeader.Config1, CacheMissHeader.Config2) !=
+            std::tie(Header.Event, Header.BuildID, Header.Period, Header.Config,
+                     Header.Config1, Header.Config2))
+      return createStringError(errc::invalid_argument,
+                               "incompatible SPE sampling attributes");
+    CacheMissHeader = Header;
+  }
   Traces.insert(Traces.end(), Other.Traces.begin(), Other.Traces.end());
 
   for (const auto &[PC, Count] : Other.BasicSamples)
@@ -185,6 +234,7 @@ void DataAggregator::mergeFrom(const DataAggregator &Other) {
   NumLongRangeTraces += Other.NumLongRangeTraces;
   NumTotalSamples += Other.NumTotalSamples;
   Parsed = true;
+  return Error::success();
 }
 
 void DataAggregator::markFunctionsWithProfile() {
@@ -259,29 +309,39 @@ Error DataAggregator::start() {
     // P/M: whether branch was Predicted or Mispredicted.
     // N: optionally appears when the branch was Not-Taken (ie fall-through)
     // 12345  0x123/0x456/PN/-/-/8/RET/-
-    opts::ITraceAggregation = "bl";
+    if (!isCacheMissMode())
+      opts::ITraceAggregation = "bl";
     opts::ParseMemProfile = true;
     opts::BasicAggregation = false;
   }
 
   SmallVector<std::tuple<StringRef, PerfProcessInfo *, std::string>, 5> Jobs;
+  if (isCacheMissMode())
+    opts::ParseMemProfile = true;
   if (opts::BasicAggregation) {
     Jobs.emplace_back("events without brstack", &MainEventsPPI,
                       "script -F pid,event,ip");
   } else if (!opts::ITraceAggregation.empty()) {
     // Disable parsing memory profile from trace data, unless requested by user.
-    if (!opts::ParseMemProfile.getNumOccurrences())
+    if (!opts::ParseMemProfile.getNumOccurrences() && !isCacheMissMode())
       opts::ParseMemProfile = false;
     Jobs.emplace_back("branch events with itrace", &MainEventsPPI,
                       "script -F pid,brstack --itrace=" +
                           opts::ITraceAggregation);
   } else {
-    Jobs.emplace_back("branch events", &MainEventsPPI, "script -F pid,brstack");
+    Jobs.emplace_back("branch events", &MainEventsPPI,
+                      !isCacheMissMode() ? "script -F pid,brstack"
+                                         : "script --no-itrace -F pid,brstack");
   }
 
-  if (opts::ParseMemProfile)
-    Jobs.emplace_back("mem events", &MemEventsPPI,
-                      "script -F pid,event,addr,ip");
+  if (opts::ParseMemProfile) {
+    std::string Args = "script -F pid,event,addr,ip";
+    if (isCacheMissMode()) {
+      Args += std::string(" --show-lost-events --itrace=") +
+              getCacheMissEvent().ITrace + "e";
+    }
+    Jobs.emplace_back("mem events", &MemEventsPPI, std::move(Args));
+  }
 
   Jobs.emplace_back("process events", &MMapEventsPPI,
                     "script --show-mmap-events --no-itrace");
@@ -362,6 +422,7 @@ void DataAggregator::processFileBuildID(StringRef FileBuildID) {
   }
 
   std::optional<StringRef> FileName = getFileNameForBuildID(FileBuildID);
+  MatchedBuildID = FileName.has_value();
   if (FileName && *FileName == sys::path::filename(BC->getFilename())) {
     outs() << "PERF2BOLT: matched build-id and file name\n";
     return;
@@ -393,6 +454,51 @@ void DataAggregator::processFileBuildID(StringRef FileBuildID) {
             "data, or there were no samples recorded for the binary. "
             "Use -ignore-build-id option to override.\n";
   abort();
+}
+
+Error DataAggregator::parseCacheMissAttrs(StringRef Attributes) {
+  bool Found = false;
+  while (!Attributes.empty()) {
+    StringRef Line;
+    std::tie(Line, Attributes) = Attributes.split('\n');
+    if (!Line.starts_with("arm_spe_"))
+      continue;
+    if (Found)
+      return createStringError(errc::not_supported,
+                               "cache-miss profiles require one SPE event");
+    Found = true;
+    auto Field = [&](StringRef Key, uint64_t &Value, bool Required = false) {
+      size_t Pos = Line.find(Key);
+      if (Pos == StringRef::npos)
+        return !Required;
+      StringRef Text = Line.drop_front(Pos + Key.size()).split(',').first;
+      return !Text.trim().getAsInteger(0, Value);
+    };
+    if (!Field("sample_freq }: ", CacheMissHeader.Period, true) ||
+        !Field("config: ", CacheMissHeader.Config, true) ||
+        !Field("config1: ", CacheMissHeader.Config1) ||
+        !Field("config2: ", CacheMissHeader.Config2) ||
+        Line.contains("freq: 1"))
+      return createStringError(errc::not_supported,
+                               "unsupported SPE sampling attributes");
+  }
+  if (!Found)
+    return createStringError(errc::not_supported,
+                             "cache-miss profiles require an Arm SPE event");
+  return CacheMissHeader.validate();
+}
+
+Error DataAggregator::readCacheMissAttrs() {
+  PerfProcessInfo Process;
+  if (Error E =
+          launchPerfProcess("SPE sampling attributes", Process, "evlist -v"))
+    return E;
+  if (Error E = prepareToParse("SPE sampling attributes", Process))
+    return E;
+  auto Buffer = MemoryBuffer::getFile(Process.StdoutPath);
+  if (!Buffer)
+    return errorCodeToError(Buffer.getError());
+  return parseCacheMissAttrs((*Buffer)->getBuffer());
 }
 
 bool DataAggregator::checkPerfDataMagic(StringRef FileName) {
@@ -735,6 +841,16 @@ Error DataAggregator::parsePerfData() {
     errs() << "BOLT-WARNING: build-id will not be checked because we could "
               "not read one from input binary\n";
   }
+  if (isCacheMissMode()) {
+    if (!MatchedBuildID)
+      return createStringError(
+          errc::invalid_argument,
+          "cache-miss profiles require a verified build-id");
+    CacheMissHeader.BuildID = BC->getFileBuildID()->str();
+    CacheMissHeader.Event = getCacheMissEvent().Name.str();
+    if (Error E = readCacheMissAttrs())
+      return E;
+  }
 
   if (BC->IsLinuxKernel) {
     // Current MMap parsing logic does not work with linux kernel.
@@ -774,8 +890,17 @@ Error DataAggregator::parsePerfData() {
       std::string ErrMsg = toString(std::move(E));
       Regex NoData("Samples for '.*' event do not have ADDR attribute set. "
                    "Cannot print 'addr' field.");
-      if (!NoData.match(ErrMsg))
-        return E;
+      if (!NoData.match(ErrMsg) || isCacheMissMode())
+        return createStringError(errc::io_error, "%s", ErrMsg.c_str());
+      return Error::success();
+    }
+    if (isCacheMissMode()) {
+      auto Diagnostics = MemoryBuffer::getFile(MemEventsPPI.StderrPath);
+      if (!Diagnostics)
+        return errorCodeToError(Diagnostics.getError());
+      if (!(*Diagnostics)->getBuffer().empty())
+        errs() << "PERF2BOLT: SPE decoder diagnostics:\n"
+               << (*Diagnostics)->getBuffer();
     }
     if (std::error_code EC = parseMemEvents())
       return errorCodeToError(EC);
@@ -899,13 +1024,15 @@ Error DataAggregator::parseAllInputs(BinaryContext &BC) {
   parallel::strategy = SavedStrategy;
 
   for (AggregatorJob *Job : Jobs) {
-    if (Job->DA->Parsed)
-      mergeFrom(*Job->DA);
+    if (Job->DA->Parsed) {
+      if (Error E = mergeFrom(*Job->DA))
+        ParseErrors = joinErrors(std::move(ParseErrors), std::move(E));
+    }
     delete Job->DA;
     delete Job;
   }
 
-  if (!Parsed)
+  if (!Parsed || isCacheMissMode())
     return ParseErrors;
   handleAllErrors(std::move(ParseErrors), [](const ErrorInfoBase &EI) {
     errs() << "PERF2BOLT-WARNING: " << EI.message() << "\n";
@@ -924,6 +1051,18 @@ Error DataAggregator::preprocessProfile(BinaryContext &BC) {
   }
 
   this->BC = &BC;
+  if (opts::EnableLoopDataPrefetch && !opts::AggregateOnly)
+    return createStringError(
+        errc::not_supported,
+        "loop data prefetch requires fdata; run perf2bolt without -nl first");
+  if (isCacheMissMode() &&
+      (opts::BasicAggregation || BAT || opts::ProfileFormat != opts::PF_Fdata ||
+       !opts::SaveProfile.empty() || opts::ReadPreAggregated ||
+       opts::IgnoreBuildID))
+    return createStringError(
+        errc::not_supported,
+        "cache-miss profiles require non-BAT perf.data and fdata output "
+        "without -nl, --pa, --ignore-build-id or YAML");
 
   if (!opts::ReadPreAggregated)
     findPerfExecutable();
@@ -965,7 +1104,8 @@ Error DataAggregator::preprocessProfile(BinaryContext &BC) {
 }
 
 Error DataAggregator::readProfile(BinaryContext &BC) {
-  processProfile(BC);
+  if (Error E = processProfile(BC))
+    return E;
 
   if (Error E = DataReader::readProfile(BC))
     return E;
@@ -994,7 +1134,7 @@ bool DataAggregator::mayHaveProfileData(const BinaryFunction &Function) {
   return Function.hasProfileAvailable();
 }
 
-void DataAggregator::processProfile(BinaryContext &BC) {
+Error DataAggregator::processProfile(BinaryContext &BC) {
   // Set for DataReader::readProfile
   NoLBRMode = opts::BasicAggregation;
 
@@ -1005,6 +1145,19 @@ void DataAggregator::processProfile(BinaryContext &BC) {
     processBasicEvents();
   else
     processBranchEvents();
+
+  if (Error E = processCacheMissEvents())
+    return E;
+  if (isCacheMissMode()) {
+    if (NamesToCacheMissEvents.empty())
+      return createStringError(errc::invalid_argument,
+                               "no SPE cache-miss records match the input");
+    for (const auto &[Name, Data] : NamesToCacheMissEvents)
+      if (!NamesToBranches.count(Name))
+        return createStringError(errc::not_supported,
+                                 "SPE cache-miss functions require branch "
+                                 "records from a supported non--nl source");
+  }
 
   processMemEvents();
 
@@ -1036,6 +1189,7 @@ void DataAggregator::processProfile(BinaryContext &BC) {
   clear(Traces);
   clear(BasicSamples);
   clear(MemSamples);
+  return Error::success();
 }
 
 BinaryFunction *
@@ -1107,7 +1261,7 @@ bool DataAggregator::doBasicSample(BinaryFunction &OrigFunc, uint64_t Address,
 
 bool DataAggregator::doIntraBranch(BinaryFunction &Func, uint64_t From,
                                    uint64_t To, uint64_t Count,
-                                   uint64_t Mispreds) {
+                                   uint64_t Mispreds, CycleStats Cycles) {
   FuncBranchData *AggrData = getBranchData(Func);
   if (!AggrData) {
     AggrData = &NamesToBranches[Func.getOneName()];
@@ -1117,14 +1271,14 @@ bool DataAggregator::doIntraBranch(BinaryFunction &Func, uint64_t From,
 
   LLVM_DEBUG(dbgs() << "BOLT-DEBUG: bumpBranchCount: "
                     << formatv("{0} @ {1:x} -> {0} @ {2:x}\n", Func, From, To));
-  AggrData->bumpBranchCount(From, To, Count, Mispreds);
+  AggrData->bumpBranchCount(From, To, Count, Mispreds, Cycles);
   return true;
 }
 
 bool DataAggregator::doInterBranch(BinaryFunction *FromFunc,
                                    BinaryFunction *ToFunc, uint64_t From,
                                    uint64_t To, uint64_t Count,
-                                   uint64_t Mispreds) {
+                                   uint64_t Mispreds, CycleStats Cycles) {
   FuncBranchData *FromAggrData = nullptr;
   FuncBranchData *ToAggrData = nullptr;
   StringRef SrcFunc;
@@ -1150,10 +1304,10 @@ bool DataAggregator::doInterBranch(BinaryFunction *FromFunc,
 
   if (FromAggrData)
     FromAggrData->bumpCallCount(From, Location(!DstFunc.empty(), DstFunc, To),
-                                Count, Mispreds);
+                                Count, Mispreds, Cycles);
   if (ToAggrData)
     ToAggrData->bumpEntryCount(Location(!SrcFunc.empty(), SrcFunc, From), To,
-                               Count, Mispreds);
+                               Count, Mispreds, Cycles);
   return true;
 }
 
@@ -1165,7 +1319,7 @@ bool DataAggregator::checkReturn(uint64_t Addr) {
 }
 
 bool DataAggregator::doBranch(uint64_t From, uint64_t To, uint64_t Count,
-                              uint64_t Mispreds) {
+                              uint64_t Mispreds, CycleStats Cycles) {
   // Mutates \p Addr to an offset into the containing function, performing BAT
   // offset translation and parent lookup.
   //
@@ -1195,9 +1349,9 @@ bool DataAggregator::doBranch(uint64_t From, uint64_t To, uint64_t Count,
 
   // Treat recursive control transfers as inter-branches.
   if (FromFunc == ToFunc && To != 0)
-    return doIntraBranch(*FromFunc, From, To, Count, Mispreds);
+    return doIntraBranch(*FromFunc, From, To, Count, Mispreds, Cycles);
 
-  return doInterBranch(FromFunc, ToFunc, From, To, Count, Mispreds);
+  return doInterBranch(FromFunc, ToFunc, From, To, Count, Mispreds, Cycles);
 }
 
 bool DataAggregator::doTrace(const Trace &Trace, uint64_t Count,
@@ -1237,7 +1391,7 @@ bool DataAggregator::doTrace(const Trace &Trace, uint64_t Count,
   LLVM_DEBUG(dbgs() << "Processing " << FTs->size() << " fallthroughs for "
                     << FromFunc->getPrintName() << ":" << Trace << '\n');
   for (const auto &[From, To] : *FTs)
-    doIntraBranch(*ParentFunc, From, To, Count, false);
+    doIntraBranch(*ParentFunc, From, To, Count, false, {});
 
   return true;
 }
@@ -1328,6 +1482,7 @@ DataAggregator::getFallthroughsInTrace(BinaryFunction &BF, const Trace &Trace,
 }
 
 ErrorOr<DataAggregator::LBREntry> DataAggregator::parseLBREntry() {
+  consumeAllRemainingFS();
   /// perf script -F brstack entry format:
   /// FROM/TO/EVENT/INTX/ABORT/CYCLES[/TYPE/SPEC]
   ErrorOr<StringRef> EntryStr = parseString(FieldSeparator, true);
@@ -1388,7 +1543,11 @@ ErrorOr<DataAggregator::LBREntry> DataAggregator::parseLBREntry() {
     MispredWarning = false;
   }
 
-  // Transaction, abort, cycles are ignored.
+  if (Fields[5].getAsInteger(10, Res.Cycles) || Res.Cycles < 0) {
+    reportError("expected non-negative cycle count");
+    return make_error_code(errc::io_error);
+  }
+  // Transaction and abort are ignored.
 
   // Type: COND/UNCOND/IND/CALL/IND_CALL/RET
   Res.IsReturn = Fields.size() > 6 && Fields[6] == "RET";
@@ -1398,7 +1557,7 @@ ErrorOr<DataAggregator::LBREntry> DataAggregator::parseLBREntry() {
 }
 
 bool DataAggregator::checkAndConsumeFS() {
-  if (ParsingBuf[0] != FieldSeparator)
+  if (ParsingBuf.empty() || ParsingBuf[0] != FieldSeparator)
     return false;
 
   ParsingBuf = ParsingBuf.drop_front(1);
@@ -1420,7 +1579,7 @@ void DataAggregator::consumeRestOfLine() {
 }
 
 bool DataAggregator::checkNewLine() {
-  return ParsingBuf[0] == '\n';
+  return !ParsingBuf.empty() && ParsingBuf[0] == '\n';
 }
 
 ErrorOr<DataAggregator::PerfBranchSample> DataAggregator::parseBranchSample() {
@@ -1499,7 +1658,7 @@ ErrorOr<DataAggregator::PerfBasicSample> DataAggregator::parseBasicSample() {
 }
 
 ErrorOr<DataAggregator::PerfMemSample> DataAggregator::parseMemSample() {
-  PerfMemSample Res{0, 0};
+  PerfMemSample Res{};
 
   while (checkAndConsumeFS()) {
   }
@@ -1520,7 +1679,9 @@ ErrorOr<DataAggregator::PerfMemSample> DataAggregator::parseMemSample() {
   ErrorOr<StringRef> Event = parseString(FieldSeparator);
   if (std::error_code EC = Event.getError())
     return EC;
-  if (!Event.get().contains("mem-loads")) {
+
+  const bool IsCacheMiss = hasCacheMissEvent(*Event);
+  if (!IsCacheMiss && !Event->contains("mem-loads")) {
     consumeRestOfLine();
     return Res;
   }
@@ -1547,10 +1708,15 @@ ErrorOr<DataAggregator::PerfMemSample> DataAggregator::parseMemSample() {
   }
 
   uint64_t Address = *AddrRes;
-  if (!BC->HasFixedLoadAddress)
+  if (!BC->HasFixedLoadAddress && !IsCacheMiss)
     adjustAddress(Address, MMapInfoIter->second);
 
-  return PerfMemSample{PCRes.get(), Address};
+  uint64_t PC = *PCRes;
+  if (!BC->HasFixedLoadAddress)
+    adjustAddress(PC, MMapInfoIter->second);
+
+  return PerfMemSample{PC, Address, IsCacheMiss && Event->ends_with("-miss:"),
+                       IsCacheMiss};
 }
 
 ErrorOr<Location> DataAggregator::parseLocationOrOffset() {
@@ -1728,7 +1894,7 @@ std::error_code DataAggregator::parseAggregatedLBREntry() {
 
   /// Record a trace.
   Trace T{Addr[0]->Offset, Addr[1]->Offset, Addr[2]->Offset};
-  TakenBranchInfo TI{(uint64_t)Count, (uint64_t)Mispreds};
+  TakenBranchInfo TI{(uint64_t)Count, (uint64_t)Mispreds, {}};
   Traces.emplace_back(T, TI);
 
   NumTotalSamples += Count;
@@ -1819,7 +1985,20 @@ void DataAggregator::parseLBRSample(const PerfBranchSample &Sample,
   // executed branch record.
   const LBREntry *NextLBR = nullptr;
   uint32_t NumEntry = 0;
+  int64_t TotalCycles = 0;
+  bool HasCycles = true;
+  for (const LBREntry &LBR : Sample.LBR)
+    if (LBR.Cycles <= 0 || AddOverflow(TotalCycles, LBR.Cycles, TotalCycles)) {
+      HasCycles = false;
+      break;
+    }
+  TotalCycles = 0;
+  DenseMap<std::pair<uint64_t, uint64_t>, int64_t> LastSeen;
+
   for (const LBREntry &LBR : Sample.LBR) {
+    const int64_t BranchCycles = TotalCycles;
+    if (HasCycles)
+      TotalCycles += LBR.Cycles;
     ++NumEntry;
     // Hardware bug workaround: Intel Skylake (which has 32 LBR entries)
     // sometimes record entry 32 as an exact copy of entry 31. This will cause
@@ -1835,6 +2014,14 @@ void DataAggregator::parseLBRSample(const PerfBranchSample &Sample,
     TakenBranchInfo &Info = TraceMap[Trace{LBR.From, LBR.To, TraceTo}];
     ++Info.TakenCount;
     Info.MispredCount += LBR.Mispred;
+    if (HasCycles) {
+      auto [I, Inserted] =
+          LastSeen.try_emplace(std::make_pair(LBR.From, LBR.To), BranchCycles);
+      if (!Inserted) {
+        Info.Cycles.merge({BranchCycles - I->second, 1});
+        I->second = BranchCycles;
+      }
+    }
     if (LBR.IsReturn)
       Returns.emplace(LBR.From, true);
   }
@@ -1992,7 +2179,8 @@ void DataAggregator::processBranchEvents() {
     // Ignore returns.
     if (!IsReturn && Trace.Branch != Trace::FT_ONLY &&
         Trace.Branch != Trace::FT_EXTERNAL_ORIGIN)
-      doBranch(Trace.Branch, Trace.From, Info.TakenCount, Info.MispredCount);
+      doBranch(Trace.Branch, Trace.From, Info.TakenCount, Info.MispredCount,
+               Info.Cycles);
     if (Trace.To != Trace::BR_ONLY)
       doTrace(Trace, Info.TakenCount, IsReturn);
   }
@@ -2051,11 +2239,19 @@ std::error_code DataAggregator::parseMemEvents() {
   NamedRegionTimer T("parseMemEvents", "Parsing mem events", TimerGroupName,
                      TimerGroupDesc, opts::TimeAggregator);
   while (hasData()) {
+    StringRef Line = ParsingBuf.split('\n').first;
+    if (isCacheMissMode() &&
+        (Line.contains("PERF_RECORD_LOST") || Line.contains("AUXTRACE_ERROR") ||
+         Line.contains("trace error"))) {
+      reportError("lost SPE samples or decoder error");
+      return make_error_code(errc::io_error);
+    }
     ErrorOr<PerfMemSample> Sample = parseMemSample();
     if (std::error_code EC = Sample.getError())
       return EC;
 
-    if (getBinaryFunctionContainingAddress(Sample->PC))
+    if (Sample->PC &&
+        (Sample->IsCacheMiss || getBinaryFunctionContainingAddress(Sample->PC)))
       MemSamples.emplace_back(std::move(Sample.get()));
   }
 
@@ -2066,6 +2262,8 @@ void DataAggregator::processMemEvents() {
   NamedRegionTimer T("ProcessMemEvents", "Processing mem events",
                      TimerGroupName, TimerGroupDesc, opts::TimeAggregator);
   for (const PerfMemSample &Sample : MemSamples) {
+    if (Sample.IsCacheMiss)
+      continue;
     uint64_t PC = Sample.PC;
     uint64_t Addr = Sample.Addr;
     StringRef FuncName;
@@ -2101,6 +2299,34 @@ void DataAggregator::processMemEvents() {
     MemData->update(FuncLoc, AddrLoc);
     LLVM_DEBUG(dbgs() << "Mem event: " << FuncLoc << " = " << AddrLoc << "\n");
   }
+}
+
+Error DataAggregator::processCacheMissEvents() {
+  if (!isCacheMissMode())
+    return Error::success();
+  outs() << "PERF2BOLT: processing cache miss events...\n";
+  for (const PerfMemSample &Sample : MemSamples) {
+    if (!Sample.IsCacheMiss)
+      continue;
+    // BAT mapping for cache-miss PCs is not supported by this format yet.
+    BinaryFunction *Func = getBinaryFunctionContainingAddress(Sample.PC);
+    if (!Func)
+      continue;
+    StringRef Name = getLocationName(*Func, /*BAT=*/false);
+    auto [It, Inserted] = NamesToCacheMissEvents.try_emplace(
+        Name, Name, FuncCacheMissData::ContainerTy());
+    if (!It->second.bumpCount(Sample.PC - Func->getAddress(), Sample.IsMiss,
+                              !Sample.IsMiss))
+      return createStringError(std::errc::value_too_large,
+                               "cache-miss profile counter overflow");
+  }
+  for (const auto &[Name, Profile] : NamesToCacheMissEvents)
+    for (const CacheMissInfo &Counts : Profile.Data)
+      if (Counts.MissCount > Counts.AccessCount)
+        return createStringError(
+            errc::invalid_argument,
+            "cache-miss events have no matching access denominator");
+  return Error::success();
 }
 
 std::error_code DataAggregator::parsePreAggregatedLBRSamples() {
@@ -2516,7 +2742,10 @@ DataAggregator::getFileNameForBuildID(StringRef FileBuildID) {
       continue;
     }
 
-    if (IDPair->second.starts_with(FileBuildID)) {
+    StringRef ID = IDPair->second;
+    // perf pads short build-ids to its fixed storage width with zeroes.
+    if (ID.consume_front(FileBuildID) &&
+        llvm::all_of(ID, [](char C) { return C == '0'; })) {
       FileName = sys::path::filename(IDPair->first);
       break;
     }
@@ -2559,20 +2788,19 @@ std::error_code DataAggregator::writeFdataFile(StringRef OutputFilename) const {
   if (EC)
     return EC;
 
-  bool WriteMemLocs = false;
-
-  auto writeLocation = [&OutFile, &WriteMemLocs](const Location &Loc) {
-    if (WriteMemLocs)
-      OutFile << (Loc.IsSymbol ? "4 " : "3 ");
-    else
-      OutFile << (Loc.IsSymbol ? "1 " : "0 ");
-    OutFile << (Loc.Name.empty() ? "[unknown]" : getEscapedName(Loc.Name))
+  auto writeLocation = [&OutFile](const Location &Loc, unsigned Kind = 0) {
+    OutFile << Kind + unsigned(Loc.IsSymbol) << " "
+            << (Loc.Name.empty() ? "[unknown]" : getEscapedName(Loc.Name))
             << " " << Twine::utohexstr(Loc.Offset) << FieldSeparator;
   };
 
   uint64_t BranchValues = 0;
   uint64_t MemValues = 0;
+  uint64_t CacheMissValues = 0;
 
+  const bool Prefetch = isCacheMissMode();
+  if (Prefetch)
+    CacheMissHeader.print(OutFile);
   if (BAT)
     OutFile << "boltedcollection\n";
   if (opts::BasicAggregation) {
@@ -2590,39 +2818,50 @@ std::error_code DataAggregator::writeFdataFile(StringRef OutputFilename) const {
       }
     }
   } else {
+    auto writeBranch = [&](const BranchInfo &BI) {
+      writeLocation(BI.From);
+      writeLocation(BI.To);
+      OutFile << BI.Mispreds << " " << BI.Branches;
+      if (Prefetch)
+        OutFile << " " << BI.Cycles.Total << " " << BI.Cycles.Samples;
+      OutFile << "\n";
+      ++BranchValues;
+    };
     for (const auto &KV : NamesToBranches) {
       const FuncBranchData &FBD = KV.second;
-      for (const BranchInfo &BI : FBD.Data) {
-        writeLocation(BI.From);
-        writeLocation(BI.To);
-        OutFile << BI.Mispreds << " " << BI.Branches << "\n";
-        ++BranchValues;
-      }
+      for (const BranchInfo &BI : FBD.Data)
+        writeBranch(BI);
       for (const BranchInfo &BI : FBD.EntryData) {
         // Do not output if source is a known symbol, since this was already
         // accounted for in the source function
         if (BI.From.IsSymbol)
           continue;
-        writeLocation(BI.From);
-        writeLocation(BI.To);
-        OutFile << BI.Mispreds << " " << BI.Branches << "\n";
-        ++BranchValues;
+        writeBranch(BI);
       }
     }
 
-    WriteMemLocs = true;
+    for (const auto &KV : NamesToCacheMissEvents) {
+      const FuncCacheMissData &FCMD = KV.second;
+      for (const CacheMissInfo &CMI : FCMD.Data) {
+        writeLocation(CMI.Offset, 6);
+        OutFile << CMI.MissCount << " " << CMI.AccessCount << "\n";
+        ++CacheMissValues;
+      }
+    }
+
     for (const auto &KV : NamesToMemEvents) {
       const FuncMemData &FMD = KV.second;
       for (const MemInfo &MemEvent : FMD.Data) {
-        writeLocation(MemEvent.Offset);
-        writeLocation(MemEvent.Addr);
+        writeLocation(MemEvent.Offset, 3);
+        writeLocation(MemEvent.Addr, 3);
         OutFile << MemEvent.Count << "\n";
         ++MemValues;
       }
     }
   }
 
-  outs() << "PERF2BOLT: wrote " << BranchValues << " objects and " << MemValues
+  outs() << "PERF2BOLT: wrote " << BranchValues << " objects, "
+         << CacheMissValues << " cache miss objects and " << MemValues
          << " memory objects to " << OutputFilename << "\n";
 
   return std::error_code();

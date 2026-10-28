@@ -566,9 +566,9 @@ Error RewriteInstance::setProfile(StringRef Filename) {
   }
 
   // Spawn a profile reader based on file contents.
-  if (DataAggregator::checkPerfDataMagic(Filename))
+  if (DataAggregator::checkPerfDataMagic(Filename)) {
     ProfileReader = std::make_unique<DataAggregator>(Filename);
-  else if (YAMLProfileReader::isYAML(Filename))
+  } else if (YAMLProfileReader::isYAML(Filename))
     ProfileReader = std::make_unique<YAMLProfileReader>(Filename);
   else
     ProfileReader = std::make_unique<DataReader>(Filename);

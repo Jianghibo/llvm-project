@@ -372,6 +372,19 @@ std::error_code YAMLProfileWriter::writeProfile(const RewriteInstance &RI) {
   const BinaryContext &BC = RI.getBinaryContext();
   const auto &Functions = BC.getBinaryFunctions();
 
+  if (llvm::any_of(Functions, [](const auto &Entry) {
+        const BinaryFunction &BF = Entry.second;
+        if (BF.hasCacheMissProfile())
+          return true;
+        for (const BinaryBasicBlock &BB : BF)
+          for (const auto &BI : BB.branch_info())
+            if (BI.Cycles.Samples)
+              return true;
+        return false;
+      }))
+    errs()
+        << "BOLT-WARNING: YAML output omits cache-miss and cycle statistics; "
+           "retain the extended fdata for loop data prefetch\n";
   std::error_code EC;
   OS = std::make_unique<raw_fd_ostream>(Filename, EC, sys::fs::OF_None);
   if (EC) {

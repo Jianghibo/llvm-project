@@ -94,6 +94,7 @@ private:
     uint64_t To;
     bool Mispred;
     bool IsReturn;
+    int64_t Cycles{0};
   };
   friend raw_ostream &operator<<(raw_ostream &OS, const LBREntry &);
 
@@ -114,6 +115,8 @@ private:
   struct PerfMemSample {
     uint64_t PC;
     uint64_t Addr;
+    bool IsMiss{false};
+    bool IsCacheMiss{false};
   };
 
   /// Container for the unit of branch data, matching pre-aggregated trace type.
@@ -148,7 +151,9 @@ private:
   struct TakenBranchInfo {
     uint64_t TakenCount{0};
     uint64_t MispredCount{0};
+    CycleStats Cycles{};
   };
+
   friend raw_ostream &operator<<(raw_ostream &OS, const TakenBranchInfo &TBI);
 
   /// Intermediate storage for profile data. We save the results of parsing
@@ -223,6 +228,12 @@ private:
   /// Name of the binary with matching build-id from perf.data if different
   /// from the file name in BC.
   std::string BuildIDBinaryName;
+  bool MatchedBuildID = false;
+  PrefetchProfileHeader CacheMissHeader;
+
+  /// Read and validate the SPE sampling attributes reported by perf evlist.
+  Error readCacheMissAttrs();
+  Error parseCacheMissAttrs(StringRef Attributes);
 
   /// Memory map info for a single file as recorded in perf.data
   /// When a binary has multiple text segments, the Size is computed as the
@@ -303,19 +314,20 @@ private:
 
   /// Register an intraprocedural branch \p Branch.
   bool doIntraBranch(BinaryFunction &Func, uint64_t From, uint64_t To,
-                     uint64_t Count, uint64_t Mispreds);
+                     uint64_t Count, uint64_t Mispreds, CycleStats Cycles);
 
   /// Register an interprocedural branch from \p FromFunc to \p ToFunc with
   /// offsets \p From and \p To, respectively.
   bool doInterBranch(BinaryFunction *FromFunc, BinaryFunction *ToFunc,
                      uint64_t From, uint64_t To, uint64_t Count,
-                     uint64_t Mispreds);
+                     uint64_t Mispreds, CycleStats Cycles);
 
   /// Checks if \p Addr corresponds to a return instruction.
   bool checkReturn(uint64_t Addr);
 
   /// Register a \p Branch.
-  bool doBranch(uint64_t From, uint64_t To, uint64_t Count, uint64_t Mispreds);
+  bool doBranch(uint64_t From, uint64_t To, uint64_t Count, uint64_t Mispreds,
+                CycleStats Cycles);
 
   /// Register a trace between two LBR entries supplied in execution order.
   bool doTrace(const Trace &Trace, uint64_t Count, bool IsReturn);
@@ -391,6 +403,9 @@ private:
   /// Process parsed memory events profile.
   void processMemEvents();
 
+  /// Aggregate SPE load accesses and misses by original instruction PC.
+  Error processCacheMissEvents();
+
   /// Parse a single line of a PERF_RECORD_MMAP2 event looking for a mapping
   /// between the binary name and its memory layout in a process with a given
   /// PID.
@@ -426,7 +441,7 @@ private:
   Error parseAllInputs(BinaryContext &BC);
 
   /// Merge parsed profile data from another aggregation job.
-  void mergeFrom(const DataAggregator &Other);
+  Error mergeFrom(const DataAggregator &Other);
 
   /// Mark binary functions covered by parsed profile data.
   void markFunctionsWithProfile();
@@ -579,7 +594,7 @@ private:
   bool ignoreKernelInterrupt(LBREntry &LBR) const;
 
   /// Populate functions in \p BC with profile.
-  void processProfile(BinaryContext &BC);
+  Error processProfile(BinaryContext &BC);
 
   /// Start an aggregation job asynchronously.
   Error start();
@@ -681,6 +696,7 @@ public:
   }
 
   friend class YAMLProfileWriter;
+  friend class DataAggregatorTester;
 };
 
 inline raw_ostream &operator<<(raw_ostream &OS,

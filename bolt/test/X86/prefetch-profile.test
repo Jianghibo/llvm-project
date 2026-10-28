@@ -1,0 +1,57 @@
+# REQUIRES: system-linux
+# RUN: split-file %s %t
+# RUN: merge-fdata %t/first %t/second > %t/merged
+# RUN: FileCheck %s --input-file=%t/merged --check-prefix=MERGED
+# RUN: llvm-mc -filetype=obj -triple=x86_64 %t/input.s -o %t.o
+# RUN: ld.lld --emit-relocs --build-id=0x11223344 -e usqrt %t.o -o %t.exe
+# RUN: llvm-bolt %t.exe --data %t/merged -o %t.out
+# RUN: not merge-fdata %t/first %t/incompatible 2>&1 | FileCheck %s --check-prefix=MISMATCH
+# RUN: not llvm-bolt %t.exe --data %t/truncated -o %t.bad 2>&1 | FileCheck %s --check-prefix=INVALID
+# RUN: not llvm-bolt %t.exe --data %t/header -o %t.bad 2>&1 | FileCheck %s --check-prefix=HEADER
+# RUN: not merge-fdata %t/extra-fields 2>&1 | FileCheck %s --check-prefix=EXTRA
+# RUN: not llvm-bolt %t.exe --data %t/extra-fields -o %t.bad 2>&1 | FileCheck %s --check-prefix=EXTRA-READ
+# MERGED: bolt-prefetch llc_miss 11223344 1024 200000001 0 0
+# MERGED: 1 usqrt 3d 1 usqrt 10 3 30 190 13
+# MERGED: 7 usqrt 10 5 13
+# MISMATCH: cannot merge incompatible
+# INVALID: expected decimal number
+# HEADER: invalid bolt-prefetch header
+# EXTRA: prefetch fields require a bolt-prefetch header
+# EXTRA-READ: expected end of branch record
+
+#--- first
+bolt-prefetch llc_miss 11223344 1024 200000001 0 0
+1 usqrt 3d 1 usqrt 10 1 10 100 10
+7 usqrt 10 2 5
+#--- second
+bolt-prefetch llc_miss 11223344 1024 200000001 0 0
+7 usqrt 10 3 8
+1 usqrt 3d 1 usqrt 10 2 20 90 3
+#--- incompatible
+bolt-prefetch l1d_miss 11223344 1024 200000001 0 0
+1 usqrt 3d 1 usqrt 10 0 1 0 0
+#--- truncated
+bolt-prefetch llc_miss 11223344 1024 200000001 0 0
+1 usqrt 3d 1 usqrt 10 0 1
+#--- header
+bolt-prefetch llc_miss 11223344 1024 200000001 0
+1 usqrt 3d 1 usqrt 10 0 1 0 0
+
+#--- extra-fields
+1 usqrt 3d 1 usqrt 10 0 1 100
+
+#--- input.s
+.text
+.globl usqrt
+.type usqrt, @function
+usqrt:
+  .rept 16
+  nop
+  .endr
+  mov (%rdi), %rax
+  .rept 42
+  nop
+  .endr
+  jne usqrt+16
+  ret
+.size usqrt, .-usqrt

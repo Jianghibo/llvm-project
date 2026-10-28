@@ -31,9 +31,11 @@ class LivenessAnalysis : public DataflowAnalysis<LivenessAnalysis, BitVector,
 
 public:
   LivenessAnalysis(const RegAnalysis &RA, BinaryFunction &BF,
-                   MCPlusBuilder::AllocatorIdTy AllocId)
+                   MCPlusBuilder::AllocatorIdTy AllocId,
+                   bool AssumeABI = opts::AssumeABI)
       : Parent(BF, AllocId), RA(RA),
-        NumRegs(BF.getBinaryContext().MRI->getNumRegs()) {}
+        NumRegs(BF.getBinaryContext().MRI->getNumRegs()), AssumeABI(AssumeABI) {
+  }
   virtual ~LivenessAnalysis();
 
   // Return the state before the execution of an Instruction.
@@ -79,6 +81,7 @@ protected:
   /// Reference to the result of reg analysis
   const RegAnalysis &RA;
   const uint16_t NumRegs;
+  const bool AssumeABI;
 
   void preflight() {}
 
@@ -87,7 +90,7 @@ protected:
     // values).
     if (BB.succ_size() == 0) {
       BitVector State(NumRegs, false);
-      if (opts::AssumeABI) {
+      if (AssumeABI) {
         BC.MIB->getDefaultLiveOut(State);
         BC.MIB->getCalleeSavedRegs(State);
       } else {
@@ -125,7 +128,7 @@ protected:
         BC.MIB->getDefaultLiveOut(Written);
         // If ABI is respected, everything except CSRs should be dead after a
         // call
-        if (opts::AssumeABI) {
+        if (AssumeABI) {
           BitVector CSR = BitVector(NumRegs, false);
           BC.MIB->getCalleeSavedRegs(CSR);
           CSR.flip();

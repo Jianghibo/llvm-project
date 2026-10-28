@@ -12,6 +12,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "bolt/Core/CycleStats.h"
+#include "bolt/Profile/PrefetchProfile.h"
 #include "bolt/Profile/ProfileYAMLMapping.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
@@ -24,6 +26,7 @@
 #include "llvm/Support/ThreadPool.h"
 #include <algorithm>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 
@@ -252,15 +255,115 @@ void mergeFunctionProfile(BinaryFunctionProfile &MergedBF,
       MergedBF.Blocks.emplace_back(std::move(*BB));
 }
 
-bool isYAML(const StringRef Filename) {
-  ErrorOr<std::unique_ptr<MemoryBuffer>> MB =
-      MemoryBuffer::getFileOrSTDIN(Filename);
-  if (std::error_code EC = MB.getError())
-    report_error(Filename, EC);
-  StringRef Buffer = MB.get()->getBuffer();
+enum class ProfileFormat { Legacy, Prefetch, YAML };
+
+ProfileFormat getProfileFormat(StringRef Filename) {
+  std::ifstream File(Filename.str(), std::ios::binary);
+  if (!File)
+    report_error(Filename, "cannot open profile");
+  // Only the initial marker is needed to dispatch to a reader.
+  char Prefix[16];
+  File.read(Prefix, sizeof(Prefix));
+  StringRef Buffer(Prefix, File.gcount());
   if (Buffer.starts_with("---\n"))
-    return true;
-  return false;
+    return ProfileFormat::YAML;
+  if (Buffer.starts_with("bolt-prefetch "))
+    return ProfileFormat::Prefetch;
+  return ProfileFormat::Legacy;
+}
+
+// Count fields without splitting escaped spaces in symbol names.
+unsigned countFields(StringRef Line, bool CountEmpty = false) {
+  unsigned Count = CountEmpty ? 1 : 0;
+  bool InField = false;
+  for (size_t I = 0; I < Line.size(); ++I) {
+    if (Line[I] == ' ') {
+      if (CountEmpty)
+        ++Count;
+      InField = false;
+    } else {
+      if (!InField && !CountEmpty)
+        ++Count;
+      InField = true;
+      if (Line[I] == '\\' && I + 1 < Line.size())
+        ++I;
+    }
+  }
+  return Count;
+}
+
+void mergePrefetchProfiles(const SmallVectorImpl<std::string> &Filenames) {
+  std::string Header;
+  std::map<std::string, SmallVector<int64_t, 4>> Records;
+  for (const std::string &Filename : Filenames) {
+    auto MB = MemoryBuffer::getFileOrSTDIN(Filename);
+    if (!MB)
+      report_error(Filename, MB.getError());
+    StringRef Buf = (*MB)->getBuffer();
+    auto [FirstLine, Rest] = Buf.split('\n');
+    auto ParsedHeader = llvm::bolt::PrefetchProfileHeader::parse(FirstLine);
+    if (!ParsedHeader)
+      report_error(Filename, toString(ParsedHeader.takeError()));
+    std::string CanonicalHeader;
+    raw_string_ostream HeaderOS(CanonicalHeader);
+    ParsedHeader->print(HeaderOS);
+    if (Header.empty())
+      Header = CanonicalHeader;
+    if (Header != CanonicalHeader)
+      report_error(Filename,
+                   "cannot merge incompatible identities, sampling attributes "
+                   "or cache events/formats");
+    while (!Rest.empty()) {
+      auto [Line, Next] = Rest.split('\n');
+      Rest = Next;
+      Line = Line.rtrim(' ');
+      if (Line.empty())
+        continue;
+      if (Line.size() < 2 || Line[1] != ' ' || Line[0] < '0' || Line[0] > '8')
+        report_error(Filename, "unknown prefetch profile record");
+      const bool Branch = Line[0] <= '2';
+      const bool Cache = Line[0] >= '6';
+      const unsigned N = Branch ? 4 : Cache ? 2 : 1;
+      constexpr unsigned BranchFields = 10, CacheFields = 5, MemoryFields = 7;
+      if (countFields(Line) != (Branch  ? BranchFields
+                                : Cache ? CacheFields
+                                        : MemoryFields))
+        report_error(Filename, "malformed prefetch profile record");
+      SmallVector<int64_t, 4> Values(N);
+      for (unsigned I = N; I; --I) {
+        auto [Key, Value] = Line.rsplit(' ');
+        if (Value.getAsInteger(10, Values[I - 1]) ||
+            (Values[I - 1] < 0 && !(Branch && I == 4 && Values[3] == -1)))
+          report_error(Filename, "invalid prefetch counter");
+        Line = Key.rtrim(' ');
+      }
+      if ((Branch &&
+           (Values[0] > Values[1] || (Values[3] <= 0 && Values[2] != 0))) ||
+          (Cache && Values[0] > Values[1]))
+        report_error(Filename, "inconsistent prefetch counters");
+      auto [It, Inserted] = Records.try_emplace(Line.str(), N, 0);
+      auto &Merged = It->second;
+      if (Branch) {
+        llvm::bolt::CycleStats Cycles(Merged[2], Merged[3]);
+        Cycles.merge({Values[2], Values[3]});
+        Merged[2] = Cycles.Total;
+        Merged[3] = Cycles.Samples;
+      }
+      for (unsigned I = 0; I < (Branch ? 2u : N); ++I)
+        if (AddOverflow(Merged[I], Values[I], Merged[I]))
+          report_error(Filename, "prefetch counter overflow");
+    }
+  }
+  if (!opts::SuppressMergedDataOutput) {
+    output() << Header;
+    for (const auto &[Key, Values] : Records) {
+      output() << Key;
+      for (int64_t Value : Values)
+        output() << ' ' << Value;
+      output() << '\n';
+    }
+  }
+  errs() << "Profile from " << Filenames.size() << " files merged.\n";
 }
 
 void mergeLegacyProfiles(const SmallVectorImpl<std::string> &Filenames) {
@@ -287,12 +390,14 @@ void mergeLegacyProfiles(const SmallVectorImpl<std::string> &Filenames) {
   auto ParseProfile = [&](const std::string &Filename, auto &Profiles) {
     const llvm::thread::id tid = llvm::this_thread::get_id();
 
-    if (isYAML(Filename))
+    if (getProfileFormat(Filename) == ProfileFormat::YAML)
       report_error(Filename, "cannot mix YAML and legacy formats");
 
     std::ifstream FdataFile(Filename, std::ios::in);
     std::string FdataLine;
     std::getline(FdataFile, FdataLine);
+    if (StringRef(FdataLine).starts_with("bolt-prefetch "))
+      report_error(Filename, "cannot mix legacy and prefetch profile formats");
 
     auto checkMode = [&](const std::string &Key, std::optional<bool> &Flag) {
       const bool KeyIsSet = FdataLine.rfind(Key, 0) == 0;
@@ -340,17 +445,14 @@ void mergeLegacyProfiles(const SmallVectorImpl<std::string> &Filenames) {
       if (Line.split(' ').first.getAsInteger(10, Type))
         report_error(Filename, "Malformed / corrupted entry type");
       bool IsBranchEntry = Type < 3;
+      if ((Type >= 6 && Type <= 8) || (IsBranchEntry && countFields(Line) > 8))
+        report_error(Filename,
+                     "prefetch fields require a bolt-prefetch header");
 
       // Validate the number of fields in the line. Count only unescaped spaces
       // as field separators, since function names may contain escaped spaces,
       // like "foo\ bar".
-      size_t NumFields = 1;
-      for (size_t I = 0; I < Line.size(); ++I) {
-        if (Line[I] == '\\')
-          ++I;
-        else if (Line[I] == ' ')
-          ++NumFields;
-      }
+      const unsigned NumFields = countFields(Line, /*CountEmpty=*/true);
       size_t ExpectedFields =
           IsBranchEntry ? (NoLBRCollection.value_or(false) ? 4 : 8) : 7;
       if (NumFields != ExpectedFields) {
@@ -450,8 +552,12 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (!isYAML(Inputs.front())) {
-    mergeLegacyProfiles(Inputs);
+  const ProfileFormat Format = getProfileFormat(Inputs.front());
+  if (Format != ProfileFormat::YAML) {
+    if (Format == ProfileFormat::Prefetch)
+      mergePrefetchProfiles(Inputs);
+    else
+      mergeLegacyProfiles(Inputs);
     return 0;
   }
 

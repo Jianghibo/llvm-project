@@ -11,6 +11,7 @@
 #include "bolt/Core/BinaryFunction.h"
 #include "bolt/Passes/MCF.h"
 #include "bolt/Profile/ProfileYAMLMapping.h"
+#include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/NameResolver.h"
 #include "bolt/Utils/Utils.h"
 #include "llvm/ADT/STLExtras.h"
@@ -365,6 +366,10 @@ bool YAMLProfileReader::parseFunctionProfile(
 }
 
 Error YAMLProfileReader::preprocessProfile(BinaryContext &BC) {
+  if (opts::EnableLoopDataPrefetch)
+    return createStringError(std::errc::not_supported,
+                             "loop data prefetch requires extended fdata; "
+                             "YAML has no cache-miss data");
   ErrorOr<std::unique_ptr<MemoryBuffer>> MB =
       MemoryBuffer::getFileOrSTDIN(Filename);
   if (std::error_code EC = MB.getError()) {

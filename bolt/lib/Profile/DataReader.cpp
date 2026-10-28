@@ -14,6 +14,7 @@
 #include "bolt/Profile/DataReader.h"
 #include "bolt/Core/BinaryFunction.h"
 #include "bolt/Passes/MCF.h"
+#include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/NameResolver.h"
 #include "bolt/Utils/Utils.h"
 #include "llvm/Support/CommandLine.h"
@@ -163,50 +164,83 @@ void FuncBasicSampleData::bumpCount(uint64_t Offset, uint64_t Count) {
   SI.Hits += Count;
 }
 
+bool CacheMissInfo::mergeWith(const CacheMissInfo &Other) {
+  if (Other.MissCount > uint64_t(INT64_MAX) - MissCount ||
+      Other.AccessCount > uint64_t(INT64_MAX) - AccessCount)
+    return false;
+  MissCount += Other.MissCount;
+  AccessCount += Other.AccessCount;
+  return true;
+}
+
+bool FuncCacheMissData::bumpCount(uint64_t Offset, uint64_t MissCount,
+                                  uint64_t AccessCount) {
+  auto [It, Inserted] = Index.try_emplace(Offset, Data.size());
+  if (Inserted) {
+    Data.emplace_back(Location(true, Name, Offset), MissCount, AccessCount);
+    return true;
+  }
+  return Data[It->second].mergeWith(
+      CacheMissInfo(Location(true, Name, Offset), MissCount, AccessCount));
+}
+
 void FuncBranchData::bumpBranchCount(uint64_t OffsetFrom, uint64_t OffsetTo,
-                                     uint64_t Count, uint64_t Mispreds) {
+                                     uint64_t Count, uint64_t Mispreds,
+                                     CycleStats Cycles) {
   auto Iter = IntraIndex[OffsetFrom].find(OffsetTo);
   if (Iter == IntraIndex[OffsetFrom].end()) {
     Data.emplace_back(Location(true, Name, OffsetFrom),
-                      Location(true, Name, OffsetTo), Mispreds, Count);
+                      Location(true, Name, OffsetTo), Mispreds, Count, Cycles);
     IntraIndex[OffsetFrom][OffsetTo] = Data.size() - 1;
     return;
   }
   BranchInfo &BI = Data[Iter->second];
   BI.Branches += Count;
   BI.Mispreds += Mispreds;
+  BI.Cycles.merge(Cycles);
 }
 
 void FuncBranchData::bumpCallCount(uint64_t OffsetFrom, const Location &To,
-                                   uint64_t Count, uint64_t Mispreds) {
+                                   uint64_t Count, uint64_t Mispreds,
+                                   CycleStats Cycles) {
   auto Iter = InterIndex[OffsetFrom].find(To);
   if (Iter == InterIndex[OffsetFrom].end()) {
-    Data.emplace_back(Location(true, Name, OffsetFrom), To, Mispreds, Count);
+    Data.emplace_back(Location(true, Name, OffsetFrom), To, Mispreds, Count,
+                      Cycles);
     InterIndex[OffsetFrom][To] = Data.size() - 1;
     return;
   }
   BranchInfo &BI = Data[Iter->second];
   BI.Branches += Count;
   BI.Mispreds += Mispreds;
+  BI.Cycles.merge(Cycles);
 }
 
 void FuncBranchData::bumpEntryCount(const Location &From, uint64_t OffsetTo,
-                                    uint64_t Count, uint64_t Mispreds) {
+                                    uint64_t Count, uint64_t Mispreds,
+                                    CycleStats Cycles) {
   auto Iter = EntryIndex[OffsetTo].find(From);
   if (Iter == EntryIndex[OffsetTo].end()) {
     EntryData.emplace_back(From, Location(true, Name, OffsetTo), Mispreds,
-                           Count);
+                           Count, Cycles);
     EntryIndex[OffsetTo][From] = EntryData.size() - 1;
     return;
   }
   BranchInfo &BI = EntryData[Iter->second];
   BI.Branches += Count;
   BI.Mispreds += Mispreds;
+  BI.Cycles.merge(Cycles);
 }
 
-void BranchInfo::mergeWith(const BranchInfo &BI) {
-  Branches += BI.Branches;
-  Mispreds += BI.Mispreds;
+bool BranchInfo::mergeWith(const BranchInfo &BI) {
+  int64_t NewBranches, NewMispreds;
+  if (AddOverflow(Branches, BI.Branches, NewBranches) ||
+      AddOverflow(Mispreds, BI.Mispreds, NewMispreds))
+    return false;
+  Branches = NewBranches;
+  Mispreds = NewMispreds;
+  Cycles.merge(BI.Cycles);
+  return true;
 }
 
 void BranchInfo::print(raw_ostream &OS) const {
@@ -240,6 +274,11 @@ void FuncMemData::update(const Location &Offset, const Location &Addr) {
 Error DataReader::preprocessProfile(BinaryContext &BC) {
   if (std::error_code EC = parseInput())
     return errorCodeToError(EC);
+
+  if (PrefetchProfile && (!BC.getFileBuildID() ||
+                          *BC.getFileBuildID() != PrefetchProfile->BuildID))
+    return createStringError(errc::invalid_argument,
+                             "prefetch profile build-id does not match input");
 
   if (opts::DumpData)
     dump();
@@ -275,23 +314,68 @@ Error DataReader::preprocessProfile(BinaryContext &BC) {
       FuncData->setEntryCounts(Function);
       FuncData->Used = true;
     }
+    if (FuncCacheMissData *CacheMissData =
+            getCacheMissDataForNames(Function.getNames())) {
+      setCacheMissData(Function, CacheMissData);
+      Function.HasCacheMissProfile = true;
+      CacheMissData->Used = true;
+    }
   }
 
   for (auto &BFI : BC.getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
     matchProfileMemData(Function);
+    matchProfileCacheMissData(Function);
   }
 
   return Error::success();
 }
 
+void DataReader::bindCacheMissProfile(BinaryFunction &Function,
+                                      CacheMissBindingStats &Stats) {
+  FuncCacheMissData *CacheMissData = getCacheMissData(Function);
+  if (!CacheMissData)
+    return;
+  BinaryContext &BC = Function.getBinaryContext();
+  for (const CacheMissInfo &CMI : CacheMissData->Data) {
+    const uint64_t Offset = CMI.Offset.Offset;
+    auto II = Function.Instructions.find(Offset);
+    if (II == Function.Instructions.end()) {
+      ++Stats.BadPC;
+      if (opts::Verbosity)
+        BC.errs() << "BOLT-WARNING: cache-miss PC " << Function.getPrintName()
+                  << "+0x" << Twine::utohexstr(Offset)
+                  << " is not an instruction\n";
+      continue;
+    }
+    if (!BC.MIB->mayLoad(II->second)) {
+      ++Stats.NonLoad;
+      if (opts::Verbosity)
+        BC.errs() << "BOLT-WARNING: cache-miss PC " << Function.getPrintName()
+                  << "+0x" << Twine::utohexstr(Offset) << " is not a load\n";
+      continue;
+    }
+
+    auto &CacheMissProf = BC.MIB->getOrCreateAnnotationAs<CacheMissProfile>(
+        II->second, "CacheMissProfile");
+    CacheMissProf.MissCount = CMI.MissCount;
+    CacheMissProf.AccessCount = CMI.AccessCount;
+    ++Stats.Bound;
+  }
+  Function.HasCacheMissProfile = true;
+}
+
 Error DataReader::readProfilePreCFG(BinaryContext &BC) {
+  CacheMissBindingStats Stats;
+  uint64_t Unmatched = 0;
   for (auto &BFI : BC.getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
+    // Bind load samples before CFG construction can discard original offsets.
+    bindCacheMissProfile(Function, Stats);
     FuncMemData *MemoryData = getMemData(Function);
+
     if (!MemoryData)
       continue;
-
     for (MemInfo &MI : MemoryData->Data) {
       const uint64_t Offset = MI.Offset.Offset;
       auto II = Function.Instructions.find(Offset);
@@ -315,6 +399,19 @@ Error DataReader::readProfilePreCFG(BinaryContext &BC) {
         MemAccessProfile.NextInstrOffset = II->first;
     }
     Function.HasMemoryProfile = true;
+  }
+
+  for (const auto &[Name, Data] : NamesToCacheMissEvents)
+    if (!Data.Used)
+      Unmatched += Data.Data.size();
+  if (PrefetchProfile) {
+    BC.outs() << "BOLT-INFO: cache-miss bindings: " << Stats.Bound << " loads, "
+              << Stats.BadPC << " invalid PCs, " << Stats.NonLoad
+              << " non-loads, " << Unmatched << " unmatched function records\n";
+    if (opts::EnableLoopDataPrefetch && !Stats.Bound &&
+        (Stats.BadPC || Stats.NonLoad || Unmatched))
+      return createStringError(errc::invalid_argument,
+                               "no cache-miss records bind to input loads");
   }
 
   return Error::success();
@@ -413,7 +510,7 @@ void DataReader::readProfile(BinaryFunction &BF) {
       continue;
 
     if (!recordBranch(BF, BI.From.Offset, BI.To.Offset, BI.Branches,
-                      BI.Mispreds)) {
+                      BI.Mispreds, BI.Cycles)) {
       LLVM_DEBUG(dbgs() << "bad branch : " << BI.From.Offset << " -> "
                         << BI.To.Offset << '\n');
     }
@@ -485,6 +582,23 @@ void DataReader::matchProfileMemData(BinaryFunction &BF) {
     // Update function profile data with the new set.
     setMemData(BF, NewMemData);
     NewMemData->Used = true;
+    break;
+  }
+}
+
+void DataReader::matchProfileCacheMissData(BinaryFunction &BF) {
+  if (getCacheMissData(BF))
+    return;
+  const std::vector<FuncCacheMissData *> AllCacheMissData =
+      getCacheMissDataForNamesRegex(BF.getNames());
+  for (FuncCacheMissData *NewCacheMissData : AllCacheMissData) {
+    // Prevent functions from sharing the same profile.
+    if (NewCacheMissData->Used)
+      continue;
+
+    // Update function data with the new set.
+    setCacheMissData(BF, NewCacheMissData);
+    NewCacheMissData->Used = true;
     break;
   }
 }
@@ -682,7 +796,8 @@ void DataReader::convertBranchData(BinaryFunction &BF) const {
 }
 
 bool DataReader::recordBranch(BinaryFunction &BF, uint64_t From, uint64_t To,
-                              uint64_t Count, uint64_t Mispreds) const {
+                              uint64_t Count, uint64_t Mispreds,
+                              CycleStats Cycles) const {
   BinaryContext &BC = BF.getBinaryContext();
 
   BinaryBasicBlock *FromBB = BF.getBasicBlockContainingOffset(From);
@@ -804,8 +919,10 @@ bool DataReader::recordBranch(BinaryFunction &BF, uint64_t From, uint64_t To,
       BinaryBasicBlock::BinaryBranchInfo &FTBI =
           FTSuccessor->getBranchInfo(*ToBB);
       FTBI.Count += Count;
-      if (Count)
+      if (Count) {
         FTBI.MispredictedCount += Mispreds;
+        FTBI.Cycles = {}; // This fall-through has no measured branch interval.
+      }
       ToBB = FTSuccessor;
     } else {
       LLVM_DEBUG(dbgs() << "invalid branch in " << BF
@@ -819,6 +936,7 @@ bool DataReader::recordBranch(BinaryFunction &BF, uint64_t From, uint64_t To,
   // Only update mispredicted count if it the count was real.
   if (Count) {
     BI.MispredictedCount += Mispreds;
+    BI.Cycles.merge(Cycles);
   }
 
   return true;
@@ -830,7 +948,7 @@ void DataReader::reportError(StringRef ErrorMsg) {
 }
 
 bool DataReader::expectAndConsumeFS() {
-  if (ParsingBuf[0] != FieldSeparator) {
+  if (ParsingBuf.empty() || ParsingBuf[0] != FieldSeparator) {
     reportError("expected field separator");
     return false;
   }
@@ -840,14 +958,14 @@ bool DataReader::expectAndConsumeFS() {
 }
 
 void DataReader::consumeAllRemainingFS() {
-  while (ParsingBuf[0] == FieldSeparator) {
+  while (!ParsingBuf.empty() && ParsingBuf[0] == FieldSeparator) {
     ParsingBuf = ParsingBuf.drop_front(1);
     Col += 1;
   }
 }
 
 bool DataReader::checkAndConsumeNewLine() {
-  if (ParsingBuf[0] != '\n')
+  if (ParsingBuf.empty() || ParsingBuf[0] != '\n')
     return false;
 
   ParsingBuf = ParsingBuf.drop_front(1);
@@ -932,27 +1050,16 @@ ErrorOr<uint64_t> DataReader::parseHexField(char EndChar, bool EndNl) {
 }
 
 ErrorOr<Location> DataReader::parseLocation(char EndChar, bool EndNl,
-                                            bool ExpectMemLoc) {
-  // Read whether the location of the branch should be DSO or a symbol
-  // 0 means it is a DSO. 1 means it is a global symbol. 2 means it is a local
-  // symbol.
-  // The symbol flag is also used to tag memory load events by adding 3 to the
-  // base values, i.e. 3 not a symbol, 4 global symbol and 5 local symbol.
-  if (!ExpectMemLoc && ParsingBuf[0] != '0' && ParsingBuf[0] != '1' &&
-      ParsingBuf[0] != '2') {
-    reportError("expected 0, 1 or 2");
+                                            char Kind) {
+  // Branch, memory and cache locations use bases 0, 3 and 6 respectively.
+  // The following two values denote global and local symbols.
+  if (ParsingBuf[0] < Kind || ParsingBuf[0] > Kind + 2) {
+    reportError((Twine("expected ") + Twine(Kind - '0') + ", " +
+                 Twine(Kind - '0' + 1) + " or " + Twine(Kind - '0' + 2))
+                    .str());
     return make_error_code(llvm::errc::io_error);
   }
-
-  if (ExpectMemLoc && ParsingBuf[0] != '3' && ParsingBuf[0] != '4' &&
-      ParsingBuf[0] != '5') {
-    reportError("expected 3, 4 or 5");
-    return make_error_code(llvm::errc::io_error);
-  }
-
-  bool IsSymbol =
-      (!ExpectMemLoc && (ParsingBuf[0] == '1' || ParsingBuf[0] == '2')) ||
-      (ExpectMemLoc && (ParsingBuf[0] == '4' || ParsingBuf[0] == '5'));
+  const bool IsSymbol = ParsingBuf[0] != Kind;
   ParsingBuf = ParsingBuf.drop_front(1);
   Col += 1;
 
@@ -994,18 +1101,43 @@ ErrorOr<BranchInfo> DataReader::parseBranchInfo() {
   int64_t NumMispreds = MRes.get();
 
   consumeAllRemainingFS();
-  ErrorOr<int64_t> BRes = parseNumberField(FieldSeparator, /* EndNl = */ true);
+  ErrorOr<int64_t> BRes = parseNumberField(FieldSeparator, /*EndNl=*/true);
   if (std::error_code EC = BRes.getError())
     return EC;
   int64_t NumBranches = BRes.get();
 
-  consumeAllRemainingFS();
-  if (!checkAndConsumeNewLine()) {
-    reportError("expected end of line");
-    return make_error_code(llvm::errc::io_error);
+  if (NumMispreds < 0 || NumBranches < 0 ||
+      (PrefetchProfile && NumMispreds > NumBranches)) {
+    reportError("invalid branch counts");
+    return make_error_code(errc::io_error);
   }
-
-  return BranchInfo(std::move(From), std::move(To), NumMispreds, NumBranches);
+  consumeAllRemainingFS();
+  CycleStats Cycles;
+  if (PrefetchProfile) {
+    auto Total = parseNumberField(FieldSeparator, /*EndNl=*/true);
+    if (!Total)
+      return Total.getError();
+    if (*Total < 0) {
+      reportError("negative cycle count");
+      return make_error_code(errc::io_error);
+    }
+    consumeAllRemainingFS();
+    auto Samples = parseNumberField(FieldSeparator, /*EndNl=*/true);
+    if (!Samples)
+      return Samples.getError();
+    if (*Samples < -1 || (*Samples <= 0 && *Total != 0)) {
+      reportError("invalid cycle statistics");
+      return make_error_code(errc::io_error);
+    }
+    Cycles = {*Total, *Samples};
+    consumeAllRemainingFS();
+  }
+  if (!checkAndConsumeNewLine()) {
+    reportError("expected end of branch record");
+    return make_error_code(errc::io_error);
+  }
+  return BranchInfo(std::move(From), std::move(To), NumMispreds, NumBranches,
+                    Cycles);
 }
 
 ErrorOr<MemInfo> DataReader::parseMemInfo() {
@@ -1032,6 +1164,40 @@ ErrorOr<MemInfo> DataReader::parseMemInfo() {
   }
 
   return MemInfo(Offset, Addr, CountRes.get());
+}
+
+ErrorOr<CacheMissInfo> DataReader::parseCacheMissInfo() {
+  ErrorOr<Location> Res = parseCacheMissLocation(FieldSeparator);
+  if (std::error_code EC = Res.getError())
+    return EC;
+
+  Location Offset = Res.get();
+
+  consumeAllRemainingFS();
+  ErrorOr<int64_t> MissRes =
+      parseNumberField(FieldSeparator, /* EndNl = */ true);
+  if (std::error_code EC = MissRes.getError())
+    return EC;
+  int64_t MissCount = MissRes.get();
+
+  consumeAllRemainingFS();
+  ErrorOr<int64_t> AccessRes =
+      parseNumberField(FieldSeparator, /* EndNl = */ true);
+  if (std::error_code EC = AccessRes.getError())
+    return EC;
+  int64_t AccessCount = AccessRes.get();
+
+  consumeAllRemainingFS();
+  if (!checkAndConsumeNewLine()) {
+    reportError("expected end of line");
+    return make_error_code(llvm::errc::io_error);
+  }
+
+  if (MissCount < 0 || AccessCount < 0 || MissCount > AccessCount) {
+    reportError("invalid cache miss/access counts");
+    return make_error_code(errc::io_error);
+  }
+  return CacheMissInfo(std::move(Offset), MissCount, AccessCount);
 }
 
 ErrorOr<BasicSampleInfo> DataReader::parseSampleInfo() {
@@ -1106,6 +1272,13 @@ bool DataReader::hasMemData() {
   if (ParsingBuf[0] == '3' || ParsingBuf[0] == '4' || ParsingBuf[0] == '5')
     return true;
   return false;
+}
+
+bool DataReader::hasCacheMissData() {
+  if (ParsingBuf.size() == 0)
+    return false;
+
+  return ParsingBuf[0] >= '6' && ParsingBuf[0] <= '8';
 }
 
 std::error_code DataReader::parseInNoLBRMode() {
@@ -1184,6 +1357,10 @@ std::error_code DataReader::parse() {
     return NamesToMemEvents.try_emplace(Name, Name).first;
   };
 
+  auto GetOrCreateFuncCacheMissEntry = [&](StringRef Name) {
+    return NamesToCacheMissEvents.try_emplace(Name, Name).first;
+  };
+
   Col = 0;
   Line = 1;
   ErrorOr<bool> SymbolsFlagOrErr = maybeParseFlag("symbols");
@@ -1205,7 +1382,26 @@ std::error_code DataReader::parse() {
     return BATFlagOrErr.getError();
   BATMode = *BATFlagOrErr;
 
-  if (!hasBranchData() && !hasMemData()) {
+  if (ParsingBuf.starts_with("bolt-prefetch ")) {
+    auto HeaderLine = parseString('\n');
+    if (!HeaderLine)
+      return HeaderLine.getError();
+    auto Header = PrefetchProfileHeader::parse(*HeaderLine);
+    if (!Header) {
+      reportError(toString(Header.takeError()));
+      return make_error_code(errc::io_error);
+    }
+    PrefetchProfile = std::move(*Header);
+  }
+  if (BATMode && PrefetchProfile) {
+    reportError("BAT cache-miss profiles are not supported");
+    return make_error_code(errc::not_supported);
+  }
+  if (NoLBRMode && (opts::EnableLoopDataPrefetch || PrefetchProfile)) {
+    reportError("loop data prefetch does not support no_lbr/-nl");
+    return make_error_code(errc::not_supported);
+  }
+  if (!hasBranchData() && !hasMemData() && !hasCacheMissData()) {
     Diag << "ERROR: no valid profile data found\n";
     return make_error_code(llvm::errc::io_error);
   }
@@ -1213,50 +1409,91 @@ std::error_code DataReader::parse() {
   if (NoLBRMode)
     return parseInNoLBRMode();
 
-  while (hasBranchData()) {
-    ErrorOr<BranchInfo> Res = parseBranchInfo();
-    if (std::error_code EC = Res.getError())
-      return EC;
-
-    BranchInfo BI = Res.get();
-
-    // Ignore branches not involving known location.
-    if (!BI.From.IsSymbol && !BI.To.IsSymbol)
+  while (!ParsingBuf.empty()) {
+    if (checkAndConsumeNewLine())
       continue;
-
-    auto I = GetOrCreateFuncEntry(BI.From.Name);
-    I->second.Data.emplace_back(std::move(BI));
-
-    // Add entry data for branches to another function or branches
-    // to entry points (including recursive calls)
-    if (BI.To.IsSymbol && (BI.From.Name != BI.To.Name || BI.To.Offset == 0)) {
-      I = GetOrCreateFuncEntry(BI.To.Name);
-      I->second.EntryData.emplace_back(std::move(BI));
+    if (hasBranchData()) {
+      auto Res = parseBranchInfo();
+      if (!Res)
+        return Res.getError();
+      BranchInfo BI = *Res;
+      if (!BI.From.IsSymbol && !BI.To.IsSymbol)
+        continue;
+      auto I = GetOrCreateFuncEntry(BI.From.Name);
+      I->second.Data.push_back(BI);
+      if (BI.To.IsSymbol && (BI.From.Name != BI.To.Name || BI.To.Offset == 0)) {
+        I = GetOrCreateFuncEntry(BI.To.Name);
+        I->second.EntryData.push_back(BI);
+      }
+    } else if (hasCacheMissData()) {
+      if (!PrefetchProfile) {
+        reportError("cache-miss records require a bolt-prefetch header");
+        return make_error_code(errc::io_error);
+      }
+      auto Res = parseCacheMissInfo();
+      if (!Res)
+        return Res.getError();
+      if (!Res->Offset.IsSymbol)
+        continue;
+      auto I = GetOrCreateFuncCacheMissEntry(Res->Offset.Name);
+      if (!I->second.bumpCount(Res->Offset.Offset, Res->MissCount,
+                               Res->AccessCount)) {
+        reportError("cache-miss profile counter overflow");
+        return make_error_code(std::errc::value_too_large);
+      }
+    } else if (hasMemData()) {
+      auto Res = parseMemInfo();
+      if (!Res)
+        return Res.getError();
+      if (Res->Offset.IsSymbol)
+        GetOrCreateFuncMemEntry(Res->Offset.Name)->second.Data.push_back(*Res);
+    } else {
+      reportError("unknown profile record");
+      return make_error_code(errc::io_error);
     }
   }
 
-  while (hasMemData()) {
-    ErrorOr<MemInfo> Res = parseMemInfo();
-    if (std::error_code EC = Res.getError())
-      return EC;
-
-    MemInfo MI = Res.get();
-
-    // Ignore memory events not involving known pc.
-    if (!MI.Offset.IsSymbol)
-      continue;
-
-    auto I = GetOrCreateFuncMemEntry(MI.Offset.Name);
-    I->second.Data.emplace_back(std::move(MI));
-  }
-
-  for (auto &FuncBranches : NamesToBranches)
-    llvm::stable_sort(FuncBranches.second.Data);
+  if (opts::EnableLoopDataPrefetch)
+    for (const auto &[Name, Data] : NamesToCacheMissEvents)
+      if (!NamesToBranches.count(Name)) {
+        reportError("loop data prefetch requires branch counts for cache-miss "
+                    "functions");
+        return make_error_code(errc::not_supported);
+      }
+  if (std::error_code EC = sortAndMergeBranches())
+    return EC;
 
   for (auto &MemEvents : NamesToMemEvents)
     llvm::stable_sort(MemEvents.second.Data);
 
+  for (auto &CacheMissEvents : NamesToCacheMissEvents)
+    llvm::stable_sort(CacheMissEvents.second.Data);
+
   return std::error_code();
+}
+
+std::error_code DataReader::sortAndMergeBranches() {
+  for (auto &[Name, Function] : NamesToBranches) {
+    for (auto *Data : {&Function.Data, &Function.EntryData}) {
+      llvm::stable_sort(*Data);
+      auto Out = Data->begin();
+      for (auto I = Data->begin(); I != Data->end(); ++I) {
+        if (Out != Data->begin() && *(Out - 1) == *I) {
+          if (!(Out - 1)->mergeWith(*I)) {
+            reportError("branch count overflow");
+            return make_error_code(std::errc::value_too_large);
+          }
+        } else {
+          if (Out != I)
+            *Out = std::move(*I);
+          ++Out;
+        }
+      }
+      Data->erase(Out, Data->end());
+    }
+  }
+
+  return {};
 }
 
 void DataReader::buildLTONameMaps() {
@@ -1272,6 +1509,13 @@ void DataReader::buildLTONameMaps() {
     const std::optional<StringRef> CommonName = getLTOCommonName(FuncName);
     if (CommonName)
       LTOCommonNameMemMap[*CommonName].push_back(&FuncData.second);
+  }
+
+  for (auto &FuncData : NamesToCacheMissEvents) {
+    const StringRef FuncName = FuncData.first;
+    const std::optional<StringRef> CommonName = getLTOCommonName(FuncName);
+    if (CommonName)
+      LTOCommonNameCacheMissMap[*CommonName].push_back(&FuncData.second);
   }
 }
 
@@ -1330,12 +1574,14 @@ fetchMapEntriesRegex(MapTy &Map,
 }
 
 bool DataReader::mayHaveProfileData(const BinaryFunction &Function) {
-  if (getBranchData(Function) || getMemData(Function))
+  if (getBranchData(Function) || getMemData(Function) ||
+      getCacheMissData(Function))
     return true;
 
   if (getFuncBasicSampleData(Function.getNames()) ||
       getBranchDataForNames(Function.getNames()) ||
-      getMemDataForNames(Function.getNames()))
+      getMemDataForNames(Function.getNames()) ||
+      getCacheMissDataForNames(Function.getNames()))
     return true;
 
   if (!hasVolatileName(Function))
@@ -1351,7 +1597,7 @@ bool DataReader::mayHaveProfileData(const BinaryFunction &Function) {
   if (!AllMemData.empty())
     return true;
 
-  return false;
+  return !getCacheMissDataForNamesRegex(Function.getNames()).empty();
 }
 
 FuncBranchData *
@@ -1375,6 +1621,12 @@ DataReader::getFuncBasicSampleData(const std::vector<StringRef> &FuncNames) {
                                                  FuncNames);
 }
 
+FuncCacheMissData *
+DataReader::getCacheMissDataForNames(const std::vector<StringRef> &FuncNames) {
+  return fetchMapEntry<NamesToCacheMissEventsMapTy>(NamesToCacheMissEvents,
+                                                    FuncNames);
+}
+
 std::vector<FuncBranchData *> DataReader::getBranchDataForNamesRegex(
     const std::vector<StringRef> &FuncNames) {
   return fetchMapEntriesRegex(NamesToBranches, LTOCommonNameMap, FuncNames);
@@ -1383,6 +1635,12 @@ std::vector<FuncBranchData *> DataReader::getBranchDataForNamesRegex(
 std::vector<FuncMemData *>
 DataReader::getMemDataForNamesRegex(const std::vector<StringRef> &FuncNames) {
   return fetchMapEntriesRegex(NamesToMemEvents, LTOCommonNameMemMap, FuncNames);
+}
+
+std::vector<FuncCacheMissData *> DataReader::getCacheMissDataForNamesRegex(
+    const std::vector<StringRef> &FuncNames) {
+  return fetchMapEntriesRegex(NamesToCacheMissEvents, LTOCommonNameCacheMissMap,
+                              FuncNames);
 }
 
 bool DataReader::hasLocalsWithFileName() const {
@@ -1433,6 +1691,16 @@ void DataReader::dump() const {
       LastOffset = MI.Offset;
     }
     Diag << "\n";
+  }
+
+  for (const auto &KV : NamesToCacheMissEvents) {
+    const StringRef Name = KV.first;
+    const FuncCacheMissData &FCMD = KV.second;
+    Diag << "Cache Miss events for " << Name << "\n";
+    for (const CacheMissInfo &CMI : FCMD.Data) {
+      Diag << CMI.Offset << ": " << CMI.MissCount << ", " << CMI.AccessCount
+           << "\n";
+    }
   }
 }
 

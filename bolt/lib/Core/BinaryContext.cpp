@@ -79,6 +79,11 @@ PrintMemData("print-mem-data",
   cl::Hidden,
   cl::cat(BoltCategory));
 
+static cl::opt<bool>
+    PrintCacheMiss("print-cache-miss", cl::Hidden,
+                   cl::desc("print cache miss info when printing functions"),
+                   cl::ZeroOrMore, cl::cat(BoltCategory));
+
 cl::opt<std::string> CompDirOverride(
     "comp-dir-override",
     cl::desc("overrides DW_AT_comp_dir, and provides an alternative base "
@@ -2553,6 +2558,13 @@ void BinaryContext::printInstruction(raw_ostream &OS, const MCInst &Instruction,
   if ((opts::PrintRelocations || PrintRelocations) && Function) {
     const uint64_t Size = computeCodeSize(&Instruction, &Instruction + 1);
     Function->printRelocations(OS, Offset, Size);
+  }
+
+  if (opts::PrintCacheMiss) {
+    if (auto Profile = MIB->tryGetAnnotationAs<CacheMissProfile>(
+            Instruction, "CacheMissProfile"))
+      OS << "# MissCount: " << Profile->MissCount
+         << ", AccessCount: " << Profile->AccessCount;
   }
 
   OS << Endl;

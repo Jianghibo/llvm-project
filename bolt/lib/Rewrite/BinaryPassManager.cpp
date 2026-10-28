@@ -22,6 +22,7 @@
 #include "bolt/Passes/Instrumentation.h"
 #include "bolt/Passes/JTFootprintReduction.h"
 #include "bolt/Passes/LongJmp.h"
+#include "bolt/Passes/LoopDataPrefetch.h"
 #include "bolt/Passes/LoopInversionPass.h"
 #include "bolt/Passes/MCF.h"
 #include "bolt/Passes/PLTCall.h"
@@ -51,6 +52,8 @@
 using namespace llvm;
 
 namespace opts {
+extern cl::opt<bool> BasicAggregation;
+extern cl::opt<bool> DeprecatedBasicAggregationNl;
 
 extern cl::opt<bool> PrintAll;
 extern cl::opt<bool> PrintDynoStats;
@@ -147,6 +150,11 @@ static cl::opt<bool>
     PrintLongJmp("print-longjmp",
                  cl::desc("print functions after longjmp pass"), cl::Hidden,
                  cl::cat(BoltOptCategory));
+
+static cl::opt<bool> PrintLoopDataPrefetch(
+    "print-loop-data-prefetch", cl::Hidden,
+    cl::desc("print functions after loopdataprefetch pass"),
+    cl::cat(BoltOptCategory));
 
 cl::opt<bool>
     PrintNormalized("print-normalized",
@@ -369,6 +377,12 @@ Error BinaryFunctionPassManager::runPasses() {
 }
 
 Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+  if (opts::EnableLoopDataPrefetch &&
+      (opts::BasicAggregation || opts::DeprecatedBasicAggregationNl))
+    return createFatalBOLTError("loop data prefetch does not support -nl");
+  if (opts::EnableLoopDataPrefetch && BC.IsLinuxKernel)
+    return createFatalBOLTError(
+        "loop data prefetch supports userspace ELF only");
   BinaryFunctionPassManager Manager(BC);
 
   if (BC.isAArch64())
@@ -422,6 +436,10 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
                        !opts::KeepNops);
 
   Manager.registerPass(std::make_unique<NormalizeCFG>(PrintNormalized));
+
+  if (opts::EnableLoopDataPrefetch && BC.isAArch64() && !opts::Instrument)
+    Manager.registerPass(
+        std::make_unique<LoopDataPrefetch>(PrintLoopDataPrefetch));
 
   if (BC.isX86())
     Manager.registerPass(std::make_unique<StripRepRet>(NeverPrint),

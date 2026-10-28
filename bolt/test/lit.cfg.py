@@ -88,6 +88,11 @@ llvm_config.add_tool_substitutions([ToolSubst(r"ld\.lld", command=ld_lld)])
 config.substitutions.append(("%cflags", ""))
 config.substitutions.append(("%cxxflags", ""))
 
+# Raw executable path for scripts that invoke BOLT themselves.
+config.substitutions.append(
+    ("%llvm_bolt", os.path.join(config.llvm_tools_dir, "llvm-bolt"))
+)
+
 link_fdata_cmd = os.path.join(config.test_source_root, "link_fdata.py")
 
 tool_dirs = [config.llvm_tools_dir, config.test_source_root]

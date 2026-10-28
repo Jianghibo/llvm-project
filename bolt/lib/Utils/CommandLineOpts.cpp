@@ -42,6 +42,11 @@ cl::OptionCategory BoltInstrCategory("BOLT instrumentation options");
 cl::OptionCategory HeatmapCategory("Heatmap options");
 cl::OptionCategory BinaryAnalysisCategory("BinaryAnalysis options");
 
+cl::opt<bool> EnableLoopDataPrefetch(
+    "enable-loop-data-prefetch", cl::Hidden, cl::init(false),
+    cl::desc("enable experimental loop data prefetching"),
+    cl::cat(BoltOptCategory));
+
 cl::opt<unsigned> AlignText("align-text",
                             cl::desc("alignment of .text section"), cl::Hidden,
                             cl::cat(BoltCategory));

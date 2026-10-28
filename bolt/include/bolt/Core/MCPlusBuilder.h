@@ -2058,6 +2058,123 @@ public:
     llvm_unreachable("not implemented");
   }
 
+  /// Maximum supported distance in loop iterations.
+  static constexpr unsigned MaxLoopPrefetchDistance = 1000;
+
+  /// Byte-based address semantics for ordinary affine loop accesses.
+  struct LoopMemoryAccess {
+    MCPhysReg Base = 0, Index = 0;
+    MCPhysReg Dest = 0; // First loaded result, or 0 if discarded.
+    int64_t Offset = 0, Writeback = 0;
+    unsigned IndexBits = 64, Shift = 0, Size = 0, Elements = 1;
+    bool SignExtend = false, HasWriteback = false;
+
+    /// Compare the effective address and accessed range, excluding results.
+    bool hasSameAddress(const LoopMemoryAccess &Other) const {
+      return Base == Other.Base && Index == Other.Index &&
+             IndexBits == Other.IndexBits && Shift == Other.Shift &&
+             SignExtend == Other.SignExtend && Offset == Other.Offset &&
+             Size == Other.Size && Elements == Other.Elements;
+    }
+  };
+
+  virtual std::optional<LoopMemoryAccess>
+  analyzeLoopMemory(const MCInst &Inst) const {
+    return std::nullopt;
+  }
+
+  /// Recognize a modular self-update of Reg, including load/store writeback.
+  virtual bool getLoopRegisterUpdate(const MCInst &Inst, MCPhysReg Reg,
+                                     int64_t &Step) const {
+    return false;
+  }
+
+  /// Full-width assignment: Base +/- (Index << Shift) + constant.
+  /// The constant does not affect the stride. Register 0 denotes zero.
+  struct LoopRegisterAssignment {
+    MCPhysReg Base = 0, Index = 0;
+    unsigned Shift = 0;
+    bool SubtractIndex = false;
+  };
+
+  virtual std::optional<LoopRegisterAssignment>
+  analyzeLoopRegisterAssignment(const MCInst &Inst, MCPhysReg Reg) const {
+    return std::nullopt;
+  }
+
+  virtual bool isLoopPrefetchBarrier(const MCInst &Inst) const { return true; }
+
+  virtual bool isPrefetchHint(StringRef Hint) const { return false; }
+
+  /// Recognize a nonzero-entry, unit countdown with a backedge on nonzero.
+  /// Return the counter and whether the entry branch is taken on zero.
+  virtual MCPhysReg getLoopCountDownReg(const MCInst &Update,
+                                        const MCInst &Backedge,
+                                        const MCInst &Entry,
+                                        bool &EntryOnZero) const {
+    return 0;
+  }
+
+  struct LoopConstantCount {
+    MCPhysReg Reg;
+    uint64_t Count;
+  };
+
+  /// Recognize an immediate positive initialization and unit countdown.
+  virtual std::optional<LoopConstantCount>
+  getLoopConstantCount(const MCInst &Init, const MCInst &Update,
+                       const MCInst &Backedge) const {
+    return std::nullopt;
+  }
+
+  struct LoopIndirectAccess {
+    const MCInst *IndexLoad = nullptr;
+    LoopMemoryAccess Address;
+    MCPhysReg Count = 0;
+    int64_t BaseDelta = 0, IndexDelta = 0;
+  };
+
+  /// Guard all of Code, including its ordinary index load, by Count > Distance.
+  /// Guard must not modify flags or any original register.
+  virtual bool createLoopIndirectPrefetch(
+      const LoopIndirectAccess &Source, const LoopMemoryAccess &Target,
+      unsigned Distance, ArrayRef<MCPhysReg> Scratch, StringRef Hint,
+      const MCSymbol *Skip, MCContext *Ctx, SmallVectorImpl<MCInst> &Code,
+      SmallVectorImpl<MCInst> &Guard) const {
+    return false;
+  }
+
+  /// Build without changing any source register, memory, SP, or flags.
+  /// Scratch registers must be safe to clobber. The caller preserves live
+  /// values and provides the unwind rules for any surrounding spill window.
+  /// When requested, materialize the complete first address in Scratch[0].
+  /// The last Address.Elements instructions are the prefetch requests.
+  virtual bool createLoopPrefetch(const LoopMemoryAccess &Address,
+                                  int64_t BaseDelta, int64_t IndexDelta,
+                                  ArrayRef<MCPhysReg> Scratch, StringRef Hint,
+                                  SmallVectorImpl<MCInst> &Code,
+                                  bool MaterializeAddress) const {
+    return false;
+  }
+
+  /// Save and restore one or two GPRs in a balanced 16-byte stack slot.
+  /// Preserve flags. The caller must provide matching CFI and ensure that
+  /// changing SP does not change any prefetch input address.
+  virtual bool createLoopPrefetchSpill(ArrayRef<MCPhysReg> Registers,
+                                       MCInst &Save, MCInst &Restore) const {
+    return false;
+  }
+
+  /// Guard prefetches by cache-line crossings without modifying flags.
+  /// Address holds the complete future address; Scratch can be clobbered.
+  /// Branch to Skip when no request is needed.
+  virtual bool createLoopPrefetchGuard(MCPhysReg Address, MCPhysReg Scratch,
+                                       int64_t Step, unsigned LineSize,
+                                       const MCSymbol *Skip, MCContext *Ctx,
+                                       SmallVectorImpl<MCInst> &Code) const {
+    return false;
+  }
+
   /// Create a fragment of code (sequence of instructions) that load a 32-bit
   /// address from memory, zero-extends it to 64 and jump to it (indirect jump).
   virtual void

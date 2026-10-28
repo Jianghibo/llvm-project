@@ -14,6 +14,9 @@
 #ifndef BOLT_PROFILE_DATA_READER_H
 #define BOLT_PROFILE_DATA_READER_H
 
+#include "bolt/Core/BinaryData.h"
+#include "bolt/Core/CycleStats.h"
+#include "bolt/Profile/PrefetchProfile.h"
 #include "bolt/Profile/ProfileReaderBase.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
@@ -66,10 +69,12 @@ struct BranchInfo {
   Location To;
   int64_t Mispreds;
   int64_t Branches;
+  CycleStats Cycles;
 
-  BranchInfo(Location From, Location To, int64_t Mispreds, int64_t Branches)
+  BranchInfo(Location From, Location To, int64_t Mispreds, int64_t Branches,
+             CycleStats Cycles = {})
       : From(std::move(From)), To(std::move(To)), Mispreds(Mispreds),
-        Branches(Branches) {}
+        Branches(Branches), Cycles(Cycles) {}
 
   bool operator==(const BranchInfo &RHS) const {
     return From == RHS.From && To == RHS.To;
@@ -80,7 +85,7 @@ struct BranchInfo {
   }
 
   /// Merges branch and misprediction counts of \p BI with those of this object.
-  void mergeWith(const BranchInfo &BI);
+  bool mergeWith(const BranchInfo &BI);
 
   void print(raw_ostream &OS) const;
 };
@@ -118,11 +123,11 @@ struct FuncBranchData {
   DenseMap<uint64_t, DenseMap<Location, size_t>> EntryIndex;
 
   void bumpBranchCount(uint64_t OffsetFrom, uint64_t OffsetTo, uint64_t Count,
-                       uint64_t Mispreds);
+                       uint64_t Mispreds, CycleStats Cycles);
   void bumpCallCount(uint64_t OffsetFrom, const Location &To, uint64_t Count,
-                     uint64_t Mispreds);
+                     uint64_t Mispreds, CycleStats Cycles = {});
   void bumpEntryCount(const Location &From, uint64_t OffsetTo, uint64_t Count,
-                      uint64_t Mispreds);
+                      uint64_t Mispreds, CycleStats Cycles = {});
 };
 
 /// MemInfo represents a single memory load from an address \p Addr at an \p
@@ -232,6 +237,40 @@ struct FuncBasicSampleData {
   void bumpCount(uint64_t Offset, uint64_t Count);
 };
 
+struct CacheMissInfo {
+  Location Offset;
+  uint64_t MissCount;
+  uint64_t AccessCount;
+
+  CacheMissInfo(Location Offset, uint64_t MissCount, uint64_t AccessCount)
+      : Offset(Offset), MissCount(MissCount), AccessCount(AccessCount) {}
+
+  bool operator==(const CacheMissInfo &RHS) const {
+    return Offset == RHS.Offset;
+  }
+
+  bool operator<(const CacheMissInfo &RHS) const { return Offset < RHS.Offset; }
+
+  bool mergeWith(const CacheMissInfo &SI);
+};
+
+struct FuncCacheMissData {
+  typedef std::vector<CacheMissInfo> ContainerTy;
+
+  StringRef Name;
+  ContainerTy Data;
+
+  /// Indicate if the data was used.
+  bool Used{false};
+
+  FuncCacheMissData(StringRef Name, ContainerTy Data = ContainerTy())
+      : Name(Name), Data(std::move(Data)) {}
+
+  DenseMap<uint64_t, size_t> Index;
+
+  bool bumpCount(uint64_t Offset, uint64_t MissCount, uint64_t AccessCount);
+};
+
 /// DataReader Class
 ///
 class DataReader : public ProfileReaderBase {
@@ -275,6 +314,9 @@ protected:
   /// creation of basic blocks.
   void matchProfileMemData(BinaryFunction &BF);
 
+  /// Match cache-miss records to a function before CFG construction.
+  void matchProfileCacheMissData(BinaryFunction &BF);
+
   /// Check how closely \p BranchData matches the function \p BF.
   /// Return accuracy (ranging from 0.0 to 1.0) of the matching.
   float evaluateProfileData(BinaryFunction &BF,
@@ -297,7 +339,8 @@ protected:
   ///
   /// Return true if the branch is valid, false otherwise.
   bool recordBranch(BinaryFunction &BF, uint64_t From, uint64_t To,
-                    uint64_t Count = 1, uint64_t Mispreds = 0) const;
+                    uint64_t Count = 1, uint64_t Mispreds = 0,
+                    CycleStats Cycles = {}) const;
 
   /// Parses the input bolt data file into internal data structures. We expect
   /// the file format to follow the syntax below.
@@ -373,6 +416,10 @@ protected:
   FuncBasicSampleData *
   getFuncBasicSampleData(const std::vector<StringRef> &FuncNames);
 
+  /// Return cache-miss data matching one of the names in \p FuncNames.
+  FuncCacheMissData *
+  getCacheMissDataForNames(const std::vector<StringRef> &FuncNames);
+
   /// Return a vector of all FuncBranchData matching the list of names.
   /// Internally use fuzzy matching to match special names like LTO-generated
   /// function names.
@@ -384,6 +431,10 @@ protected:
   /// function names.
   std::vector<FuncMemData *>
   getMemDataForNamesRegex(const std::vector<StringRef> &FuncNames);
+
+  /// Return cache-miss data using fuzzy matching for volatile function names.
+  std::vector<FuncCacheMissData *>
+  getCacheMissDataForNamesRegex(const std::vector<StringRef> &FuncNames);
 
   /// Return branch data profile associated with function \p BF  or nullptr
   /// if the function has no associated profile.
@@ -413,13 +464,29 @@ protected:
     FuncsToMemData[&BF] = FMD;
   }
 
+  /// Return cache-miss data associated with \p BF, or nullptr if absent.
+  FuncCacheMissData *getCacheMissData(const BinaryFunction &BF) const {
+    auto FCMDI = FuncsToCacheMisses.find(&BF);
+    if (FCMDI == FuncsToCacheMisses.end())
+      return nullptr;
+    return FCMDI->second;
+  }
+
+  /// Associate cache-miss data with \p BF.
+  void setCacheMissData(const BinaryFunction &BF, FuncCacheMissData *FCMD) {
+    FuncsToCacheMisses[&BF] = FCMD;
+  }
+
   using NamesToBranchesMapTy = std::map<StringRef, FuncBranchData>;
   using NamesToBasicSamplesMapTy = std::map<StringRef, FuncBasicSampleData>;
   using NamesToMemEventsMapTy = std::map<StringRef, FuncMemData>;
+  using NamesToCacheMissEventsMapTy = std::map<StringRef, FuncCacheMissData>;
   using FuncsToBranchesMapTy =
       std::unordered_map<const BinaryFunction *, FuncBranchData *>;
   using FuncsToMemDataMapTy =
       std::unordered_map<const BinaryFunction *, FuncMemData *>;
+  using FuncsToCacheMissesMapTy =
+      std::unordered_map<const BinaryFunction *, FuncCacheMissData *>;
 
   /// Dumps the entire data structures parsed. Used for debugging.
   void dump() const;
@@ -455,20 +522,32 @@ protected:
   ErrorOr<StringRef> parseString(char EndChar, bool EndNl = false);
   ErrorOr<int64_t> parseNumberField(char EndChar, bool EndNl = false);
   ErrorOr<uint64_t> parseHexField(char EndChar, bool EndNl = false);
-  ErrorOr<Location> parseLocation(char EndChar, bool EndNl, bool ExpectMemLoc);
+  struct CacheMissBindingStats {
+    uint64_t Bound = 0, BadPC = 0, NonLoad = 0;
+  };
+  void bindCacheMissProfile(BinaryFunction &Function,
+                            CacheMissBindingStats &Stats);
+  std::error_code sortAndMergeBranches();
+
+  ErrorOr<Location> parseLocation(char EndChar, bool EndNl, char Kind);
   ErrorOr<Location> parseLocation(char EndChar, bool EndNl = false) {
-    return parseLocation(EndChar, EndNl, false);
+    return parseLocation(EndChar, EndNl, '0');
   }
   ErrorOr<Location> parseMemLocation(char EndChar, bool EndNl = false) {
-    return parseLocation(EndChar, EndNl, true);
+    return parseLocation(EndChar, EndNl, '3');
+  }
+  ErrorOr<Location> parseCacheMissLocation(char EndChar, bool EndNl = false) {
+    return parseLocation(EndChar, EndNl, '6');
   }
   ErrorOr<BranchInfo> parseBranchInfo();
   ErrorOr<BasicSampleInfo> parseSampleInfo();
   ErrorOr<MemInfo> parseMemInfo();
+  ErrorOr<CacheMissInfo> parseCacheMissInfo();
   ErrorOr<bool> maybeParseNoLBRFlag();
   ErrorOr<bool> maybeParseFlag(StringRef Flag);
   bool hasBranchData();
   bool hasMemData();
+  bool hasCacheMissData();
 
   /// An in-memory copy of the input data file - owns strings used in reader.
   std::unique_ptr<MemoryBuffer> FileBuf;
@@ -479,17 +558,22 @@ protected:
   NamesToBranchesMapTy NamesToBranches;
   NamesToBasicSamplesMapTy NamesToBasicSamples;
   NamesToMemEventsMapTy NamesToMemEvents;
+  NamesToCacheMissEventsMapTy NamesToCacheMissEvents;
   FuncsToBranchesMapTy FuncsToBranches;
   FuncsToMemDataMapTy FuncsToMemData;
+  FuncsToCacheMissesMapTy FuncsToCacheMisses;
   bool NoLBRMode{false};
   bool BATMode{false};
   bool SymbolsMode{false};
+  /// Prefetch extension; ordinary fdata remains unchanged.
+  std::optional<PrefetchProfileHeader> PrefetchProfile;
   StringSet<> EventNames;
   static const char FieldSeparator = ' ';
 
   /// Maps of common LTO names to possible matching profiles.
   StringMap<std::vector<FuncBranchData *>> LTOCommonNameMap;
   StringMap<std::vector<FuncMemData *>> LTOCommonNameMemMap;
+  StringMap<std::vector<FuncCacheMissData *>> LTOCommonNameCacheMissMap;
 
 public:
   void setParsingBuffer(StringRef Buffer) { ParsingBuf = Buffer; }

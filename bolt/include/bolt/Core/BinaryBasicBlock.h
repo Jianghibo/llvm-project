@@ -15,6 +15,7 @@
 #ifndef BOLT_CORE_BINARY_BASIC_BLOCK_H
 #define BOLT_CORE_BINARY_BASIC_BLOCK_H
 
+#include "bolt/Core/CycleStats.h"
 #include "bolt/Core/FunctionLayout.h"
 #include "bolt/Core/MCPlus.h"
 #include "llvm/ADT/GraphTraits.h"
@@ -50,6 +51,7 @@ public:
   struct BinaryBranchInfo {
     uint64_t Count;
     uint64_t MispredictedCount; /// number of branches mispredicted
+    CycleStats Cycles{};
 
     bool operator<(const BinaryBranchInfo &Other) const {
       return std::tie(Count, MispredictedCount) <
@@ -575,7 +577,9 @@ public:
                     uint64_t MispredictedCount = 0);
 
   void addSuccessor(BinaryBasicBlock *Succ, const BinaryBranchInfo &BI) {
+    const CycleStats Cycles = BI.Cycles;
     addSuccessor(Succ, BI.Count, BI.MispredictedCount);
+    BranchInfo.back().Cycles = Cycles;
   }
 
   /// Add a range of successors.
@@ -595,7 +599,8 @@ public:
   /// Replace Succ with NewSucc.  This routine is helpful for preserving
   /// the order of conditional successors when editing the CFG.
   void replaceSuccessor(BinaryBasicBlock *Succ, BinaryBasicBlock *NewSucc,
-                        uint64_t Count = 0, uint64_t MispredictedCount = 0);
+                        uint64_t Count = 0, uint64_t MispredictedCount = 0,
+                        CycleStats Cycles = {});
 
   /// Move all of this block's successors to a new block, and set the
   /// execution count of this new block with our execution count. This is
@@ -720,6 +725,10 @@ public:
     Instructions.clear();
     NumPseudos = 0;
   }
+
+  /// Release unused instruction storage after splitting a block. Invalidates
+  /// instruction pointers and iterators.
+  void shrinkInstructions() { Instructions.shrink_to_fit(); }
 
   /// Retrieve iterator for \p Inst or return end iterator if instruction is not
   /// from this basic block.

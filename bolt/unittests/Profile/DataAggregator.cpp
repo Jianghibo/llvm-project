@@ -8,7 +8,9 @@
 
 #include "bolt/Profile/DataAggregator.h"
 #include "bolt/Core/BinaryContext.h"
+#include "bolt/Core/BinaryFunction.h"
 #include "llvm/BinaryFormat/ELF.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/TargetSelect.h"
@@ -119,7 +121,226 @@ TEST(DataAggregatorTest, buildID) {
   ASSERT_EQ(*FileName, "File2");
   FileName = DA.getFileNameForBuildID("333");
   ASSERT_EQ(*FileName, "File3");
+
+  DA.setParsingBuffer("11112222 File1\n111100000000 File2\n");
+  FileName = DA.getFileNameForBuildID("1111");
+  ASSERT_TRUE(FileName);
+  EXPECT_EQ(*FileName, "File2");
 }
+
+namespace llvm {
+namespace bolt {
+
+class DataAggregatorTester : public testing::Test {
+protected:
+  void SetUp() override {
+    // Avoid spawning perf processes.
+    opts::ReadPreAggregated = true;
+    DA = std::make_unique<DataAggregator>("<pseudo input>");
+  }
+
+  using LBREntry = DataAggregator::LBREntry;
+
+  ErrorOr<LBREntry> parseEntry() { return DA->parseLBREntry(); }
+
+  void prepareContext() {
+    DA->NamesToCacheMissEvents.clear();
+    DA->MemSamples.clear();
+    InitializeNativeTarget();
+    InitializeNativeTargetDisassembler();
+    BC = cantFail(BinaryContext::createBinaryContext(
+        Triple(LLVM_DEFAULT_TARGET_TRIPLE),
+        std::make_shared<orc::SymbolStringPool>(), "<pseudo input>", nullptr,
+        false, nullptr, {outs(), errs()}));
+    BC->FirstAllocAddress = 0x1000;
+    BC->LayoutStartAddress = 0x2000;
+    BinarySection &Section = BC->registerOrUpdateSection(
+        ".text", ELF::SHT_PROGBITS, ELF::SHF_ALLOC | ELF::SHF_EXECINSTR);
+    BC->createBinaryFunction("loop", Section, 0x1000, 0x100)->setMaxSize(0x100);
+    DA->BC = BC.get();
+    DA->BinaryMMapInfo[1] = {};
+  }
+
+  void aggregate(ArrayRef<LBREntry> Entries) {
+    prepareContext();
+    DataAggregator::PerfBranchSample Sample;
+    Sample.LBR.append(Entries.begin(), Entries.end());
+    DA->parseLBRSample(Sample, /*NeedsSkylakeFix=*/false);
+  }
+
+  CycleStats getCycles(uint64_t From, uint64_t To) const {
+    CycleStats Cycles;
+    for (const auto &[Trace, Info] : DA->TraceMap)
+      if (Trace.Branch == From && Trace.From == To)
+        Cycles.merge(Info.Cycles);
+    return Cycles;
+  }
+
+  std::error_code parseMemory(StringRef Input) {
+    DA->setParsingBuffer(Input);
+    return DA->parseMemEvents();
+  }
+
+  Error aggregateMemory() { return DA->processCacheMissEvents(); }
+
+  std::pair<uint64_t, uint64_t> cacheCounts(uint64_t Offset) {
+    auto &Profile = DA->NamesToCacheMissEvents.at("loop");
+    const auto &Counts = Profile.Data[Profile.Index.at(Offset)];
+    return {Counts.MissCount, Counts.AccessCount};
+  }
+
+  unsigned legacyMemorySamples() {
+    return llvm::count_if(
+        DA->MemSamples, [](const auto &Sample) { return !Sample.IsCacheMiss; });
+  }
+
+  Error samplingAttrs(StringRef Input) {
+    DA->CacheMissHeader = {};
+    DA->CacheMissHeader.BuildID = "11223344";
+    DA->CacheMissHeader.Event = "llc_miss";
+    return DA->parseCacheMissAttrs(Input);
+  }
+
+  Error mergeSamplingAttrs(uint64_t Period) {
+    DataAggregator Other("<pseudo input>");
+    Other.CacheMissHeader = DA->CacheMissHeader;
+    Other.CacheMissHeader.Period = Period;
+    return DA->mergeFrom(Other);
+  }
+
+  std::pair<uint64_t, uint64_t> relocatedMemory() {
+    prepareContext();
+    DA->BinaryMMapInfo[1].BaseAddress = 0x100000;
+    DA->BinaryMMapInfo[1].MMapAddress = 0x100000;
+    DA->BinaryMMapInfo[1].Size = 0x2000;
+    BC->HasFixedLoadAddress = false;
+    EXPECT_FALSE(parseMemory("1 llc-access: 800000 101010\n"));
+    return {DA->MemSamples.front().PC, DA->MemSamples.front().Addr};
+  }
+
+  std::error_code parseBranches(StringRef Input) {
+    DA->setParsingBuffer(Input);
+    return DA->parseBranchEvents();
+  }
+
+  void TearDown() override {
+    cl::getRegisteredOptions()["cache-miss"]->reset();
+  }
+
+  std::unique_ptr<BinaryContext> BC;
+  std::unique_ptr<DataAggregator> DA;
+};
+
+TEST_F(DataAggregatorTester, LegacyLBREntries) {
+  DA->setParsingBuffer("0x1010/0x1000/P/-/-/12 0x1020/0x1000/M/-/-/9\n");
+  auto First = parseEntry();
+  ASSERT_TRUE(First);
+  EXPECT_EQ(First->From, 0x1010u);
+  EXPECT_EQ(First->To, 0x1000u);
+  EXPECT_EQ(First->Cycles, 12);
+  EXPECT_FALSE(First->Mispred);
+  auto Second = parseEntry();
+  ASSERT_TRUE(Second);
+  EXPECT_EQ(Second->From, 0x1020u);
+  EXPECT_EQ(Second->Cycles, 9);
+  EXPECT_TRUE(Second->Mispred);
+}
+
+TEST_F(DataAggregatorTester, ExtendedLBREntries) {
+  DA->setParsingBuffer("0x1010/0x1000/P/-/-/12/COND/-   "
+                       "0x1020/0x1000/M/-/-/9/UNCOND/-  \n");
+  auto First = parseEntry();
+  ASSERT_TRUE(First);
+  EXPECT_EQ(First->Cycles, 12);
+  auto Second = parseEntry();
+  ASSERT_TRUE(Second);
+  EXPECT_EQ(Second->From, 0x1020u);
+  EXPECT_EQ(Second->Cycles, 9);
+}
+
+TEST_F(DataAggregatorTester, InvalidLBREntries) {
+  for (StringRef Input :
+       {"0x1010/0x1000/P/-/-\n", "bad/0x1000/P/-/-/12\n",
+        "0x1010/bad/P/-/-/12\n", "0x1010/0x1000/?/-/-/12\n",
+        "0x1010/0x1000/P/-/-/bad\n", "0x1010/0x1000/P/-/-/-1\n",
+        "0x1010/0x1000/P/-/-/12"}) {
+    SCOPED_TRACE(Input.str());
+    DA->setParsingBuffer(Input);
+    EXPECT_FALSE(parseEntry());
+  }
+}
+
+TEST_F(DataAggregatorTester, TruncatedEntryDoesNotConsumeNextEntry) {
+  DA->setParsingBuffer("0x1010/0x1000/P/-/- 0x1020/0x1000/P/-/-/9\n");
+  EXPECT_FALSE(parseEntry());
+  auto Second = parseEntry();
+  ASSERT_TRUE(Second);
+  EXPECT_EQ(Second->From, 0x1020u);
+  EXPECT_EQ(Second->Cycles, 9);
+}
+
+TEST_F(DataAggregatorTester, SingleBranchHasNoInterval) {
+  aggregate({{0x1010, 0x1000, false, false, 12}});
+  EXPECT_EQ(getCycles(0x1010, 0x1000).Total, 0);
+  EXPECT_EQ(getCycles(0x1010, 0x1000).Samples, 0);
+}
+
+TEST_F(DataAggregatorTester, RepeatedBranchInterval) {
+  aggregate({{0x1010, 0x1000, false, false, 100},
+             {0x1020, 0x1000, false, false, 7},
+             {0x1010, 0x1000, false, false, 20}});
+  EXPECT_EQ(getCycles(0x1010, 0x1000).Total, 107);
+  EXPECT_EQ(getCycles(0x1010, 0x1000).Samples, 1);
+  EXPECT_EQ(getCycles(0x1020, 0x1000).Total, 0);
+  EXPECT_EQ(getCycles(0x1020, 0x1000).Samples, 0);
+}
+
+TEST_F(DataAggregatorTester, MultipleBranchIntervals) {
+  aggregate({{0x1010, 0x1000, false, false, 100},
+             {0x1020, 0x1000, false, false, 7},
+             {0x1010, 0x1000, false, false, 20},
+             {0x1020, 0x1000, false, false, 3},
+             {0x1010, 0x1000, false, false, 40}});
+  EXPECT_EQ(getCycles(0x1010, 0x1000).Total, 130);
+  EXPECT_EQ(getCycles(0x1010, 0x1000).Samples, 2);
+}
+
+TEST_F(DataAggregatorTester, IntervalIncludesUnmappedBranches) {
+  aggregate({{0x1010, 0x1000, false, false, 100},
+             {0x3000, 0x3010, false, false, 7},
+             {0x1010, 0x1000, false, false, 20}});
+  EXPECT_EQ(getCycles(0x1010, 0x1000).Total, 107);
+  EXPECT_EQ(getCycles(0x1010, 0x1000).Samples, 1);
+}
+
+TEST_F(DataAggregatorTester, CacheMissCountsAndEventFiltering) {
+  auto *Option = cl::getRegisteredOptions()["cache-miss"];
+  ASSERT_FALSE(Option->addOccurrence(0, "cache-miss", "llc_miss"));
+  for (StringRef Input : {"1 llc-access: a000 1010\n1 llc-miss: a000 1010\n"
+                          "1 llc-access: a000 1020\n1 llc-miss: a000 1020\n"
+                          "1 llc-access: a000 1010\n1 l1d-miss: a000 1010\n"
+                          "1 mem-loads: a000 1010\n",
+                          "1 mem-loads: a000 1010\n1 llc-miss: a000 1020\n"
+                          "1 llc-access: a000 1010\n1 l1d-miss: a000 1010\n"
+                          "1 llc-miss: a000 1010\n1 llc-access: a000 1020\n"
+                          "1 llc-access: a000 1010\n"}) {
+    prepareContext();
+    ASSERT_FALSE(parseMemory(Input));
+    EXPECT_EQ(legacyMemorySamples(), 1u);
+    ASSERT_FALSE(bool(aggregateMemory()));
+    EXPECT_EQ(cacheCounts(0x10), std::make_pair(uint64_t(1), uint64_t(2)));
+    EXPECT_EQ(cacheCounts(0x20), std::make_pair(uint64_t(1), uint64_t(1)));
+  }
+  Option->reset();
+  prepareContext();
+  ASSERT_FALSE(parseMemory("1 llc-access: a000 1010\n"
+                           "1 mem-loads: a000 1010\n"));
+  EXPECT_EQ(legacyMemorySamples(), 1u);
+  ASSERT_FALSE(bool(aggregateMemory()));
+}
+
+} // namespace bolt
+} // namespace llvm
 
 TEST_F(PreAggregatedTestHelper, parseHexField) {
   auto Res = parseHex("4b196f\n");
@@ -393,3 +614,46 @@ TEST_F(PreAggregatedX86TestHelper, MultipleEntries) {
 }
 
 #endif
+namespace llvm {
+namespace bolt {
+
+TEST_F(DataAggregatorTester, BranchSamplesAndParseErrors) {
+  prepareContext();
+  ASSERT_FALSE(parseBranches("1\n"
+                             "1 0x1010/0x1000/P/-/-/12/COND/- \n"));
+  EXPECT_TRUE(parseBranches("1 0x1010/0x1000/P/-/-\n"));
+}
+
+TEST_F(DataAggregatorTester, PrefetchSamplingAttributes) {
+  StringRef Valid =
+      "arm_spe_0/load_filter=1/: type: 25, config: 0x200000001, "
+      "{ sample_period, sample_freq }: 1024, sample_type: IP|TID\n";
+  EXPECT_FALSE(bool(samplingAttrs(Valid)));
+  for (StringRef Invalid :
+       {"cycles: config: 0, { sample_period, sample_freq }: 1024\n",
+        "arm_spe_0//: config: 0x200000001, "
+        "{ sample_period, sample_freq }: 1024, config2: 1\n",
+        "arm_spe_0//: config: 0x200000001, "
+        "{ sample_period, sample_freq }: 1024, freq: 1\n"}) {
+    SCOPED_TRACE(Invalid.str());
+    auto E = samplingAttrs(Invalid);
+    EXPECT_TRUE(bool(E));
+    consumeError(std::move(E));
+  }
+  // Relocate the code PC, while retaining the data VA independently.
+  auto *Option = cl::getRegisteredOptions()["cache-miss"];
+  ASSERT_FALSE(Option->addOccurrence(0, "cache-miss", "llc_miss"));
+  ASSERT_FALSE(bool(samplingAttrs(Valid)));
+  EXPECT_FALSE(bool(mergeSamplingAttrs(1024)));
+  auto Mismatch = mergeSamplingAttrs(2048);
+  EXPECT_TRUE(bool(Mismatch));
+  consumeError(std::move(Mismatch));
+  EXPECT_EQ(relocatedMemory(),
+            std::make_pair(uint64_t(0x1010), uint64_t(0x800000)));
+  EXPECT_TRUE(parseMemory("PERF_RECORD_LOST 10\n"));
+  EXPECT_TRUE(parseMemory("instruction trace error: lost data\n"));
+  Option->reset();
+}
+
+} // namespace bolt
+} // namespace llvm

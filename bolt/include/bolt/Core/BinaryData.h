@@ -236,6 +236,22 @@ inline raw_ostream &operator<<(raw_ostream &OS,
   return OS;
 }
 
+/// Sampled miss and access counts attached to an original load instruction.
+struct CacheMissProfile {
+  uint64_t MissCount;   ///< Number of sampled cache misses.
+  uint64_t AccessCount; ///< Number of sampled accesses.
+  bool operator==(const CacheMissProfile &Other) const {
+    return MissCount == Other.MissCount && AccessCount == Other.AccessCount;
+  }
+};
+
+inline raw_ostream &operator<<(raw_ostream &OS,
+                               const bolt::CacheMissProfile &CMP) {
+  OS << "Misses: " << CMP.MissCount << ", Accesses: " << CMP.AccessCount
+     << "\n";
+  return OS;
+}
+
 } // namespace bolt
 } // namespace llvm
 
