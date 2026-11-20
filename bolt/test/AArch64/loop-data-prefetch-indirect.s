@@ -9,8 +9,6 @@
 # RUN: llvm-bolt %t.exe -o %t.off --enable-loop-data-prefetch --loop-prefetch-distance=0 --loop-prefetch-hints=%t/hints --verify-cfg 2>&1 | FileCheck %s --check-prefix=OFF
 # RUN: llvm-bolt %t.exe -o %t.on --enable-loop-data-prefetch --loop-prefetch-indirect --loop-prefetch-distance=0 --loop-prefetch-hints=%t/hints --loop-prefetch-diagnostics --verify-cfg 2>&1 | FileCheck %s --check-prefix=DIAG
 # RUN: llvm-objdump -d --no-print-imm-hex %t.on | FileCheck %s --check-prefix=CODE
-# RUN: llvm-bolt %t.exe -o %t.mixed --enable-loop-data-prefetch --loop-prefetch-indirect --loop-prefetch-distance=4 --loop-prefetch-hints=%t/hints --loop-prefetch-cache-line-size=64 --loop-prefetch-max-instructions=16 --verify-cfg
-# RUN: llvm-objdump -d --no-print-imm-hex --disassemble-symbols=gather32 %t.mixed | FileCheck %s --check-prefix=MIXED
 # RUN: llvm-bolt %t.exe -o %t.zero --enable-loop-data-prefetch --loop-prefetch-indirect --loop-prefetch-distance=0 --loop-prefetch-hints=%t/hints --loop-prefetch-max-loop-instructions=0 --verify-cfg 2>&1 | FileCheck %s --check-prefix=OFF
 # RUN: llvm-objdump -d --no-print-imm-hex --disassemble-symbols=gather32 %t.zero | FileCheck %s --check-prefix=ZERO
 # RUN: llvm-bolt %t.exe -o %t.auto --data=%t/profile --enable-loop-data-prefetch --loop-prefetch-indirect --loop-prefetch-latency=40 --loop-prefetch-diagnostics --verify-cfg 2>&1 | FileCheck %s --check-prefix=AUTO
@@ -79,14 +77,6 @@
 # CODE-LABEL: <clobber>:
 # CODE-NOT:  prfm
 
-# MIXED-LABEL: <gather32>:
-# MIXED:      cbnz
-# MIXED:      prfm
-# MIXED:      ldr w3, [x0], #4
-# MIXED:      tbnz
-# MIXED:      ldr {{w[0-9]+}}, [x0, #12]
-# MIXED-NEXT: prfm
-# MIXED:      ldr x4, [x1, w3, sxtw #3]
 
 # ZERO-LABEL: <gather32>:
 # ZERO:      ldr w3, [x0], #4

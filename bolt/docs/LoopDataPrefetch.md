@@ -34,7 +34,7 @@
 
 建议输入在链接时保留 `--emit-relocs`。非重定位模式仍受普通 BOLT 的原函数空间限制，不能容纳增长的函数可能保留原实现；应核对最终输出及 BOLT 的发射诊断。
 
-完整候选计划在修改前构建；失败不会留下部分序列。直接地址路径在原 load 前插入算术及预取，一步指针路径在原 load 后插入。启用直接地址的请求节流时，在该位置拆出预取块及合流块，原 load 及其后续指令位于合流块。原分支的计数和周期随 terminator 移动，新分支仅有估计计数，周期保持未知。新块继承该位置的 CFI、fragment 和地址映射；保留移动指令的标签，更新布局并重建支配树和循环信息。提交前清除临时活跃性 annotation，并按函数释放其分配空间，拆块后释放原块多余的指令容量。原 CFI 规则及其依赖寄存器在序列中保持有效。
+完整候选计划在修改前构建；失败不会留下部分序列。直接地址路径在原 load 前插入算术及预取，一步指针路径在原 load 后插入。间接预取路径在该位置拆出预取块及合流块，原 load 及其后续指令位于合流块。原分支的计数和周期随 terminator 移动，新分支仅有估计计数，周期保持未知。新块继承该位置的 CFI、fragment 和地址映射；保留移动指令的标签，更新布局并重建支配树和循环信息。提交前清除临时活跃性 annotation，并按函数释放其分配空间，拆块后释放原块多余的指令容量。原 CFI 规则及其依赖寄存器在序列中保持有效。
 
 ## SPE profile 转换与诊断
 
@@ -101,7 +101,7 @@ llvm-bolt app -o app.prefetch --enable-loop-data-prefetch \
 
 默认 `D` 是包含候选的该层自然循环的迭代数，范围为 0～1048576；`D=0` 禁用候选。启用批量模式后，被提升的内层候选改以直接父循环迭代数解释 D，详见 P4-03。循环展开后的每次回边对应一个迭代，不能把它当作一个原始数组元素。base/index 的每轮更新分别累计，再乘以 D；64 位索引可将增量折叠到字节位移，32 位索引保留回绕后扩展的顺序。
 
-例如每轮 X 索引增加 2、load 使用 `lsl #3` 时，`D=4` 对应 64 字节提前量。pre-index 使用更新后的访问地址，post-index 使用更新前的访问地址。成对 load 默认保留两个元素的地址，生成两条预取；启用下述缓存行节流时合并为一条。地址计算与原 load 同路径执行；零次循环不会新增循环外预取，短循环和尾部可以产生指向后续迭代的预取提示，不会为此增加实际 load。
+例如每轮 X 索引增加 2、load 使用 `lsl #3` 时，`D=4` 对应 64 字节提前量。pre-index 使用更新后的访问地址，post-index 使用更新前的访问地址。成对 load 默认保留两个元素的地址，生成两条预取。地址计算与原 load 同路径执行；零次循环不会新增循环外预取，短循环和尾部可以产生指向后续迭代的预取提示，不会为此增加实际 load。
 
 手工选择不依赖缺失的 SPE/周期统计；显式提供的 profile 仍须满足原输入格式和 `no_lbr/-nl` 等限制。手工配置会使 Lite 的 profile 热度过滤不再排除候选函数，其他显式函数选择和忽略规则仍然有效。`--loop-data-prefetch` 仅打印 Pass，不能代替 `--enable-loop-data-prefetch`。
 
@@ -118,7 +118,7 @@ add  x1, x1, #1
 
 每次查询都使用该定义之前的源寄存器状态，遇到覆盖优先检查最近定义。跨块时只沿循环内的唯一前驱查找，在合流及 loop header 边界停止，不把上一轮的定义当作当前定义；部分寄存器写入和未支持表达式会拒绝。寄存器 SUB 使用带符号的步长差，例如 `sub x8, x0, x1, lsl #3` 且 x1 每轮加 1 时，D=4 对应 `[x8, #-32]`。
 
-该路径复用当前地址和推导出的增量，仍支持原有 W/X load 寻址、预算、去重及可选缓存行节流，不引入一般路径切片或合流框架。
+该路径复用当前地址和推导出的增量，仍支持原有 W/X load 寻址、预算及去重，不引入一般路径切片或合流框架。
 
 一步指针追逐只复用原程序已经加载的 next 指针：
 
@@ -171,7 +171,7 @@ if (remaining != 0) {
 
 guard 对 32/64 位无符号计数使用不修改 NZCV 的 SUB/BIC/TBNZ。令 `K=D+1`，由于 K 小于符号位，`(remaining-K) & ~remaining` 的最高位可精确判断减法借位，包括 remaining 最高位为 1 的情况。余量不足时整个新访存块均跳过，空循环仍由原入口分支跳过。
 
-新路径复用两个空闲 caller-saved、CFI 排除和现有 CFG 拆块；地址计算、新索引 load、guard、PRFM 及跳转全部计入原预算。不满足预算或寄存器条件时拒绝，不 spill。简单源流通常可使用默认候选预算 8；需要额外物化源地址时，可通过命令行或逐 PC hints 显式增加预算。可选缓存行节流仍用于直接索引流的预取，间接数据地址不套用固定字节步长节流；同一循环中的两类计划共享预算。
+新路径复用两个空闲 caller-saved、CFI 排除和现有 CFG 拆块；地址计算、新索引 load、guard、PRFM 及跳转全部计入原预算。不满足预算或寄存器条件时拒绝，不 spill。简单源流通常可使用默认候选预算 8；需要额外物化源地址时，可通过命令行或逐 PC hints 显式增加预算。同一循环中的直接和间接计划共享预算。
 
 同样支持合法 version 2 profile、校准距离模型和逐 PC hints，诊断标记 `kind=indirect`。离线规划时须给 `loop-data-prefetch-plan.py --indirect`，该状态及完整 BOLT 命令写入报告。静态指令、guard 算术和 profile 入口已有回归；LLVM 24 的限定用例已通过零次、短循环、尾部和 guard page 运行检查，见 [TODO 8.17](LoopDataPrefetch-TODO.md#817-批量与地址访问运行验证及限定扩展2026-11-03)。真实负载收益仍待验收。
 
@@ -221,21 +221,11 @@ D 的单位为直接父循环迭代数；自动距离使用该父循环有效回
 
 `--loop-prefetch-diagnostics` 附带 `latency-cycles`、`iteration-cycle-total`、`iteration-cycle-samples`、`cycles-source` 和最终 D。无延迟、缺失/歧义周期、超距离、低 miss 样本或预算不足均有明确拒绝原因。汇总分别报告完整计划数、接受 load 数、PRFM 数及新增指令预算数；后续布局可能消除已计入预算的跳转。
 
-## 缓存行请求节流
+## 缓存行参数
 
-默认 `--loop-prefetch-cache-line-size=0` 关闭节流；明确知道目标 CPU 的缓存行大小后，可指定 16～4096 之间的二次幂，例如：
+普通循环的缓存行请求节流已移除。每轮增加的地址计算、guard 分支和基本块拆分开销高于少插入的预取请求，因此现在每个候选按原访问宽度生成请求；成对 load 默认生成两条预取。
 
-```sh
-llvm-bolt app -o app.prefetch --enable-loop-data-prefetch \
-  --loop-prefetch-distance=64 --loop-prefetch-cache-line-size=64 \
-  --loop-prefetch-max-instructions=12 --loop-prefetch-diagnostics --verify-cfg
-```
-
-只对非零字节步长绝对值小于缓存行、且 load 所在块支配全部 latch 的候选节流。条件 load 可能错过所有边界迭代，故保留原请求频率；步长不小于缓存行的候选也保持原行为。以未来标量或 pair 访问范围的最后一个字节为目标，每经过一条缓存行只发送一次请求。初始和退出时的部分缓存行可能不发送请求，不影响原程序访存结果。
-
-二次幂步长用低位掩码选择每行的一次请求；其他步长比较未来地址与虚拟前一迭代地址所在的行。计算与分支不修改 NZCV，不增加状态计数器、普通 load/store 或 spill；需要两个空闲临时寄存器，不足时跳过候选。原始地址仍按 W/X 回绕及扩展规则生成。全部地址计算、判断和最多两条新增跳转均计入指令预算；布局修复可能消除其中的跳转。
-
-节流降低请求频率，也增加算术和分支开销。本机连续扫描和部分多流场景出现明显退化，所以保持显式启用；应结合距离、预算及逐 PC 关闭进行测量，自动收益判断属于 P3。没有对齐证明时，不把不同静态地址强行合并为同一缓存行。
+`--loop-prefetch-cache-line-size` 现在只用于外层批量预取的范围计算：请求数为 `ceil((span-1)/line)+1`，请求字节数按 `requests * line` 计入 `--loop-prefetch-batch-max-bytes`。该参数必须与 `--loop-prefetch-batch` 一起使用，单独指定会报错；取值仍为 16～4096 之间的二次幂。
 
 ## 持久化 hints
 
@@ -267,14 +257,14 @@ llvm-bolt app -o app.prefetch --enable-loop-data-prefetch \
 | `--loop-prefetch-max-instructions` | 8 | 每个候选的新增指令上限，hints 可覆盖 |
 | `--loop-prefetch-max-loop-instructions` | 32 | 每个循环的新增指令上限 |
 | `--loop-prefetch-max-function-instructions` | 256 | 每个函数的新增指令上限 |
-| `--loop-prefetch-max-per-loop` | 2 | 每轮最多的预取请求数，pair 默认计两条、节流后计一条 |
+| `--loop-prefetch-max-per-loop` | 2 | 每轮最多的预取请求数，pair 默认计两条 |
 | `--loop-prefetch-max-per-function` | 32 | 每个函数静态预取指令数上限 |
 | `--loop-prefetch-max-registers` | 2 | 每个候选可用的空闲临时 GPR 上限，范围 0～2 |
 | `--loop-prefetch-analysis-limit` | 20000 | 每个函数分析的原指令数上限，包含 CFI pseudos |
 
 AArch64 每条新增指令为 4 字节，指令预算同时约束代码增长。不引入 spill；无安全寄存器或超预算时跳过。可直接编码的 base+位移预取不需要临时寄存器。可证明有效地址相同且中间没有地址寄存器定义的块内请求会去重；没有对齐依据时，不假定不同地址一定处于同一 cache line。多流共享循环及函数预算；先完成合法计划，再优先分配给手工配置、较高 miss 样本的候选，miss 数相同时选择新增指令较少的计划。同等优先级保持原顺序，最终仍按原始位置逆序提交。排序仅是同协议下的资源分配依据，不是收益保证。
 
-`--loop-prefetch-diagnostics` 输出函数、原始 PC、循环入口、配置来源、D、hint、候选预算、opcode、地址分量、实际增量、生成指令数及实际采用的 `cache-line` 大小（0 表示该候选不节流）。常见原因包括 `unproven recurrence`、`unsupported address`、`unsupported loop context`、`opaque CFI expression`、寄存器不足和预算限制。函数/循环整体拒绝时可能没有单条候选 PC。其中 base-delta、offset、writeback 的单位为字节，index-delta 的单位为索引寄存器的增量；D 与步长的有符号乘积溢出时拒绝，W 索引再按 32 位截断。日志中的 `inserted` 表示计划通过并提交到 BOLT 内部；最终发射仍受普通 BOLT 约束，应核对输出机器码，也不代表已取得性能收益。
+`--loop-prefetch-diagnostics` 输出函数、原始 PC、循环入口、配置来源、D、hint、候选预算、opcode、地址分量、实际增量、生成指令数及批量候选使用的 `cache-line` 大小（普通候选为 0）。常见原因包括 `unproven recurrence`、`unsupported address`、`unsupported loop context`、`opaque CFI expression`、寄存器不足和预算限制。函数/循环整体拒绝时可能没有单条候选 PC。其中 base-delta、offset、writeback 的单位为字节，index-delta 的单位为索引寄存器的增量；D 与步长的有符号乘积溢出时拒绝，W 索引再按 32 位截断。日志中的 `inserted` 表示计划通过并提交到 BOLT 内部；最终发射仍受普通 BOLT 约束，应核对输出机器码，也不代表已取得性能收益。
 
 自动路径要求足够的 access 样本、miss rate 超过阈值及显式校准延迟；迭代时间取校准覆盖或有效的单 latch profile 周期。缺失输入或超距离时跳过，具体规则见自动距离章节。不存在隐含延迟和迭代偏移常数。
 
@@ -344,7 +334,7 @@ python3 bolt/utils/loop-data-prefetch-bench.py \
 
 程序结果不一致、命令失败或超过显式门槛都会返回非零，已获取的记录仍写入 `report.json`；`completed` 区分完整运行与中途失败。生产验收还需独立输入、目标环境和约定的误差规则，脚本的受控程序不能提供这些条件。
 
-本机后续实验共执行 250 次：5 种访问模式 × 1/4 线程 × 普通 BOLT 和四种预取配置 × 每组 5 次，数据总量 512 MiB、重复 20 次、绑定 CPU 24～27。校验和全部一致；详细数据在 TODO 8.6。单线程相对普通 BOLT 的中位耗时变化如下，负值表示耗时减少：
+以下历史实验包含已移除的普通循环缓存行节流配置，仅保留当时的工程记录；当前实现不再生成该模式的 guard。本机后续实验共执行 250 次：5 种访问模式 × 1/4 线程 × 普通 BOLT 和四种预取配置 × 每组 5 次，数据总量 512 MiB、重复 20 次、绑定 CPU 24～27。校验和全部一致；详细数据在 TODO 8.6。单线程相对普通 BOLT 的中位耗时变化如下，负值表示耗时减少：
 
 | 场景 | D=16，无节流 | D=16，64 字节节流 | D=64，无节流 | D=64，64 字节节流 |
 | --- | ---: | ---: | ---: | ---: |

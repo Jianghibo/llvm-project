@@ -30,23 +30,10 @@
 # RUN:   --loop-prefetch-distance=4 --verify-cfg
 # RUN: llvm-objdump -d --no-print-imm-hex %t.so.out | FileCheck %s
 # RUN: %if target=aarch64{{.*}} %{ %python %t/check-dso.py %t.so.out %}
-# RUN: llvm-bolt %t.exe -o %t.throttled --enable-loop-data-prefetch \
-# RUN:   --loop-prefetch-distance=4 --loop-prefetch-cache-line-size=64 \
-# RUN:   --loop-prefetch-diagnostics --enable-bat --verify-cfg 2>&1 | FileCheck %s --check-prefix=THROTTLE
-# RUN: llvm-objdump -d --no-print-imm-hex %t.throttled | FileCheck %s --check-prefix=GUARD
-# RUN: %if target=aarch64{{.*}} %{ %t.throttled %}
-# RUN: llvm-bolt %t.pie -o %t.pie.throttled --enable-loop-data-prefetch \
-# RUN:   --loop-prefetch-distance=4 --loop-prefetch-cache-line-size=64 --verify-cfg
-# RUN: %if target=aarch64{{.*}} %{ %t.pie.throttled %}
-# RUN: llvm-bolt %t.so -o %t.so.throttled --enable-loop-data-prefetch \
-# RUN:   --loop-prefetch-distance=4 --loop-prefetch-cache-line-size=64 --verify-cfg
-# RUN: %if target=aarch64{{.*}} %{ %python %t/check-dso.py %t.so.throttled %}
-# RUN: llvm-bolt %t.exe -o %t.throttle-limit --enable-loop-data-prefetch \
-# RUN:   --loop-prefetch-distance=4 --loop-prefetch-cache-line-size=64 \
-# RUN:   --loop-prefetch-max-registers=0 --loop-prefetch-diagnostics 2>&1 | \
-# RUN:   FileCheck %s --check-prefix=GUARD-LIMIT
 # RUN: not llvm-bolt %t.exe -o %t.bad --enable-loop-data-prefetch \
 # RUN:   --loop-prefetch-cache-line-size=48 2>&1 | FileCheck %s --check-prefix=BAD-LINE
+# RUN: not llvm-bolt %t.exe -o %t.bad --enable-loop-data-prefetch \
+# RUN:   --loop-prefetch-cache-line-size=64 2>&1 | FileCheck %s --check-prefix=LINE-BATCH
 # RUN: not llvm-bolt %t.exe -o %t.bad --enable-loop-data-prefetch \
 # RUN:   --loop-prefetch-hints=%t/bad-id 2>&1 | FileCheck %s --check-prefix=BAD-ID
 # RUN: not llvm-bolt %t.exe -o %t.bad --enable-loop-data-prefetch \
@@ -125,34 +112,8 @@
 # LARGE:      add x{{[0-9]+}}, x0, x{{[0-9]+}}
 # LARGE:      prfm pldl3strm
 
-# THROTTLE-DAG: BOLT-PREFETCH: with_cfi {{.*}} cache-line=64
-# THROTTLE-DAG: BOLT-PREFETCH: pre_index {{.*}} cache-line=64
-# GUARD-LIMIT: throttling needs two dead registers
 # BAD-LINE: cache line size must be 0 or a power of two
-# GUARD-LABEL: <with_cfi>:
-# GUARD:      and x2, x0, #0x38
-# GUARD-NEXT: cbnz x2,
-# GUARD:      prfm pldl1keep, [x0]
-# GUARD-LABEL: <pre_index>:
-# GUARD:      and x3, x2, #0x30
-# GUARD:      prfm pldl1keep, [x2]
-# GUARD-NOT:  prfm
-# GUARD:      ldp x2, x3,
-# GUARD-LABEL: <odd_stride>:
-# GUARD:      sub [[ODD_TMP:x[0-9]+]], [[ODD_ADDR:x[0-9]+]], #3
-# GUARD-NEXT: eor [[ODD_TMP]], [[ODD_TMP]], [[ODD_ADDR]]
-# GUARD-NEXT: lsr [[ODD_TMP]], [[ODD_TMP]], #6
-# GUARD-NEXT: cbz [[ODD_TMP]],
-# GUARD:      prfm pldl1keep, {{\[}}[[ODD_ADDR]]{{\]}}
-# GUARD-LABEL: <reverse_stride>:
-# GUARD:      add [[REV_TMP:x[0-9]+]], [[REV_ADDR:x[0-9]+]], #3
-# GUARD-NEXT: eor [[REV_TMP]], [[REV_TMP]], [[REV_ADDR]]
-# GUARD-NEXT: lsr [[REV_TMP]], [[REV_TMP]], #6
-# GUARD-NEXT: cbz [[REV_TMP]],
-# GUARD-LABEL: <conditional_load>:
-# GUARD-NOT:  and
-# GUARD:      prfm pldl1keep, [x2, #32]
-# GUARD-NEXT: ldr x2, [x0, x1, lsl #3]
+# LINE-BATCH: loop-prefetch-cache-line-size requires --loop-prefetch-batch
 
 #--- input.s
 .text

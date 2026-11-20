@@ -142,7 +142,7 @@ def main():
     parser.add_argument("--cpus", type=integers)
     parser.add_argument("--threads", type=integers, default=[1, 4])
     parser.add_argument("--distances", type=integers, default=[16, 64])
-    parser.add_argument("--lines", type=integers, default=[0, 64])
+    parser.add_argument("--lines", type=integers, default=[0])
     parser.add_argument("--per-pc", action="store_true",
                         help="scan one load at a time using build-id-bound hints")
     parser.add_argument("--latency", type=int, default=0)
@@ -189,12 +189,13 @@ def main():
         or not args.distances
         or any(not 1 <= d <= 1048576 for d in args.distances)
         or not args.lines
-        or any(n and (n < 16 or n > 4096 or n & (n - 1)) for n in args.lines)
         or not set(modes) <= {"sequential", "strided", "records", "streams2", "streams4"}
         or not 0 <= args.large_functions <= 4096
         or not 1 <= args.large_body_instructions <= 65536
     ):
         parser.error("invalid workload, distance, line size, or scale")
+    if any(args.lines):
+        parser.error("cache-line throttling was removed; --lines must be 0")
     available = os.sched_getaffinity(0)
     cpus = args.cpus if args.cpus is not None else sorted(available)[:4]
     if not cpus or not set(cpus) <= available:

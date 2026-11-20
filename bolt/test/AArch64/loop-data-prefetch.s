@@ -7,7 +7,7 @@
 # RUN: llvm-objdump -d --no-print-imm-hex --disassemble-symbols=forward,negative,immediate,indirect,no_cycles,pair %t.out | FileCheck %s
 # RUN: %if target=aarch64{{.*}} %{ %t.exe && %t.out %}
 # RUN: llvm-bolt %t.exe -o %t.layout --data %t/profile --lite=0 \
-# RUN:   --enable-loop-data-prefetch --loop-prefetch-latency=200 --loop-prefetch-cache-line-size=64 \
+# RUN:   --enable-loop-data-prefetch --loop-prefetch-latency=200 \
 # RUN:   --reorder-blocks=ext-tsp --split-functions --split-all-cold --verify-cfg
 # RUN: %if target=aarch64{{.*}} %{ %t.layout %}
 # RUN: not llvm-bolt %t.exe -o %t.bad --data %t/no_lbr \
@@ -47,6 +47,14 @@
 # RUN: llvm-nm %t.exe > %t/symbols
 # RUN: not env BOLT_TEST_NO_BRANCH=1 %python %t/convert.py perf2bolt %t.exe -p %t/perf.data \
 # RUN:   -o %t.bad --cache-miss=llc_miss 2>&1 | FileCheck %s --check-prefix=NO-BRANCH
+# RUN: env BOLT_TEST_ORPHAN_MEM=1 %python %t/convert.py perf2bolt %t.exe -p %t/perf.data \
+# RUN:   -o %t.orphan-generated --cache-miss=llc_miss 2>&1 | FileCheck %s --check-prefix=ORPHAN-GEN
+# RUN: llvm-bolt %t.exe --data %t.orphan-generated -o %t.orphan-generated.out --lite=0 \
+# RUN:   --enable-loop-data-prefetch --loop-prefetch-latency=200 --verify-cfg 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=ORPHAN-USE
+# RUN: llvm-bolt %t.exe --data %t/orphan -o %t.orphan-reader.out --lite=0 \
+# RUN:   --enable-loop-data-prefetch --loop-prefetch-latency=200 --verify-cfg 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=ORPHAN-READER
 # RUN: not llvm-bolt %t.exe --data %t/legacy -o %t.bad --enable-loop-data-prefetch --loop-prefetch-latency=200 2>&1 | \
 # RUN:   FileCheck %s --check-prefix=LEGACY
 
@@ -107,6 +115,11 @@
 # IDENTITY: prefetch profile build-id does not match input
 # PROTOCOL: cannot merge incompatible identities, sampling attributes
 # NO-BRANCH: require branch records from a supported non--nl source
+# ORPHAN-GEN: BOLT-WARNING: ignoring 1 cache-miss functions without branch records
+# ORPHAN-GEN: PERF2BOLT: wrote {{.*}} cache miss objects
+# ORPHAN-USE: number of prefetch instructions inserted: 1
+# ORPHAN-READER: BOLT-WARNING: ignoring 1 cache-miss functions without branch records
+# ORPHAN-READER: number of prefetch instructions inserted: 1
 # LEGACY: prefetch profile has no binary identity
 
 # COUNT: number of prefetch instructions inserted: 5
@@ -285,6 +298,13 @@ bolt-prefetch 2 llc_miss 11223344 1024 200000001 0 0
 7 no_cycles 0 8 10
 7 with_cfi 0 8 10
 
+#--- orphan
+bolt-prefetch 2 llc_miss 11223344 1024 200000001 0 0
+0 [unknown] 0 1 forward 0 0 1 0 0
+1 forward c 1 forward 0 0 15 100 10
+7 forward 0 8 10
+7 pair 0 8 10
+
 #--- no_lbr
 no_lbr cycles
 1 forward 0 10
@@ -352,6 +372,12 @@ elif "pid,event,addr,ip" in args:
         print(f"1 llc-miss: 800000 {pc:x}")
     print(f"1 llc-access: 800000 {pc + 1:x}")
     print(f"1 llc-access: 800000 {pc + 4:x}")
+    if os.environ.get("BOLT_TEST_ORPHAN_MEM"):
+        orphan = symbols["pair"] + bias
+        for _ in range(8):
+            print(f"1 llc-access: 800000 {orphan:x}")
+        for _ in range(6):
+            print(f"1 llc-miss: 800000 {orphan:x}")
 elif not os.environ.get("BOLT_TEST_NO_BRANCH"):
     entry = f"{pc + 12:#x}/{pc:#x}/P/-/-/10/COND/-"
     assert "pid,brstack" in args

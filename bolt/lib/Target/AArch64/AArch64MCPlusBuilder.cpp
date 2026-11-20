@@ -2454,6 +2454,26 @@ public:
     Inst.clear();
   }
 
+  void createRestoreFromStack(MCInst &Inst, const MCPhysReg &StackReg,
+                              int Offset, const MCPhysReg &DstReg,
+                              int Size) const override {
+    assert((Size == 4 || Size == 8) && "unsupported stack restore size");
+    Inst.clear();
+    if (Offset >= 0 && (Offset & (Size - 1)) == 0 &&
+        isUInt<12>(static_cast<uint64_t>(Offset) / Size)) {
+      Inst.setOpcode(Size == 8 ? AArch64::LDRXui : AArch64::LDRWui);
+      Inst.addOperand(MCOperand::createReg(DstReg));
+      Inst.addOperand(MCOperand::createReg(StackReg));
+      Inst.addOperand(MCOperand::createImm(Offset / Size));
+    } else {
+      assert(isInt<9>(Offset) && "unsupported stack offset");
+      Inst.setOpcode(Size == 8 ? AArch64::LDURXi : AArch64::LDURWi);
+      Inst.addOperand(MCOperand::createReg(DstReg));
+      Inst.addOperand(MCOperand::createReg(StackReg));
+      Inst.addOperand(MCOperand::createImm(Offset));
+    }
+  }
+
   bool isTrap(const MCInst &Inst) const override {
     if (Inst.getOpcode() != AArch64::BRK)
       return false;
@@ -3669,19 +3689,18 @@ public:
     auto Future = Target;
     Future.Index = getAliasSized(Scratch[0], Target.IndexBits / 8);
     const MCPhysReg AddressScratch[] = {Scratch[1], Scratch[0]};
-    return createLoopPrefetch(Future, 0, 0, AddressScratch, Hint, Code,
-                              /*MaterializeAddress=*/false);
+    return createLoopPrefetch(Future, 0, 0, AddressScratch, Hint, Code);
   }
 
   bool createLoopPrefetch(const LoopMemoryAccess &A, int64_t BaseDelta,
                           int64_t IndexDelta, ArrayRef<MCPhysReg> Scratch,
-                          StringRef Hint, SmallVectorImpl<MCInst> &Code,
-                          bool MaterializeAddress) const override {
+                          StringRef Hint,
+                          SmallVectorImpl<MCInst> &Code) const override {
     auto Encoding = getPrefetchHintEncoding(Hint);
     if (!Encoding)
       return false;
     auto Address = materializeLoopAddress(A, BaseDelta, IndexDelta, Scratch,
-                                          Code, MaterializeAddress);
+                                          Code, /*MaterializeAddress=*/false);
     if (!Address)
       return false;
     if (Address->Index) {
@@ -3701,45 +3720,6 @@ public:
     return true;
   }
 
-  bool createLoopPrefetchGuard(MCPhysReg Address, MCPhysReg Scratch,
-                               int64_t Step, unsigned LineSize,
-                               const MCSymbol *Skip, MCContext *Ctx,
-                               SmallVectorImpl<MCInst> &Code) const override {
-    const uint64_t Magnitude = Step < 0 ? -uint64_t(Step) : uint64_t(Step);
-    if (!Magnitude || Magnitude >= LineSize || LineSize > 4096 ||
-        !isPowerOf2_32(LineSize))
-      return false;
-    if (isPowerOf2_64(Magnitude)) {
-      // Select one stride-sized portion of each line, including unaligned
-      // streams. Testing only the low log2(LineSize) bits handles W wrap too.
-      const uint64_t Mask = (LineSize - 1) & ~(Magnitude - 1);
-      Code.push_back(MCInstBuilder(AArch64::ANDXri)
-                         .addReg(Scratch)
-                         .addReg(Address)
-                         .addImm(AArch64_AM::encodeLogicalImmediate(Mask, 64)));
-    } else {
-      // Compare with the virtual preceding address. The first partial line
-      // need not be prefetched; no original memory access is moved or added.
-      emitAddDelta(Scratch, Address, -uint64_t(Step), Code);
-      Code.push_back(MCInstBuilder(AArch64::EORXrs)
-                         .addReg(Scratch)
-                         .addReg(Scratch)
-                         .addReg(Address)
-                         .addImm(0));
-      Code.push_back(MCInstBuilder(AArch64::UBFMXri)
-                         .addReg(Scratch)
-                         .addReg(Scratch)
-                         .addImm(Log2_32(LineSize))
-                         .addImm(63));
-    }
-    MCInst Branch =
-        MCInstBuilder(isPowerOf2_64(Magnitude) ? AArch64::CBNZX : AArch64::CBZX)
-            .addReg(Scratch);
-    Branch.addOperand(MCOperand::createExpr(getTargetExprFor(
-        Branch, MCSymbolRefExpr::create(Skip, *Ctx), *Ctx, 0)));
-    Code.push_back(Branch);
-    return true;
-  }
 
   void createIndirectCallInst(MCInst &Inst, bool IsTailCall,
                               MCPhysReg Reg) const {

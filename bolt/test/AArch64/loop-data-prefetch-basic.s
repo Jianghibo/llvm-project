@@ -12,9 +12,6 @@
 # RUN:   2>&1 | FileCheck %s --check-prefix=POINTER-DIAG
 # RUN: llvm-objdump -d --no-print-imm-hex %t.pointer | FileCheck %s --check-prefix=POINTER
 # RUN: llvm-dwarfdump --eh-frame %t.pointer | FileCheck %s --check-prefix=CFI
-# RUN: llvm-bolt %t.exe -o %t.guarded --enable-loop-data-prefetch \
-# RUN:   --loop-prefetch-distance=1 --loop-prefetch-cache-line-size=64 --verify-cfg
-# RUN: llvm-objdump -d --no-print-imm-hex --disassemble-symbols=mixed %t.guarded | FileCheck %s --check-prefix=GUARD
 # RUN: llvm-bolt %t.exe -o %t.auto --data=%t/profile \
 # RUN:   --enable-loop-data-prefetch --loop-prefetch-latency=10 \
 # RUN:   --loop-prefetch-diagnostics --verify-cfg \
@@ -94,14 +91,6 @@
 # CFI-NEXT: DW_CFA_advance_loc: 8
 # CFI-NEXT: DW_CFA_offset: W19 -16
 
-# GUARD-LABEL: <mixed>:
-# GUARD:      ldr x0, [x0, #8]
-# GUARD-NEXT: prfm pldl1keep, [x0, #8]
-# GUARD-NEXT: add x8, x4, x1, lsl #3
-# GUARD:      cbnz
-# GUARD:      prfm pldl1keep,
-# GUARD:      ldr x3, [x8]
-# GUARD-NOT:  ldr
 
 # AUTO-DIAG-DAG: BOLT-PREFETCH: affine {{.*}} source=profile distance=1 {{.*}} inserted base-delta=8 {{.*}} cycles-source=profile
 # AUTO-DIAG-DAG: BOLT-PREFETCH: pointer {{.*}} source=profile distance=1 {{.*}} placement=after-load {{.*}} cycles-source=profile

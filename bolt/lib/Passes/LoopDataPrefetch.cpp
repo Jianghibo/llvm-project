@@ -8,6 +8,7 @@
 
 #include "bolt/Passes/LoopDataPrefetch.h"
 #include "bolt/Passes/LivenessAnalysis.h"
+#include "bolt/Passes/DataflowInfoManager.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringExtras.h"
@@ -74,7 +75,7 @@ static cl::opt<unsigned> PrefetchMaxRegisters(
     cl::cat(BoltOptCategory));
 static cl::opt<unsigned> PrefetchCacheLineSize(
     "loop-prefetch-cache-line-size", cl::init(0),
-    cl::desc("cache line bytes for request throttling (0 disables)"),
+    cl::desc("cache line bytes for batch prefetch request accounting"),
     cl::cat(BoltOptCategory));
 static cl::opt<unsigned> PrefetchAnalysisLimit(
     "loop-prefetch-analysis-limit", cl::init(20000),
@@ -96,6 +97,35 @@ static cl::opt<unsigned> PrefetchBatchMaxBytes(
     "loop-prefetch-batch-max-bytes", cl::init(256),
     cl::desc("maximum requested cache-line bytes per outer-loop iteration"),
     cl::cat(BoltOptCategory));
+static cl::opt<unsigned> PrefetchEntryLines(
+    "loop-prefetch-entry-lines", cl::init(0),
+    cl::desc("prefetch N cache lines at the loop entry for variable-trip-count "
+             "loops (0 disables; e.g. 3 covers 192 bytes ahead of the base)"),
+    cl::cat(BoltOptCategory));
+static cl::opt<double> PrefetchEntryTripThreshold(
+    "loop-prefetch-entry-trip-threshold", cl::init(100.0),
+    cl::desc("average loop trip count above which the loop keeps the in-loop "
+             "rolling strategy instead of entry prefetch (default 100)"),
+    cl::cat(BoltOptCategory));
+static cl::opt<bool> PrefetchSlotStream(
+    "loop-prefetch-slot-stream",
+    cl::desc("prefetch data streams whose address register is reloaded each "
+             "iteration from a frame-relative stack slot: insert the slot "
+             "reload plus a distance-ahead prefetch at the loop head"),
+    cl::cat(BoltOptCategory), cl::Hidden);
+static cl::opt<unsigned> PrefetchSlotDistance(
+    "loop-prefetch-slot-distance", cl::init(128),
+    cl::desc("bytes to prefetch ahead of a slot-stream base (default 128)"),
+    cl::cat(BoltOptCategory), cl::Hidden);
+static cl::opt<unsigned> PrefetchSlotMinMisses(
+    "loop-prefetch-slot-min-misses", cl::init(10),
+    cl::desc("minimum sampled misses (slot reload plus data loads) for a "
+             "slot-stream candidate"),
+    cl::cat(BoltOptCategory), cl::Hidden);
+static cl::opt<unsigned> PrefetchSlotMaxPerFunction(
+    "loop-prefetch-slot-max-per-function", cl::init(4),
+    cl::desc("maximum slot-stream prefetches per function"),
+    cl::cat(BoltOptCategory), cl::Hidden);
 } // namespace opts
 
 namespace {
@@ -675,8 +705,6 @@ struct PrefetchPlan {
   const MCInst *Load = nullptr;
   MCSymbol *Continuation = nullptr;
   unsigned Requests = 0;
-  unsigned GuardedStart = 0;
-  uint64_t StepMagnitude = 0;
   uint64_t BatchIterations = 0;
   const BinaryLoop *Loop = nullptr;
   PrefetchPolicy Policy{};
@@ -684,6 +712,7 @@ struct PrefetchPlan {
   int64_t BaseDelta = 0, IndexDelta = 0;
   unsigned Instructions = 0;
   bool Manual = false, Selected = false, AfterLoad = false, Indirect = false;
+  bool EntryPrefetch = false;
 };
 
 /// Split at the original load. Existing edge metadata follows the original
@@ -697,15 +726,9 @@ void insertGuardedPrefetch(BinaryFunction &BF, PrefetchPlan &Plan) {
   const uint64_t Count = BB.getExecutionCount();
   uint64_t PrefetchCount = Count, SkipCount = Count;
   if (BB.hasProfile()) {
-    if (Plan.Indirect) {
-      // No trip-count distribution is available for the remaining-count test.
-      PrefetchCount = Count / 2;
-    } else {
-      const uint64_t LineSize = opts::PrefetchCacheLineSize;
-      PrefetchCount =
-          Count / LineSize * Plan.StepMagnitude +
-          divideCeil(Count % LineSize * Plan.StepMagnitude, LineSize);
-    }
+    // Only the indirect path uses a guard. No trip-count distribution is
+    // available for the remaining-count test.
+    PrefetchCount = Count / 2;
     SkipCount = Count - PrefetchCount;
   }
   for (BinaryBasicBlock *New : {Prefetch.get(), Join.get()}) {
@@ -728,7 +751,7 @@ void insertGuardedPrefetch(BinaryFunction &BF, PrefetchPlan &Plan) {
   BB.addSuccessor(Prefetch.get(), PrefetchCount, 0);
   Prefetch->addSuccessor(Join.get(), PrefetchCount, 0);
 
-  const auto FirstRequest = Plan.Code.begin() + Plan.GuardedStart;
+  const auto FirstRequest = Plan.Code.begin();
   BB.addInstructions(Plan.Code.begin(), FirstRequest);
   BB.addInstructions(Plan.Guard.begin(), Plan.Guard.end());
   MCInst Jump;
@@ -746,6 +769,819 @@ void insertGuardedPrefetch(BinaryFunction &BF, PrefetchPlan &Plan) {
                        /*RecomputeLandingPads=*/false);
 }
 } // namespace
+
+struct EntryPrefetchPoint {
+  BinaryBasicBlock *BB = nullptr;
+  unsigned Index = 0;
+  MCPhysReg BaseReg = 0;
+  int64_t OffsetAdjust = 0; // accumulated writeback to subtract from PRFM offset
+};
+
+/// Trace one path backwards from a block boundary, following unique
+/// predecessors, MOV assignments, and writeback loads, until reaching
+/// a non-trivial definition of the base register.  Handles nested join
+/// points by recursively tracing each predecessor path (bounded depth).
+static bool traceOnePath(BinaryFunction &BF, BinaryLoop *InnerLoop,
+                         MCPhysReg BaseReg, const BinaryBasicBlock *StartBB,
+                         unsigned StartIdx, int64_t OffsetAdjust,
+                         unsigned Depth,
+                         SmallVectorImpl<EntryPrefetchPoint> &Results) {
+  if (Depth == 0)
+    return false;
+  BinaryContext &BC = BF.getBinaryContext();
+  const auto &MIB = *BC.MIB;
+  BitVector Aliases = MIB.getAliases(BaseReg, true);
+  const BinaryBasicBlock *Block = StartBB;
+  unsigned Index = StartIdx;
+  unsigned Limit = 64;
+  bool Found = false;
+
+  while (Limit--) {
+    // Scan backwards within the current block.
+    while (Index) {
+      const MCInst &MI = *(Block->begin() + --Index);
+      BitVector Written(Aliases.size());
+      MIB.getWrittenRegs(MI, Written);
+      if (!Written.anyCommon(Aliases))
+        continue;
+      if (InnerLoop->contains(const_cast<BinaryBasicBlock *>(Block)))
+        continue;
+
+      // MOV penetration
+      if (auto A = MIB.analyzeLoopRegisterAssignment(MI, BaseReg)) {
+        if (A->Base && !A->Index && !A->Shift && !A->SubtractIndex &&
+            A->Base != BaseReg) {
+          BaseReg = A->Base;
+          Aliases = MIB.getAliases(BaseReg, true);
+          continue;
+        }
+        // Self-referencing ADD/SUB: base = base + imm (like writeback).
+        // Treat as offset accumulation and continue tracing.
+        if (A->Base == BaseReg && !A->Index && !A->Shift) {
+          if (int64_t Step; MIB.getLoopRegisterUpdate(MI, BaseReg, Step)) {
+            OffsetAdjust += Step;
+            continue;
+          }
+        }
+      }
+
+      // Writeback load penetration
+      if (auto A = MIB.analyzeLoopMemory(MI)) {
+        if (A->Base == BaseReg && A->HasWriteback) {
+          OffsetAdjust += A->Writeback;
+          continue;
+        }
+      }
+
+      // Real definition: return insertion point
+      EntryPrefetchPoint P;
+      P.BB = const_cast<BinaryBasicBlock *>(Block);
+      P.Index = Index + 1;
+      P.BaseReg = BaseReg;
+      P.OffsetAdjust = OffsetAdjust;
+      Results.push_back(P);
+      Found = true;
+      break;
+    }
+    if (Found)
+      return true;
+
+    // Block exhausted: move to the predecessor.
+    if (Block->pred_size() == 1) {
+      Block = *Block->pred_begin();
+      Index = Block->size();
+      continue;
+    }
+
+    if (Block->pred_size() > 1) {
+      // Loop header: follow the unique entry predecessor.
+      BinaryLoop *BlockLoop = BF.getLoopInfo().getLoopFor(
+          const_cast<BinaryBasicBlock *>(Block));
+      if (BlockLoop && BlockLoop->getHeader() == Block) {
+        BinaryBasicBlock *EntryPred = nullptr;
+        for (BinaryBasicBlock *Pred :
+             const_cast<BinaryBasicBlock *>(Block)->predecessors()) {
+          if (!BlockLoop->contains(Pred)) {
+            if (EntryPred)
+              return Found;
+            EntryPred = Pred;
+          }
+        }
+        if (!EntryPred)
+          return Found;
+        Block = EntryPred;
+        Index = Block->size();
+        continue;
+      }
+      // Join point: recursively trace each predecessor path.
+      for (BinaryBasicBlock *Pred :
+           const_cast<BinaryBasicBlock *>(Block)->predecessors()) {
+        if (InnerLoop->contains(Pred))
+          continue;
+        traceOnePath(BF, InnerLoop, BaseReg, Pred, Pred->size(),
+                     OffsetAdjust, Depth - 1, Results);
+      }
+      return !Results.empty();
+    }
+    return Found;
+  }
+  return Found;
+}
+
+/// Find entry prefetch insertion points for a variable-trip-count loop.
+/// If the backwards trace from the load hits a join point with multiple
+/// predecessors, trace EACH predecessor path separately and return one
+/// insertion point per path.  Each path gets its own PRFM.
+/// If RD (reaching definitions) is provided, hoist the insertion point
+/// to the earliest dominator ancestor where the defining instruction's
+/// effect still reaches (the register provably holds the same value).
+static SmallVector<EntryPrefetchPoint, 4>
+findBaseInitialization(BinaryFunction &BF, BinaryLoop *InnerLoop,
+                       MCPhysReg BaseReg, const BinaryBasicBlock &LoadBB,
+                       unsigned LoadIdx,
+                       ReachingDefOrUse</*Def=*/true> *RD = nullptr) {
+  SmallVector<EntryPrefetchPoint, 4> Results;
+
+  // First: try the simple single-path trace.
+  // Scan backwards from the load within its own block, then through
+  // unique predecessors until we find the base definition or a join.
+  BinaryContext &BC = BF.getBinaryContext();
+  const auto &MIB = *BC.MIB;
+  BitVector Aliases = MIB.getAliases(BaseReg, true);
+  const BinaryBasicBlock *Block = &LoadBB;
+  unsigned Index = LoadIdx;
+  unsigned Limit = 64;
+  int64_t OffsetAdjust = 0;
+  MCPhysReg CurReg = BaseReg;
+  // Fallback: remember the position of the first self-ADD or writeback
+  // outside the loop.  If deeper tracing fails, use this as insertion point.
+  std::optional<EntryPrefetchPoint> Fallback;
+
+  while (Limit--) {
+    bool Found = false;
+    while (Index) {
+      const MCInst &MI = *(Block->begin() + --Index);
+      BitVector Written(Aliases.size());
+      MIB.getWrittenRegs(MI, Written);
+      if (!Written.anyCommon(Aliases))
+        continue;
+      if (InnerLoop->contains(const_cast<BinaryBasicBlock *>(Block)))
+        continue;
+
+      // MOV penetration
+      if (auto A = MIB.analyzeLoopRegisterAssignment(MI, CurReg)) {
+        if (A->Base && !A->Index && !A->Shift && !A->SubtractIndex &&
+            A->Base != CurReg) {
+          CurReg = A->Base;
+          Aliases = MIB.getAliases(CurReg, true);
+          continue;
+        }
+        // Self-referencing ADD/SUB: base = base + imm (like writeback).
+        if (A->Base == CurReg && !A->Index && !A->Shift) {
+          if (int64_t Step; MIB.getLoopRegisterUpdate(MI, CurReg, Step)) {
+            if (!Fallback) {
+              Fallback = EntryPrefetchPoint{};
+              Fallback->BB = const_cast<BinaryBasicBlock *>(Block);
+              Fallback->Index = Index + 1;
+              Fallback->BaseReg = CurReg;
+              Fallback->OffsetAdjust = OffsetAdjust;
+            }
+            OffsetAdjust += Step;
+            continue;
+          }
+        }
+      }
+
+      // Writeback load penetration
+      if (auto A = MIB.analyzeLoopMemory(MI)) {
+        if (A->Base == CurReg && A->HasWriteback) {
+          if (!Fallback) {
+            Fallback = EntryPrefetchPoint{};
+            Fallback->BB = const_cast<BinaryBasicBlock *>(Block);
+            Fallback->Index = Index + 1;
+            Fallback->BaseReg = CurReg;
+            Fallback->OffsetAdjust = OffsetAdjust;
+          }
+          OffsetAdjust += A->Writeback;
+          continue;
+        }
+      }
+
+      // Real definition found on this path
+      EntryPrefetchPoint P;
+      P.BB = const_cast<BinaryBasicBlock *>(Block);
+      P.Index = Index + 1;
+      P.BaseReg = CurReg;
+      P.OffsetAdjust = OffsetAdjust;
+      Results.push_back(P);
+      Found = true;
+      break;
+    }
+    if (Found)
+      return Results;
+
+    // Block exhausted: check predecessors.
+    if (Block->pred_size() == 1) {
+      Block = *Block->pred_begin();
+      Index = Block->size();
+      continue;
+    }
+
+    if (Block->pred_size() > 1) {
+      // Check if this block is a loop header (any loop, not just
+      // InnerLoop).  If so, follow the unique entry predecessor.
+      BinaryLoop *BlockLoop = BF.getLoopInfo().getLoopFor(
+          const_cast<BinaryBasicBlock *>(Block));
+      if (BlockLoop && BlockLoop->getHeader() == Block) {
+        BinaryBasicBlock *EntryPred = nullptr;
+        for (BinaryBasicBlock *Pred :
+             const_cast<BinaryBasicBlock *>(Block)->predecessors()) {
+          if (!BlockLoop->contains(Pred)) {
+            if (EntryPred)
+              break; // multiple entry predecessors
+            EntryPred = Pred;
+          }
+        }
+        if (EntryPred) {
+          Block = EntryPred;
+          Index = Block->size();
+          continue;
+        }
+      }
+
+      // Not a loop header, or multiple entries: per-path tracing.
+      if (!InnerLoop->contains(const_cast<BinaryBasicBlock *>(Block))) {
+        for (BinaryBasicBlock *Pred :
+             const_cast<BinaryBasicBlock *>(Block)->predecessors()) {
+          if (InnerLoop->contains(Pred))
+            continue; // skip back-edges of the innermost loop
+          traceOnePath(BF, InnerLoop, CurReg, Pred, Pred->size(),
+                       OffsetAdjust, /*Depth=*/5, Results);
+        }
+        break; // fall through to dedup below
+      }
+    }
+
+    break; // no unique predecessor and not a traceable join
+  }
+
+  if (Results.empty() && Fallback)
+    Results.push_back(*Fallback);
+
+  // Deduplicate: multiple paths often converge to the same block with the
+  // same base register.  Keep one insertion point per (BB, BaseReg) pair,
+  // preferring the one with the smallest absolute offset adjustment
+  // (covers the earliest data).
+  {
+    SmallVector<EntryPrefetchPoint, 4> Deduped;
+    for (auto &P : Results) {
+      auto It = llvm::find_if(Deduped, [&](const EntryPrefetchPoint &D) {
+        return D.BB == P.BB && D.BaseReg == P.BaseReg;
+      });
+      if (It == Deduped.end()) {
+        Deduped.push_back(P);
+      } else if (std::abs(P.OffsetAdjust) < std::abs(It->OffsetAdjust)) {
+        *It = P;
+      }
+    }
+    Results = std::move(Deduped);
+  }
+
+  // PlanB: if multiple per-path results share the same base register and
+  // one result's block dominates all others, merge them into that single
+  // entry (the earliest common point).  This reduces PRFM count from
+  // N-paths × lines to 1 × lines for this register.
+  if (Results.size() > 1) {
+    LLVM_DEBUG(
+      for (auto &P : Results)
+        dbgs() << "BOLT-PREFETCH-DBG: pre-merge result BB=" << P.BB
+               << " Idx=" << P.Index << " Reg=" << P.BaseReg
+               << " Off=" << P.OffsetAdjust << "\n";
+    );
+    // Group by base register.
+    DenseMap<MCPhysReg, SmallVector<EntryPrefetchPoint *, 4>> ByReg;
+    for (auto &P : Results)
+      ByReg[P.BaseReg].push_back(&P);
+
+    SmallVector<EntryPrefetchPoint, 4> Merged;
+    for (auto &[Reg, Group] : ByReg) {
+      if (Group.size() == 1) {
+        Merged.push_back(*Group[0]);
+        continue;
+      }
+      // Find the entry whose block dominates all others in this group.
+      EntryPrefetchPoint *Dominant = nullptr;
+      for (auto *P : Group) {
+        bool DominatesAll = true;
+        for (auto *Q : Group) {
+          if (P == Q)
+            continue;
+          if (!BF.getDomTree().dominates(P->BB, Q->BB)) {
+            DominatesAll = false;
+            break;
+          }
+        }
+        if (DominatesAll) {
+          Dominant = P;
+          break;
+        }
+      }
+      if (Dominant) {
+        // Use the dominant entry with the minimum absolute offset adjust.
+        EntryPrefetchPoint M = *Dominant;
+        for (auto *Q : Group)
+          if (std::abs(Q->OffsetAdjust) < std::abs(M.OffsetAdjust))
+            M.OffsetAdjust = Q->OffsetAdjust;
+        Merged.push_back(M);
+      } else {
+        // No dominant entry: try the nearest common dominator block.
+        BinaryBasicBlock *Common = Group[0]->BB;
+        for (unsigned i = 1; i < Group.size(); ++i)
+          Common = BF.getDomTree().findNearestCommonDominator(
+              Common, Group[i]->BB);
+        if (Common && !InnerLoop->contains(Common)) {
+          // Insert at the beginning of the common dominator block.
+          // Use the register from the first result (all share the same reg).
+          EntryPrefetchPoint M;
+          M.BB = Common;
+          M.Index = 0;
+          M.BaseReg = Reg;
+          M.OffsetAdjust = 0;
+          for (auto *Q : Group)
+            M.OffsetAdjust = std::min(M.OffsetAdjust, Q->OffsetAdjust);
+          Merged.push_back(M);
+        } else {
+          // Cannot merge: keep all per-path entries.
+          for (auto *P : Group)
+            Merged.push_back(*P);
+        }
+      }
+    }
+    Results = std::move(Merged);
+  }
+
+  // PlanB-ReachingDefs: use reaching-definitions dataflow to hoist the PRFM
+  // to the position of the ORIGINAL base-register definition, bypassing
+  // both the self-ADD and the join points that block per-path tracing.
+  //
+  // The per-path trace often stops at a self-ADD (writeback) that is the
+  // last write before the loop starts (the Fallback).  RD can find the
+  // definition that reaches BEFORE that self-ADD — the instruction that
+  // originally computed the base address (e.g., `sub x0,x3,x19` or
+  // `mov x13,x20`).  We then insert the PRFM right after that original
+  // definition, giving maximum lead time without tracing through joins.
+  if (RD && Results.size() == 1) {
+    auto &P = Results[0];
+    auto &BCRef = BF.getBinaryContext();
+
+    // Only hoist when the per-path trace stopped at a self-ADD or
+    // writeback (the Fallback).  If the trace found a real definition
+    // (e.g., SUB/ADD with different source), the position is already
+    // optimal and hoisting further could place the PRFM before the
+    // register gets the correct value.
+    if (P.Index > 0) {
+      const MCInst &DefInst = P.BB->getInstructionAtIndex(P.Index - 1);
+      bool IsSelfAddOrWriteback = false;
+      if (auto A = BCRef.MIB->analyzeLoopMemory(DefInst)) {
+        if (A->Base == P.BaseReg && A->HasWriteback)
+          IsSelfAddOrWriteback = true;
+      }
+      if (auto A = BCRef.MIB->analyzeLoopRegisterAssignment(DefInst, P.BaseReg)) {
+        if (A->Base == P.BaseReg && !A->Index && !A->Shift) {
+          int64_t Step;
+          if (BCRef.MIB->getLoopRegisterUpdate(DefInst, P.BaseReg, Step))
+            IsSelfAddOrWriteback = true;
+        }
+      }
+      if (!IsSelfAddOrWriteback) {
+        return Results;  // Real definition found by trace: don't hoist.
+      }
+    } else {
+      return Results;  // No defining instruction: don't hoist.
+    }
+
+    // The per-path trace placed the PRFM after the defining instruction
+    // at P.Index-1 (e.g., the self-ADD).  Query RD at the position
+    // BEFORE that defining instruction to find the ORIGINAL definition.
+    const MCInst *QueryPoint = nullptr;
+    BinaryBasicBlock *QueryBB = nullptr;
+    unsigned QueryIdx = 0;
+
+    if (P.Index >= 2) {
+      QueryPoint = &P.BB->getInstructionAtIndex(P.Index - 2);
+      QueryBB = P.BB;
+      QueryIdx = P.Index - 2;
+    } else if (P.Index == 1) {
+      // Definition is at index 0. Query at the previous block's last
+      // instruction (the unique predecessor on the entry path).
+      auto *Node = BF.getDomTree().getNode(P.BB);
+      if (Node && Node->getIDom()) {
+        QueryBB = Node->getIDom()->getBlock();
+        if (QueryBB && !InnerLoop->contains(QueryBB)) {
+          const MCInst *Last = QueryBB->getLastNonPseudoInstr();
+          if (Last) {
+            QueryPoint = Last;
+            QueryIdx = QueryBB->size() - 1;
+          }
+        }
+      }
+    }
+
+    if (QueryPoint && QueryBB) {
+      // Find the outermost loop to prevent hoisting past it.
+      BinaryLoop *OutermostLoop = InnerLoop;
+      while (OutermostLoop->getParentLoop())
+        OutermostLoop = OutermostLoop->getParentLoop();
+
+      // Multi-level RD hoisting: after finding the initial unique
+      // definition, trace through MOV chains to get more lead time.
+      // Each level queries RD for the SOURCE register of the MOV,
+      // finding its unique definition and hoisting further back.
+      unsigned MaxLevels = 5;
+      MCPhysReg CurReg = P.BaseReg;
+      const MCInst *QueryInstr = QueryPoint;
+      BinaryBasicBlock *QueryBlock = QueryBB;
+
+      while (MaxLevels--) {
+        // Find unique reaching definition of CurReg at QueryInstr.
+        const MCInst *UniqueDef = nullptr;
+        BinaryBasicBlock *UniqueDefBB = nullptr;
+        unsigned UniqueDefIdx = 0;
+        unsigned NumCandidates = 0;
+
+        for (BinaryBasicBlock &B : BF) {
+          if (InnerLoop->contains(&B))
+            continue;
+          // Must dominate the query block to be on all paths.
+          if (!BF.getDomTree().dominates(&B, QueryBlock))
+            continue;
+          for (unsigned I = 0; I < B.size(); ++I) {
+            MCInst &Inst = B.getInstructionAtIndex(I);
+            if (BCRef.MIB->isPseudo(Inst))
+              continue;
+            BitVector Written(BCRef.MRI->getNumRegs());
+            BCRef.MIB->getWrittenRegs(Inst, Written);
+            if (!Written.test(CurReg))
+              continue;
+            if (RD->count(*QueryInstr, Inst)) {
+              ++NumCandidates;
+              if (NumCandidates > 1)
+                break;
+              UniqueDef = &Inst;
+              UniqueDefBB = &B;
+              UniqueDefIdx = I;
+            }
+          }
+          if (NumCandidates > 1)
+            break;
+        }
+
+        if (NumCandidates != 1 || !UniqueDef || !UniqueDefBB)
+          break;
+
+        // Verify the found definition is still inside the outermost
+        // enclosing loop.  Hoisting outside it would make the PRFM
+        // execute only once per function call, not per loop iteration.
+        if (!OutermostLoop->contains(UniqueDefBB))
+          break;
+
+        // Update the insertion point to after this definition.
+        Results[0].BB = UniqueDefBB;
+        Results[0].Index = UniqueDefIdx + 1;
+        Results[0].BaseReg = CurReg;
+        Results[0].OffsetAdjust = 0;
+
+        // Check if the defining instruction is a MOV to a different
+        // register.  If so, recurse on the source register.
+        MCPhysReg SrcReg = 0;
+        if (UniqueDefIdx < UniqueDefBB->size()) {
+          const MCInst &DefInst = UniqueDefBB->getInstructionAtIndex(UniqueDefIdx);
+          if (auto A = BCRef.MIB->analyzeLoopRegisterAssignment(DefInst, CurReg)) {
+            if (A->Base && !A->Index && !A->Shift && !A->SubtractIndex &&
+                A->Base != CurReg)
+              SrcReg = A->Base;
+          }
+        }
+        if (!SrcReg)
+          break;  // Not a MOV: cannot trace further.
+
+        // Set up the next query point: before the MOV definition.
+        // Also verify the NEW position is still inside the outermost
+        // loop so the PRFM executes once per outer-loop iteration.
+        CurReg = SrcReg;
+        if (!OutermostLoop->contains(UniqueDefBB))
+          break;  // Hoisted past the outermost loop: PRFM would
+                  // execute only once per function call.
+        if (UniqueDefIdx >= 1) {
+          QueryInstr = &UniqueDefBB->getInstructionAtIndex(UniqueDefIdx - 1);
+          QueryBlock = UniqueDefBB;
+        } else {
+          // Definition at index 0: query at the dominator's last instruction.
+          auto *Node = BF.getDomTree().getNode(UniqueDefBB);
+          if (!Node || !Node->getIDom())
+            break;
+          QueryBlock = Node->getIDom()->getBlock();
+          if (!QueryBlock || InnerLoop->contains(QueryBlock) ||
+              !OutermostLoop->contains(QueryBlock))
+            break;
+          QueryInstr = QueryBlock->getLastNonPseudoInstr();
+          if (!QueryInstr)
+            break;
+        }
+      }
+    }
+  }
+
+  return Results;
+}
+
+/// Determine whether a loop should use the entry multi-line prefetch
+/// strategy: low average trip count and sequential small-stride access.
+static bool shouldUseEntryStrategy(const BinaryLoop *Loop,
+                                   const MCPlusBuilder::LoopMemoryAccess &Access,
+                                   int64_t ByteStep) {
+  if (!opts::PrefetchEntryLines)
+    return false;
+  if (!ByteStep || std::abs(ByteStep) > 64)
+    return false;
+  if (Access.Index)
+    return false;
+  if (Loop->EntryCount == 0 ||
+      Loop->TotalBackEdgeCount == BinaryBasicBlock::COUNT_NO_PROFILE)
+    return false;
+  double AvgTrip = (double)Loop->TotalBackEdgeCount / Loop->EntryCount;
+  return AvgTrip < opts::PrefetchEntryTripThreshold;
+}
+
+/// Slot-stream prefetching.  Loops whose body reloads a pointer from a
+/// frame-relative stack slot each iteration and streams data through it
+/// (e.g. zstd's literal pointer) get the slot reload plus a distance-ahead
+/// prefetch inserted at the loop head.  The head reload warms the stack
+/// line for the in-body reload, and the prefetch gains the whole loop body
+/// as lead time over the data loads, mirroring source-level prefetch hints
+/// placed at the top of the loop.  Only non-innermost loops are considered:
+/// innermost loops are handled by the affine machinery above.
+static void runSlotStreamPrefetch(BinaryContext &BC, BinaryFunction &BF,
+                                  uint64_t Address, RegAnalysis &RA,
+                                  unsigned &Inserted, unsigned &Rejected) {
+  struct SlotInfo {
+    const MCInst *Reload = nullptr;
+    BinaryBasicBlock *ReloadBB = nullptr;
+    int64_t Offset = 0;
+    MCPhysReg Dest = 0;
+    uint64_t ReloadMisses = 0;
+    uint64_t DataMisses = 0;
+    unsigned DataLoads = 0;
+  };
+  auto Report = [&](StringRef Result, StringRef Extra, const SlotInfo *S,
+                    const BinaryLoop *Loop) {
+    if (!opts::PrefetchDiagnostics)
+      return;
+    BC.outs() << "BOLT-PREFETCH: " << BF.getPrintName() << " pc=";
+    if (S && S->Reload && BC.MIB->getOffset(*S->Reload))
+      BC.outs() << formatv("{0:x}", Address + *BC.MIB->getOffset(*S->Reload));
+    else
+      BC.outs() << "unknown";
+    BC.outs() << " source=profile slot-stream " << Result;
+    if (!Extra.empty())
+      BC.outs() << " " << Extra;
+    if (S)
+      BC.outs() << formatv(" slot-offset={0} reload-misses={1} "
+                          "data-misses={2} data-loads={3}",
+                          S->Offset, S->ReloadMisses, S->DataMisses,
+                          S->DataLoads);
+    if (Loop)
+      BC.outs() << formatv(" loop={0:x}",
+                           Address + Loop->getHeader()->getInputOffset());
+    BC.outs() << '\n';
+  };
+  const MCPhysReg FP = BC.MIB->getFramePointer();
+  if (!FP) {
+    Report("rejected", "no frame pointer", nullptr, nullptr);
+    return;
+  }
+  BitVector Available(BC.MRI->getNumRegs());
+  BC.MIB->getGPRegs(Available, false);
+  BC.MIB->removeNonScavengeableRegs(Available);
+  BitVector CalleeSaved(Available.size());
+  BC.MIB->getCalleeSavedRegs(CalleeSaved);
+  Available.reset(CalleeSaved);
+  if (!excludeCFIRegisters(BF, Available)) {
+    Report("rejected", "opaque CFI expression", nullptr, nullptr);
+    return;
+  }
+  const auto SlotAllocator = BC.MIB->initializeNewAnnotationAllocator();
+  auto Live = std::make_unique<LivenessAnalysis>(RA, BF, SlotAllocator,
+                                                 /*AssumeABI=*/true);
+  Live->run();
+  unsigned FunctionInsertions = 0;
+  for (BinaryLoop *TopLoop : BF.getLoopInfo()) {
+    for (BinaryLoop *Loop : TopLoop->getLoopsInPreorder()) {
+      if (FunctionInsertions >= opts::PrefetchSlotMaxPerFunction)
+        goto Done;
+      if (Loop->getSubLoops().empty())
+        continue; // Innermost loops are handled by the affine machinery.
+      // Calls inside the loop are fine here: they cannot write the caller's
+      // frame slots, and the prefetch is architecturally safe.  Only the
+      // loop header itself must not be an exception landing pad.
+      if (Loop->getHeader()->isLandingPad()) {
+        Report("rejected", "landing pad header", nullptr, Loop);
+        ++Rejected;
+        continue;
+      }
+      // Collect stack-slot reloads grouped by frame offset.  Only slots the
+      // pass can reload itself with a single instruction qualify.
+      DenseMap<int64_t, SlotInfo> Slots;
+      for (BinaryBasicBlock *BB : Loop->blocks()) {
+        for (const MCInst &MI : *BB) {
+          auto A = BC.MIB->analyzeLoopMemory(MI);
+          if (!A || A->Base != FP || A->Index || A->HasWriteback ||
+              A->Elements != 1 || A->Size != 8 || !A->Dest)
+            continue;
+          const bool Encodable =
+              isInt<9>(A->Offset) ||
+              (A->Offset >= 0 && (A->Offset & 7) == 0 &&
+               isUInt<12>(static_cast<uint64_t>(A->Offset) / 8));
+          if (!Encodable)
+            continue;
+          auto Profile = BC.MIB->tryGetAnnotationAs<CacheMissProfile>(
+              MI, "CacheMissProfile");
+          const uint64_t Misses = Profile ? Profile->MissCount : 0;
+          auto [It, IsNew] = Slots.try_emplace(A->Offset);
+          if (IsNew) {
+            It->second.Reload = &MI;
+            It->second.ReloadBB = BB;
+            It->second.Offset = A->Offset;
+            It->second.Dest = A->Dest;
+            It->second.ReloadMisses = Misses;
+          } else if (Misses > It->second.ReloadMisses) {
+            It->second.Reload = &MI;
+            It->second.ReloadBB = BB;
+            It->second.Dest = A->Dest;
+            It->second.ReloadMisses = Misses;
+          }
+        }
+      }
+      if (Slots.empty()) {
+        Report("rejected", "no stack slot reloads", nullptr, Loop);
+        continue;
+      }
+      // Match data loads streaming through each slot's anchor register.
+      // A load counts only when the anchor reload is the unique reaching
+      // definition of the anchor register at that load: an intervening
+      // redefinition (e.g. "add x8, x3, x8, lsl #3") means the streamed
+      // address comes from a different value than the slot content.
+      // ReachingDefOrUse with TrackingReg=R gives exact per-register kills;
+      // plain loads only partially kill defs that clobber wider register
+      // sets (e.g. writeback loads), which would over-reject here.
+      DenseMap<MCPhysReg, int64_t> DestToOffset;
+      for (auto &[Off, S] : Slots)
+        if (S.Dest)
+          DestToOffset[S.Dest] = Off;
+      if (!DestToOffset.empty()) {
+        // Defs of each candidate register, using the same clobber-list
+        // predicate the TrackingReg dataflow uses to gen expressions.
+        DenseMap<MCPhysReg, SmallVector<const MCInst *, 8>> DefsByReg;
+        for (BinaryBasicBlock &DefBB : BF) {
+          for (MCInst &Def : DefBB) {
+            if (BC.MIB->isPseudo(Def))
+              continue;
+            BitVector Clobbers(BC.MRI->getNumRegs());
+            RA.getInstClobberList(Def, Clobbers);
+            for (auto &[Reg, Off] : DestToOffset)
+              if (Clobbers.test(Reg))
+                DefsByReg[Reg].push_back(&Def);
+          }
+        }
+        // RD instances share the annotation name, so run them strictly one
+        // at a time: create, query, clean annotations, destroy.
+        for (auto &[Reg, Off] : DestToOffset) {
+          SlotInfo &S = Slots[Off];
+          SmallVector<const MCInst *, 8> &Defs = DefsByReg[Reg];
+          if (!S.Reload)
+            continue;
+          bool DefInDefList = false;
+          for (const MCInst *Def : Defs)
+            if (Def == S.Reload) {
+              DefInDefList = true;
+              break;
+            }
+          if (!DefInDefList)
+            continue;
+          auto RDReg = std::make_unique<ReachingDefOrUse</*Def=*/true>>(
+              RA, BF, Reg, SlotAllocator);
+          RDReg->run();
+          for (BinaryBasicBlock *BB : Loop->blocks()) {
+            for (const MCInst &MI : *BB) {
+              auto A = BC.MIB->analyzeLoopMemory(MI);
+              if (!A || A->Base != Reg || A->Base == FP || !A->Dest)
+                continue;
+              bool AnchorReaches = RDReg->count(MI, *S.Reload);
+              unsigned NumReaching = 0;
+              for (const MCInst *Def : Defs) {
+                if (RDReg->count(MI, *Def)) {
+                  ++NumReaching;
+                  if (NumReaching > 1)
+                    break;
+                }
+              }
+              if (!AnchorReaches || NumReaching != 1)
+                continue;
+              ++S.DataLoads;
+              auto Profile = BC.MIB->tryGetAnnotationAs<CacheMissProfile>(
+                  MI, "CacheMissProfile");
+              S.DataMisses += Profile ? Profile->MissCount : 0;
+            }
+          }
+          RDReg->cleanAnnotations();
+          RDReg.reset();
+        }
+      }
+      SlotInfo Best;
+      bool HasBest = false;
+      for (auto &[Off, S] : Slots) {
+        if (!S.DataLoads || !S.DataMisses)
+          continue; // Anchor register does not stream missing data.
+        if (!HasBest || S.ReloadMisses + S.DataMisses >
+                            Best.ReloadMisses + Best.DataMisses) {
+          Best = S;
+          HasBest = true;
+        }
+      }
+      if (!HasBest) {
+        Report("rejected", "no slot data stream", nullptr, Loop);
+        continue;
+      }
+      if (Best.ReloadMisses + Best.DataMisses <
+          opts::PrefetchSlotMinMisses) {
+        Report("rejected", "insufficient slot misses", nullptr, Loop);
+        continue;
+      }
+      // Insert at the loop head, after any leading CFI pseudo instructions.
+      BinaryBasicBlock *Header = Loop->getHeader();
+      const MCInst *First = nullptr;
+      unsigned InsertIdx = 0;
+      for (unsigned I = 0; I < Header->size(); ++I) {
+        const MCInst &MI = *(Header->begin() + I);
+        if (BC.MIB->isCFI(MI))
+          continue;
+        First = &MI;
+        InsertIdx = I;
+        break;
+      }
+      if (!First) {
+        Report("rejected", "empty loop header", nullptr, Loop);
+        continue;
+      }
+      MCPhysReg Scratch = 0;
+      {
+        const BitVector &LiveAt = *Live->getStateAt(*First);
+        for (int Reg : Available.set_bits())
+          if (!LiveAt.test(Reg)) {
+            Scratch = Reg;
+            break;
+          }
+      }
+      if (!Scratch) {
+        Report("rejected", "no dead register at loop head", nullptr, Loop);
+        ++Rejected;
+        continue;
+      }
+      SmallVector<MCInst, 4> Code;
+      MCInst SlotLoad;
+      BC.MIB->createRestoreFromStack(SlotLoad, FP, Best.Offset, Scratch, 8);
+      MCPlusBuilder::LoopMemoryAccess A;
+      A.Base = Scratch;
+      A.Offset = opts::PrefetchSlotDistance;
+      A.Size = 8;
+      A.Elements = 1;
+      if (!BC.MIB->createLoopPrefetch(A, 0, 0, {}, opts::PrefetchHint,
+                                      Code)) {
+        Report("rejected", "unsupported prefetch encoding", nullptr, Loop);
+        ++Rejected;
+        continue;
+      }
+      BC.MIB->addAnnotation(Code.front(), "LoopDataPrefetch", 1u);
+      SmallVector<MCInst, 8> All;
+      All.push_back(std::move(SlotLoad));
+      All.append(Code);
+      for (MCInst &MI : llvm::reverse(All))
+        Header->insertInstruction(Header->begin() + InsertIdx, MI);
+      ++Inserted;
+      ++FunctionInsertions;
+      Report("inserted",
+             formatv("slot-distance={0} scratch={1} placement=loop-head "
+                     "kind=slot-stream",
+                     opts::PrefetchSlotDistance, BC.MRI->getName(Scratch))
+                 .str(),
+             &Best, Loop);
+    }
+  }
+Done:
+  Live->cleanAnnotations();
+  Live.reset();
+  BC.MIB->freeValuesAllocator(SlotAllocator);
+}
 
 bool LoopDataPrefetch::shouldOptimize(const BinaryFunction &BF) const {
   const bool Manual = opts::LoopPrefetchDistance.getNumOccurrences() ||
@@ -769,6 +1605,9 @@ Error LoopDataPrefetch::runOnFunctions(BinaryContext &BC) {
        opts::PrefetchCacheLineSize < 16 || opts::PrefetchCacheLineSize > 4096))
     return createFatalBOLTError("loop prefetch cache line size must be 0 or a "
                                 "power of two between 16 and 4096");
+  if (opts::PrefetchCacheLineSize && !opts::PrefetchBatch)
+    return createFatalBOLTError(
+        "loop-prefetch-cache-line-size requires --loop-prefetch-batch");
   if (opts::PrefetchBatch && !opts::PrefetchCacheLineSize)
     return createFatalBOLTError(
         "batch prefetch requires an explicit cache line size");
@@ -861,6 +1700,10 @@ Error LoopDataPrefetch::runOnFunctions(BinaryContext &BC) {
     auto Live = std::make_unique<LivenessAnalysis>(RA, BF, AnalysisAllocator,
                                                    /*AssumeABI=*/true);
     Live->run();
+    // Reaching definitions for value-preserving PRFM hoisting (PlanB).
+    auto RD = std::make_unique<ReachingDefOrUse</*Def=*/true>>(
+        RA, BF, std::nullopt, AnalysisAllocator);
+    RD->run();
     SmallVector<PrefetchPlan, 8> Plans;
     unsigned FunctionRequests = 0, FunctionInstructions = 0;
     for (BinaryLoop *TopLoop : BF.getLoopInfo()) {
@@ -934,13 +1777,6 @@ Error LoopDataPrefetch::runOnFunctions(BinaryContext &BC) {
         if (opts::PrefetchIndirect)
           IndirectLoop = analyzeIndirectLoop(*Loop);
         for (BinaryBasicBlock *BB : Loop->blocks()) {
-          // A path-specific load could miss every boundary iteration. Keep
-          // its original cadence unless it executes on all backedges.
-          const bool EveryIteration =
-              opts::PrefetchCacheLineSize &&
-              llvm::all_of(Latches, [&](BinaryBasicBlock *Latch) {
-                return BF.getDomTree().dominates(BB, Latch);
-              });
           struct SelectedAccess {
             unsigned Index;
             unsigned PlanIndex;
@@ -1042,7 +1878,90 @@ Error LoopDataPrefetch::runOnFunctions(BinaryContext &BC) {
                 getAddressStride(*BB, I, Access->Base, *Loop, Stride);
             const auto IndexStride =
                 getAddressStride(*BB, I, Access->Index, *Loop, Stride);
-            int64_t BaseDelta = 0, IndexDelta = 0, ByteStep = 0;
+            // === Entry multi-line prefetch for variable-trip loops ===
+            // Trace backwards from the load past the loop boundary and
+            // through join points (per-path), then insert N PRFM lines
+            // at each path's base initialization point.
+            if (!Batch && shouldUseEntryStrategy(
+                              Loop, *Access,
+                              BaseStride ? *BaseStride : 0)) {
+              // Dedup: one entry plan per base register per loop
+              bool AlreadyCovered = false;
+              for (const auto &S : Selected) {
+                if (S.Access.Base == Access->Base &&
+                    Plans[S.PlanIndex].EntryPrefetch) {
+                  AlreadyCovered = true;
+                  break;
+                }
+              }
+              if (AlreadyCovered) {
+                Diagnose(&MI, "duplicate base for entry prefetch", Policy);
+                continue;
+              }
+              auto Points = findBaseInitialization(
+                  BF, Loop, Access->Base, *BB, I, RD.get());
+              if (Points.empty()) {
+                Reject("entry prefetch: cannot trace base init");
+                continue;
+              }
+              bool AllEncoded = true;
+              SmallVector<PrefetchPlan, 4> NewPlans;
+              for (const auto &P : Points) {
+                // Adjust the prefetch address by the accumulated writeback
+                // offset so the PRFM targets the pre-writeback base.
+                auto PrefetchAddr = *Access;
+                PrefetchAddr.Base = P.BaseReg;
+                SmallVector<MCInst, 8> Code;
+                bool Encoded = true;
+                for (unsigned Line = 0; Line < opts::PrefetchEntryLines;
+                     ++Line) {
+                  int64_t Offset = int64_t(Line) * 64 - P.OffsetAdjust;
+                  if (AddOverflow(PrefetchAddr.Offset, Offset, Offset) ||
+                      !BC.MIB->createLoopPrefetch(PrefetchAddr, Offset, 0,
+                                                  /*Scratch=*/{}, Policy.Hint,
+                                                  Code)) {
+                    Encoded = false;
+                    break;
+                  }
+                }
+                if (!Encoded) {
+                  AllEncoded = false;
+                  break;
+                }
+                PrefetchPlan Plan{P.BB, P.Index, std::move(Code), {}};
+                Plan.Load = &MI;
+                Plan.Requests = 1;
+                Plan.Loop = Loop;
+                Plan.Policy = Policy;
+                Plan.Misses = Profile ? Profile->MissCount : 0;
+                Plan.Instructions = Plan.Code.size();
+                Plan.EntryPrefetch = true;
+                NewPlans.push_back(std::move(Plan));
+              }
+              if (!AllEncoded) {
+                Reject("entry prefetch encoding failed");
+                continue;
+              }
+              // Each path's PRFMs only execute on that path, so check the
+              // budget per-path, not as a sum across all paths.
+              for (auto &P : NewPlans) {
+                if (P.Instructions > Policy.Budget) {
+                  AllEncoded = false;
+                  break;
+                }
+              }
+              if (!AllEncoded) {
+                Reject("entry prefetch exceeds instruction budget");
+                continue;
+              }
+              for (auto &P : NewPlans) {
+                Selected.push_back({I, unsigned(Plans.size()), *Access,
+                                    0, 0, Policy.Hint, *Policy.Distance});
+                Plans.push_back(std::move(P));
+              }
+              continue;
+            }
+            int64_t BaseDelta = 0, IndexDelta = 0;
             MCPhysReg NextPointer = 0;
             bool AfterLoad = false;
             std::optional<MCPlusBuilder::LoopIndirectAccess> Indirect;
@@ -1075,25 +1994,10 @@ Error LoopDataPrefetch::runOnFunctions(BinaryContext &BC) {
                 AfterLoad = true;
               }
               BaseDelta = IndexDelta = 0;
-            } else {
-              ByteStep = uint64_t(*BaseStride) +
-                         (uint64_t(*IndexStride) << Access->Shift);
             }
-            const uint64_t Magnitude =
-                ByteStep < 0 ? -uint64_t(ByteStep) : uint64_t(ByteStep);
-            const bool Throttle = opts::PrefetchCacheLineSize && Magnitude &&
-                                  Magnitude < opts::PrefetchCacheLineSize &&
-                                  EveryIteration;
-            // A throttled contiguous access needs one request per line. Use
-            // its last byte so unaligned scalar/pair accesses follow the same
-            // boundary rule; an initial partial line can remain uncovered.
             auto PrefetchAccess = Batch ? Batch->Address : *Access;
             if (AfterLoad)
               PrefetchAccess.Base = NextPointer;
-            if (Throttle) {
-              PrefetchAccess.Offset += Access->Size * Access->Elements - 1;
-              PrefetchAccess.Size = PrefetchAccess.Elements = 1;
-            }
             const unsigned Requests =
                 Batch ? Batch->Requests : PrefetchAccess.Elements;
             if (Batch && (Requests > Policy.Budget ||
@@ -1154,14 +2058,13 @@ Error LoopDataPrefetch::runOnFunctions(BinaryContext &BC) {
               if (!LiveAt->test(Reg))
                 Scratch.push_back(Reg);
             }
-            if ((Throttle || Indirect) && Scratch.size() < 2) {
-              Reject(Indirect ? "indirect prefetch needs two dead registers"
-                              : "throttling needs two dead registers");
+            if (Indirect && Scratch.size() < 2) {
+              Reject("indirect prefetch needs two dead registers");
               continue;
             }
             PrefetchPlan Plan{EmitBB, EmitIndex, {}, {}};
             Plan.Load = &MI;
-            if (Indirect || Throttle) {
+            if (Indirect) {
               auto Lock = BC.scopeLock();
               Plan.Continuation = BC.Ctx->createNamedTempSymbol("PrefetchJoin");
             }
@@ -1174,8 +2077,7 @@ Error LoopDataPrefetch::runOnFunctions(BinaryContext &BC) {
                     Batch->Span - 1);
                 if (AddOverflow(Point.Offset, int64_t(Offset), Point.Offset) ||
                     !BC.MIB->createLoopPrefetch(Point, BaseDelta, 0, Scratch,
-                                                Policy.Hint, Plan.Code,
-                                                /*MaterializeAddress=*/false)) {
+                                                Policy.Hint, Plan.Code)) {
                   Encoded = false;
                   break;
                 }
@@ -1196,21 +2098,9 @@ Error LoopDataPrefetch::runOnFunctions(BinaryContext &BC) {
               Plan.Indirect = true;
             } else if (!BC.MIB->createLoopPrefetch(
                            PrefetchAccess, BaseDelta, IndexDelta, Scratch,
-                           Policy.Hint, Plan.Code,
-                           /*MaterializeAddress=*/Throttle)) {
+                           Policy.Hint, Plan.Code)) {
               Reject("unsupported encoding or insufficient dead registers");
               continue;
-            }
-            if (Throttle) {
-              if (!BC.MIB->createLoopPrefetchGuard(
-                      Scratch[0], Scratch[1], ByteStep,
-                      opts::PrefetchCacheLineSize, Plan.Continuation,
-                      BC.Ctx.get(), Plan.Guard)) {
-                Reject("unsupported throttle guard");
-                continue;
-              }
-              Plan.StepMagnitude = Magnitude;
-              Plan.GuardedStart = Plan.Code.size() - Requests;
             }
             // Charge both possible CFG transfers even if FixupBranches later
             // removes a jump to the next block in the layout.
@@ -1291,15 +2181,30 @@ Error LoopDataPrefetch::runOnFunctions(BinaryContext &BC) {
                   Plan->Continuation && !Plan->Indirect
                       ? unsigned(opts::PrefetchCacheLineSize)
                       : 0,
-                  Plan->BatchIterations
-                      ? "outer-entry"
-                      : (Plan->AfterLoad ? "after-load" : "before-load"),
-                  Plan->BatchIterations
-                      ? "batch"
-                      : (Plan->Indirect
-                             ? "indirect"
-                             : (Plan->AfterLoad ? "pointer" : "affine")))
+                  Plan->EntryPrefetch
+                      ? "loop-entry"
+                      : (Plan->BatchIterations
+                             ? "outer-entry"
+                             : (Plan->AfterLoad ? "after-load" : "before-load")),
+                  Plan->EntryPrefetch
+                      ? "entry-affine"
+                      : (Plan->BatchIterations
+                             ? "batch"
+                             : (Plan->Indirect
+                                    ? "indirect"
+                                    : (Plan->AfterLoad ? "pointer" : "affine"))))
               .str();
+      if (Plan->EntryPrefetch) {
+        double AvgTrip =
+            Plan->Loop && Plan->Loop->EntryCount
+                ? (double)Plan->Loop->TotalBackEdgeCount /
+                      Plan->Loop->EntryCount
+                : 0.0;
+        Detail += formatv(" entry-lines={0} avg-trip={1}",
+                          opts::PrefetchEntryLines,
+                          llvm::format("%.1f", AvgTrip))
+                      .str();
+      }
       if (Plan->BatchIterations)
         Detail +=
             formatv(" inner-iterations={0} requests={1} footprint-bytes={2} "
@@ -1313,13 +2218,23 @@ Error LoopDataPrefetch::runOnFunctions(BinaryContext &BC) {
     }
     // Release per-function analysis values before moving instructions. Using
     // the default arena would retain every function's live sets until exit.
+    // Unregister the annotations first: freeValuesAllocator only destroys the
+    // value pool and would otherwise leave dangling registry entries on the
+    // instructions for later analyses with the same annotation index.
+    Live->cleanAnnotations();
+    RD->cleanAnnotations();
     Live.reset();
     BC.MIB->freeValuesAllocator(AnalysisAllocator);
     bool ChangedCFG = false;
     for (auto &Plan : llvm::reverse(Plans)) {
       if (!Plan.Selected)
         continue;
-      if (Plan.Continuation) {
+      if (Plan.EntryPrefetch) {
+        // Entry multi-line: insert at the recorded position outside the
+        // loop.  No CFG changes needed.
+        for (MCInst &MI : llvm::reverse(Plan.Code))
+          Plan.BB->insertInstruction(Plan.BB->begin() + Plan.Index, MI);
+      } else if (Plan.Continuation) {
         insertGuardedPrefetch(BF, Plan);
         ChangedCFG = true;
       } else {
@@ -1337,6 +2252,8 @@ Error LoopDataPrefetch::runOnFunctions(BinaryContext &BC) {
       BF.calculateLoopInfo();
     }
     Inserted += FunctionRequests;
+    if (opts::PrefetchSlotStream)
+      runSlotStreamPrefetch(BC, BF, Address, RA, Inserted, Rejected);
   }
   BC.outs() << "BOLT-INFO: number of prefetch instructions inserted: "
             << Inserted << " (rejected candidates: " << Rejected << ")\n";

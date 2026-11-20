@@ -91,6 +91,8 @@ def main():
     line = args.cache_line_size
     if line and (line < 16 or line > 4096 or line & (line - 1)):
         parser.error("cache line size must be 0 or a power of two from 16 to 4096")
+    if line and not args.batch:
+        parser.error("--cache-line-size requires --batch")
     try:
         root = args.output_dir or Path(tempfile.mkdtemp(prefix="prefetch-plan-"))
         if args.output_dir:

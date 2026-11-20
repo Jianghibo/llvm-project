@@ -1107,21 +1107,6 @@ TEST_P(MCPlusBuilderTester, LoopPrefetchEncoding) {
   Store.getOperand(3) =
       MCOperand::createExpr(MCSymbolRefExpr::create(Skip, *BC->Ctx));
   EXPECT_FALSE(MIB.getLoopRegisterUpdate(Store, AArch64::X0, Update));
-  for (int64_t Step : {8, -8, 3, -3}) {
-    SmallVector<MCInst, 4> Guard;
-    ASSERT_TRUE(MIB.createLoopPrefetchGuard(AArch64::X9, AArch64::X10, Step, 64,
-                                            Skip, BC->Ctx.get(), Guard));
-    EXPECT_EQ(Guard.size(), (Step == 8 || Step == -8) ? 2u : 4u);
-    EXPECT_EQ(
-        Guard.back().getOpcode(),
-        unsigned((Step == 8 || Step == -8) ? AArch64::CBNZX : AArch64::CBZX));
-    BitVector Written(BC->MRI->getNumRegs());
-    for (const MCInst &MI : Guard)
-      MIB.getWrittenRegs(MI, Written);
-    EXPECT_FALSE(Written.test(AArch64::NZCV));
-    EXPECT_FALSE(Written.test(AArch64::X9));
-    EXPECT_TRUE(Written.test(AArch64::X10));
-  }
   MCPlusBuilder::LoopMemoryAccess Immediate;
   Immediate.Base = AArch64::X0;
   Immediate.Size = 8;

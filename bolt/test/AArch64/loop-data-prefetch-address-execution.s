@@ -7,15 +7,11 @@
 # RUN:   --loop-prefetch-distance=1 --loop-prefetch-diagnostics --verify-cfg \
 # RUN:   2>&1 | FileCheck %s --check-prefix=DIAG
 # RUN: llvm-objdump -d --no-print-imm-hex %t.d1.so | FileCheck %s
-# RUN: llvm-bolt %t.so -o %t.throttle.so --enable-loop-data-prefetch \
-# RUN:   --loop-prefetch-distance=1 --loop-prefetch-cache-line-size=64 \
-# RUN:   --loop-prefetch-max-instructions=16 --verify-cfg
-# RUN: llvm-objdump -d %t.throttle.so | FileCheck %s --check-prefix=THROTTLE
 # RUN: llvm-bolt %t.so -o %t.d16.so --enable-loop-data-prefetch \
 # RUN:   --loop-prefetch-distance=16 --loop-prefetch-diagnostics --verify-cfg \
 # RUN:   2>&1 | FileCheck %s --check-prefix=FAR
 # RUN: %if target=aarch64{{.*}} %{ %python %t/check.py %t.so %t.base.so \
-# RUN:   %t.d1.so %t.throttle.so %t.d16.so %}
+# RUN:   %t.d1.so %t.d16.so %}
 
 # DIAG-DAG: BOLT-PREFETCH: slice {{.*}} inserted {{.*}} kind=affine
 # DIAG-DAG: BOLT-PREFETCH: slice_blocks {{.*}} inserted {{.*}} kind=affine
@@ -36,15 +32,6 @@
 # CHECK-LABEL: <pointer_move>:
 # CHECK:      ldr x3, [x19, #8]
 # CHECK-NEXT: prfm pldl1keep, [x3, #8]
-
-# THROTTLE-LABEL: <slice>:
-# THROTTLE: cbnz
-# THROTTLE: prfm
-# THROTTLE: ldr
-# THROTTLE-LABEL: <slice_blocks>:
-# THROTTLE: cbnz
-# THROTTLE: prfm
-# THROTTLE: ldr
 
 #--- input.s
 .text

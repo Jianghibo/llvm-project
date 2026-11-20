@@ -1140,11 +1140,11 @@ Error DataAggregator::processProfile(BinaryContext &BC) {
     if (NamesToCacheMissEvents.empty())
       return createStringError(errc::invalid_argument,
                                "no SPE cache-miss records match the input");
-    for (const auto &[Name, Data] : NamesToCacheMissEvents)
-      if (!NamesToBranches.count(Name))
-        return createStringError(errc::not_supported,
-                                 "SPE cache-miss functions require branch "
-                                 "records from a supported non--nl source");
+    dropCacheMissFunctionsWithoutBranches(Diag);
+    if (NamesToCacheMissEvents.empty())
+      return createStringError(errc::not_supported,
+                               "SPE cache-miss functions require branch "
+                               "records from a supported non--nl source");
   }
 
   processMemEvents();

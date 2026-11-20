@@ -1394,6 +1394,37 @@ std::error_code DataReader::parseInSymbolsMode() {
   return std::error_code();
 }
 
+unsigned
+DataReader::dropCacheMissFunctionsWithoutBranches(raw_ostream &OS) {
+  unsigned Dropped = 0;
+  uint64_t DroppedMisses = 0, DroppedAccesses = 0;
+  std::vector<std::string> Examples;
+  for (auto It = NamesToCacheMissEvents.begin();
+       It != NamesToCacheMissEvents.end();) {
+    if (NamesToBranches.count(It->first)) {
+      ++It;
+      continue;
+    }
+    for (const CacheMissInfo &CMI : It->second.Data) {
+      DroppedMisses += CMI.MissCount;
+      DroppedAccesses += CMI.AccessCount;
+    }
+    if (Examples.size() < 4)
+      Examples.push_back(It->first.str());
+    ++Dropped;
+    It = NamesToCacheMissEvents.erase(It);
+  }
+  if (!Dropped)
+    return 0;
+  OS << "BOLT-WARNING: ignoring " << Dropped
+     << " cache-miss functions without branch records (" << DroppedMisses
+     << " misses, " << DroppedAccesses << " accesses):";
+  for (const std::string &Name : Examples)
+    OS << ' ' << Name;
+  OS << "\n";
+  return Dropped;
+}
+
 std::error_code DataReader::parse() {
   auto GetOrCreateFuncEntry = [&](StringRef Name) {
     return NamesToBranches.try_emplace(Name, Name).first;
@@ -1501,13 +1532,15 @@ std::error_code DataReader::parse() {
     }
   }
 
-  if (opts::EnableLoopDataPrefetch)
-    for (const auto &[Name, Data] : NamesToCacheMissEvents)
-      if (!NamesToBranches.count(Name)) {
-        reportError("loop data prefetch requires branch counts for cache-miss "
-                    "functions");
-        return make_error_code(errc::not_supported);
-      }
+  if (opts::EnableLoopDataPrefetch) {
+    const bool HadCacheMiss = !NamesToCacheMissEvents.empty();
+    dropCacheMissFunctionsWithoutBranches(Diag);
+    if (HadCacheMiss && NamesToCacheMissEvents.empty()) {
+      reportError("loop data prefetch requires branch counts for cache-miss "
+                  "functions");
+      return make_error_code(errc::not_supported);
+    }
+  }
   for (auto &[Name, Function] : NamesToBranches) {
     for (auto *Data : {&Function.Data, &Function.EntryData}) {
       llvm::stable_sort(*Data);

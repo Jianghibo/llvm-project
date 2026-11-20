@@ -483,6 +483,10 @@ protected:
     FuncsToCacheMisses[&BF] = FCMD;
   }
 
+  /// Drop cache-miss functions that have no branch records and report the
+  /// discarded sample counts to \p OS. Returns the number of dropped functions.
+  unsigned dropCacheMissFunctionsWithoutBranches(raw_ostream &OS);
+
   using NamesToBranchesMapTy = std::map<StringRef, FuncBranchData>;
   using NamesToBasicSamplesMapTy = std::map<StringRef, FuncBasicSampleData>;
   using NamesToMemEventsMapTy = std::map<StringRef, FuncMemData>;

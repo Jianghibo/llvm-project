@@ -2135,23 +2135,11 @@ public:
 
   /// Build without changing any source register, memory, SP, or flags.
   /// Scratch registers must be dead at the insertion point and absent from CFI.
-  /// When requested, materialize the complete first address in Scratch[0].
   /// The last Address.Elements instructions are the prefetch requests.
   virtual bool createLoopPrefetch(const LoopMemoryAccess &Address,
                                   int64_t BaseDelta, int64_t IndexDelta,
                                   ArrayRef<MCPhysReg> Scratch, StringRef Hint,
-                                  SmallVectorImpl<MCInst> &Code,
-                                  bool MaterializeAddress = false) const {
-    return false;
-  }
-
-  /// Guard prefetches by cache-line crossings without modifying flags.
-  /// Address holds the complete future address; Scratch can be clobbered.
-  /// Branch to Skip when no request is needed.
-  virtual bool createLoopPrefetchGuard(MCPhysReg Address, MCPhysReg Scratch,
-                                       int64_t Step, unsigned LineSize,
-                                       const MCSymbol *Skip, MCContext *Ctx,
-                                       SmallVectorImpl<MCInst> &Code) const {
+                                  SmallVectorImpl<MCInst> &Code) const {
     return false;
   }
 
